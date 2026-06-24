@@ -23,7 +23,7 @@ use mcs_auth::{issue_session, SessionConfig};
 use mcs_core::VariantOptions;
 use mcs_domain::{Game, TimeControl, User};
 use mcs_game::GameActor;
-use mcs_storage::{GameRepo, Repositories, SqlxStorage};
+use mcs_storage::{GameRepo, SqlxStorage};
 use mcs_variant_standard::{register, STANDARD_VARIANT_ID};
 
 // ---------------------------------------------------------------------------
@@ -44,7 +44,10 @@ async fn test_app() -> TestApp {
         .await
         .expect("connect + migrate in-memory sqlite");
     let storage = Arc::new(storage);
-    let repositories: Arc<dyn Repositories> = storage.clone();
+
+    let mut registry = mcs_core::VariantRegistry::new();
+    register(&mut registry);
+    let variants = Arc::new(registry);
 
     let session = SessionConfig::new(
         b"test-secret-key-that-is-definitely-32-bytes!!".to_vec(),
@@ -59,7 +62,7 @@ async fn test_app() -> TestApp {
         time::Duration::minutes(10),
     );
     TestApp {
-        state: AppState::new(repositories, session, siwe),
+        state: AppState::new(storage.clone(), variants, session, siwe),
         storage,
     }
 }

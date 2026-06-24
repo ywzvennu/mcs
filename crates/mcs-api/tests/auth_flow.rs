@@ -23,7 +23,9 @@ use time::Duration;
 
 use mcs_api::{router, AppState, AuthUser, SiweConfig};
 use mcs_auth::SessionConfig;
-use mcs_storage::{Repositories, SqlxStorage};
+use mcs_core::VariantRegistry;
+use mcs_storage::SqlxStorage;
+use mcs_variant_standard::register;
 
 // ---------------------------------------------------------------------------
 // Test wallet (fixed key) — mirrors the mcs-auth signing test vector.
@@ -70,7 +72,11 @@ async fn test_state() -> AppState {
     let storage = SqlxStorage::connect("sqlite::memory:")
         .await
         .expect("connect + migrate in-memory sqlite");
-    let storage: Arc<dyn Repositories> = Arc::new(storage);
+    let storage = Arc::new(storage);
+
+    let mut registry = VariantRegistry::new();
+    register(&mut registry);
+    let variants = Arc::new(registry);
 
     let session = SessionConfig::new(
         b"test-secret-key-that-is-definitely-32-bytes!!".to_vec(),
@@ -84,7 +90,7 @@ async fn test_state() -> AppState {
         "Sign in to MCS.".to_owned(),
         Duration::minutes(10),
     );
-    AppState::new(storage, session, siwe)
+    AppState::new(storage, variants, session, siwe)
 }
 
 /// A trivial protected handler: requiring [`AuthUser`] gates it behind a valid
