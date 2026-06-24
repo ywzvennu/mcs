@@ -62,16 +62,45 @@
 //!   buffer that it observes a [`Lagged`](RecvError::Lagged), the server does
 //!   *not* drop it: it sends a fresh [`ServerMessage::Snapshot`] to resync and
 //!   then resumes streaming from the newest events.
+//!
+//! # Cluster routing & failover (#68)
+//!
+//! Each game has exactly one **owning node**, computed — with no inter-node
+//! chatter — by rendezvous-hashing the game id over the live membership set (see
+//! [`mcs_cluster`]). Before upgrading, the handler asks "do I own this game?":
+//!
+//! - **This node owns it** (always true single-node) → it serves the game
+//!   locally, reviving the actor from the durable action log on first access via
+//!   [`AppState::get_or_recover`]. This *is* the failover path: when a node dies,
+//!   its games rehash to survivors, and a survivor revives each one the first
+//!   time a client connects — there is no migration step.
+//! - **Another node owns it** → the handler does **not** upgrade. It answers with
+//!   **421 Misdirected Request** and a small JSON body naming the owner and the
+//!   exact WebSocket URL to reconnect to (the original `token`/`since_ply` query
+//!   is preserved), plus a `Location` header. A smart load balancer can route by
+//!   game id and never hit this; a plain client simply reconnects to the URL.
+//!
+//! ## Failover model & limits
+//!
+//! Ownership is a pure function of the *current* live set, and actors are rebuilt
+//! on demand from the durable log, so failover needs no special code: surviving
+//! nodes simply start answering for the dead node's games. The limits follow
+//! from that design: each clock resumes from its last persisted remaining time
+//! (downtime is not charged); a game with zero recorded actions revives to its
+//! initial position; and an in-flight socket to a node that dies must be
+//! reconnected by the client (or steered by the load balancer) to the new owner.
 
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::response::Response;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
 use std::sync::Arc;
 
 use mcs_auth::verify_session;
+use mcs_cluster::NodeInfo;
 use mcs_core::{Action, Color, GameStatus, PlayerView};
 use mcs_domain::{Clock, GameId};
 use mcs_game::{GameEvent, GameHandle, GameSessionError, GameSnapshot};
@@ -305,6 +334,83 @@ pub struct ConnectQuery {
 }
 
 // ---------------------------------------------------------------------------
+// Cluster redirect (#68)
+// ---------------------------------------------------------------------------
+
+/// The identity of the node that owns a game, as carried in a redirect body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerInfo {
+    /// The owning node's stable id.
+    pub id: String,
+    /// The owning node's externally reachable base URL (e.g. `http://10.0.0.7:8080`).
+    pub address: String,
+}
+
+/// The JSON body of a **421 Misdirected Request** cluster redirect.
+///
+/// Returned by the WS handler when the connected node is *not* the rendezvous
+/// owner of the requested game. It tells the client exactly where to reconnect:
+/// `ws_url` is the owner's address with the game path and the original query
+/// (token, `since_ply`) preserved, so a client can switch sockets without
+/// re-deriving anything. A `Location` header carries the same URL for HTTP-aware
+/// clients and proxies.
+///
+/// # Routing contract
+///
+/// - A **load balancer** that understands the game id can route the handshake to
+///   the owning node directly and never produce this response.
+/// - A **plain client** that connects to any node and receives this body must
+///   close the socket attempt and reconnect to `ws_url` (or follow `Location`).
+///
+/// Ownership can change as membership changes, so a client should always be
+/// prepared to receive a redirect and follow it, even mid-game after a failover.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedirectBody {
+    /// The node that owns this game and should serve the socket.
+    pub owner: OwnerInfo,
+    /// The WebSocket URL on the owning node to reconnect to, with the original
+    /// query string (token, `since_ply`) preserved.
+    pub ws_url: String,
+}
+
+/// Builds the 421 redirect [`Response`] pointing at `owner` for `game_id`.
+///
+/// `query` is the raw, already-validated handshake query string (without the
+/// leading `?`); it is appended verbatim so the token and any `since_ply` survive
+/// the redirect. The owner `address` is used as a base URL and the
+/// `/ws/game/{id}` path is appended; a trailing slash on the address is trimmed
+/// so we never emit a double slash.
+fn redirect_to_owner(owner: &NodeInfo, game_id: GameId, query: &str) -> Response {
+    let base = owner.address.trim_end_matches('/');
+    let mut ws_url = format!("{base}/ws/game/{game_id}");
+    if !query.is_empty() {
+        ws_url.push('?');
+        ws_url.push_str(query);
+    }
+
+    let body = RedirectBody {
+        owner: OwnerInfo {
+            id: owner.id.to_string(),
+            address: owner.address.clone(),
+        },
+        ws_url: ws_url.clone(),
+    };
+    let json = serde_json::to_vec(&body).expect("RedirectBody is always serializable");
+
+    // 421 Misdirected Request: the request reached a node that cannot serve this
+    // game. The `Location` header mirrors `ws_url` for HTTP-aware clients/proxies.
+    (
+        StatusCode::MISDIRECTED_REQUEST,
+        [
+            (header::CONTENT_TYPE, "application/json".to_owned()),
+            (header::LOCATION, ws_url),
+        ],
+        axum::body::Body::from(json),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
 
@@ -314,17 +420,23 @@ pub fn ws_router() -> axum::Router<AppState> {
     axum::Router::new().route("/ws/game/{id}", get(game_socket))
 }
 
-/// The `GET /ws/game/{id}` handler: authenticate, resolve the role, then upgrade.
+/// The `GET /ws/game/{id}` handler: authenticate, route, resolve the role, then
+/// upgrade.
 ///
-/// Authentication and role resolution happen *before* the upgrade so a failure
-/// is a normal HTTP error response (401/404) the client can read, rather than a
-/// dropped socket. Only once the caller is known to be a valid player or
-/// spectator of an existing, live game is the connection handed to
-/// [`run_connection`].
+/// Authentication, cluster routing, and role resolution all happen *before* the
+/// upgrade so a failure is a normal HTTP error response (401/404/421) the client
+/// can read, rather than a dropped socket. Only once the caller is known to be a
+/// valid player or spectator of an existing, live game **that this node owns** is
+/// the connection handed to [`run_connection`].
+///
+/// The raw query string is taken alongside the parsed [`ConnectQuery`] so that,
+/// on a cluster redirect, the token and any `since_ply` can be preserved verbatim
+/// in the reconnect URL.
 async fn game_socket(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<ConnectQuery>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     // 1. Parse the path id. A malformed id is a 422, mirroring the REST routes.
@@ -337,7 +449,32 @@ async fn game_socket(
     let claims = verify_session(state.session_config(), &query.token)?;
     let user_id = claims.sub;
 
-    // 3. Resolve the live actor, reviving it from the durable log if this node
+    // 3. Cluster routing (#68): does *this* node own the game? Ownership is the
+    //    rendezvous owner of the game id over the live membership set. Single-node
+    //    the live set is just this node, so this is always true and no redirect is
+    //    ever emitted — byte-for-byte the pre-cluster behaviour. If another node
+    //    owns it, redirect (do NOT upgrade), preserving the original query.
+    let cluster = state.cluster();
+    let nodes = cluster.registry().live_nodes().await.map_err(|error| {
+        tracing::error!(%game_id, %error, "failed to read cluster membership");
+        ApiError::Internal(format!("failed to read cluster membership: {error}"))
+    })?;
+    if let Some(owner) = mcs_cluster::owner(&game_id.to_string(), &nodes) {
+        if owner.id != cluster.this_node().id {
+            tracing::debug!(%game_id, owner = %owner.id, "redirecting WS to the owning node");
+            return Ok(redirect_to_owner(
+                owner,
+                game_id,
+                raw_query.as_deref().unwrap_or(""),
+            ));
+        }
+    }
+    // An empty live set (no owner resolvable) cannot happen with the local
+    // default, and for a real registry it means membership is momentarily empty;
+    // we fall through and serve locally rather than reject, since this node is, by
+    // construction, a live member able to recover the game from the durable log.
+
+    // 4. Resolve the live actor, reviving it from the durable log if this node
     //    has no in-memory handle for it (a cold node, or a game evicted after a
     //    restart). An unknown or already-finished game has no live actor and is
     //    a 404 just as before.
@@ -346,7 +483,7 @@ async fn game_socket(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("no live game: {game_id}")))?;
 
-    // 4. Resolve the caller's role from the persisted game record. A user who is
+    // 5. Resolve the caller's role from the persisted game record. A user who is
     //    neither player connects as a spectator.
     let game = state.storage().games().get(game_id).await?;
     let role = if game.white == user_id {
@@ -357,12 +494,12 @@ async fn game_socket(
         Role::Spectator
     };
 
-    // 5. The action-log repo lets a `?since_ply` reconnect replay the moves the
+    // 6. The action-log repo lets a `?since_ply` reconnect replay the moves the
     //    client missed. Cloned out of the state so the connection task owns it.
     let action_log = state.action_log().clone();
     let since_ply = query.since_ply;
 
-    // 6. Upgrade. From here the connection task owns the socket and the handle.
+    // 7. Upgrade. From here the connection task owns the socket and the handle.
     Ok(upgrade
         .on_upgrade(move |socket| run_connection(socket, handle, role, action_log, since_ply)))
 }

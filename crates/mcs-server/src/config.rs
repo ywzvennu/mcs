@@ -98,6 +98,8 @@ pub struct Config {
     pub siwe: SiweSettings,
     /// x402 payment gating for game creation (off by default).
     pub payments: PaymentSettings,
+    /// Cluster / horizontal-scaling configuration (off by default, #68).
+    pub cluster: ClusterSettings,
 }
 
 /// Logging configuration.
@@ -215,6 +217,59 @@ pub enum VerifierChoice {
     Mock,
 }
 
+/// Cluster / horizontal-scaling configuration (#68).
+///
+/// **Disabled by default** ([`enabled`](ClusterSettings::enabled) = `false`):
+/// the server runs as a single node with an in-process
+/// [`LocalRegistry`](mcs_cluster::LocalRegistry), opens no Redis connection, and
+/// behaves byte-for-byte as it did before clustering. Only when enabled does the
+/// composition root connect a
+/// [`RedisNodeRegistry`](mcs_cluster::RedisNodeRegistry), register this node,
+/// spawn a heartbeat task, and hand the registry to
+/// [`AppState::with_cluster`](mcs_api::AppState::with_cluster) — so the WS layer
+/// routes each game to its rendezvous owner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClusterSettings {
+    /// Whether to join a cluster. `false` by default, so the server boots
+    /// single-node and touches no cluster backend.
+    pub enabled: bool,
+    /// This node's stable id, used both to register membership and to compute
+    /// rendezvous ownership. Must be unique and stable per process. When empty
+    /// (the default), a fresh UUID is generated at startup — fine for ephemeral
+    /// nodes, but pin it for stable identities (e.g. a pod or hostname).
+    pub node_id: String,
+    /// This node's externally reachable base URL, e.g. `http://127.0.0.1:8080`.
+    /// Peers and clients use it to reach this node; it is the address a redirect
+    /// points other nodes' clients at, so it must be reachable from them (not a
+    /// loopback in a real multi-host deployment).
+    pub address: String,
+    /// The Redis connection URL backing membership, e.g.
+    /// `redis://127.0.0.1:6379`. Only consulted when [`enabled`](Self::enabled).
+    pub redis_url: String,
+    /// The liveness TTL, in seconds: a node missing this many seconds of
+    /// heartbeats is evicted from membership by Redis. Defaults to `15`.
+    pub heartbeat_ttl_secs: u64,
+    /// How often, in seconds, to renew this node's TTL. Must be comfortably
+    /// shorter than [`heartbeat_ttl_secs`](Self::heartbeat_ttl_secs). Defaults
+    /// to `5`.
+    pub heartbeat_interval_secs: u64,
+}
+
+impl Default for ClusterSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // Empty ⇒ generate a UUID at startup (see `build_node_id`).
+            node_id: String::new(),
+            address: "http://127.0.0.1:8080".to_owned(),
+            redis_url: "redis://127.0.0.1:6379".to_owned(),
+            heartbeat_ttl_secs: 15,
+            heartbeat_interval_secs: 5,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -224,6 +279,7 @@ impl Default for Config {
             session: SessionSettings::default(),
             siwe: SiweSettings::default(),
             payments: PaymentSettings::default(),
+            cluster: ClusterSettings::default(),
         }
     }
 }
@@ -361,6 +417,24 @@ impl PaymentSettings {
     }
 }
 
+impl ClusterSettings {
+    /// Resolves this node's [`NodeInfo`](mcs_cluster::NodeInfo) from the settings.
+    ///
+    /// If [`node_id`](Self::node_id) is empty a fresh UUID is generated so the
+    /// node still has a unique, stable-for-this-process identity; otherwise the
+    /// configured id is used verbatim. The [`address`](Self::address) is carried
+    /// through unchanged.
+    #[must_use]
+    pub fn node_info(&self) -> mcs_cluster::NodeInfo {
+        let id = if self.node_id.trim().is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            self.node_id.clone()
+        };
+        mcs_cluster::NodeInfo::new(id, self.address.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +479,70 @@ mod tests {
         assert_eq!(reqs.asset, cfg.payments.asset);
         assert_eq!(reqs.resource, "/seeks");
         assert_eq!(reqs.mime_type, "application/json");
+    }
+
+    #[test]
+    fn cluster_is_disabled_by_default() {
+        let cfg = Config::default();
+        assert!(!cfg.cluster.enabled, "cluster must be off by default");
+        // Empty id ⇒ a UUID is minted; non-default TTLs are sensible.
+        assert!(cfg.cluster.node_id.is_empty());
+        assert_eq!(cfg.cluster.heartbeat_ttl_secs, 15);
+        assert_eq!(cfg.cluster.heartbeat_interval_secs, 5);
+        assert!(cfg.cluster.redis_url.starts_with("redis://"));
+    }
+
+    #[test]
+    fn cluster_node_info_generates_an_id_when_unset() {
+        let cfg = Config::default();
+        let info = cfg.cluster.node_info();
+        assert!(!info.id.as_str().is_empty(), "an id must be generated");
+        assert_eq!(info.address, cfg.cluster.address);
+
+        // Two resolutions of an empty id yield distinct generated ids.
+        assert_ne!(cfg.cluster.node_info().id, cfg.cluster.node_info().id);
+    }
+
+    #[test]
+    fn cluster_node_info_uses_a_configured_id_verbatim() {
+        let mut cfg = Config::default();
+        cfg.cluster.node_id = "node-a".to_owned();
+        cfg.cluster.address = "http://10.0.0.7:8080".to_owned();
+        let info = cfg.cluster.node_info();
+        assert_eq!(info.id.as_str(), "node-a");
+        assert_eq!(info.address, "http://10.0.0.7:8080");
+    }
+
+    /// The `[cluster]` section parses from TOML, overriding only the keys given
+    /// and leaving the rest at their defaults.
+    // `Jail::expect_with` requires a closure returning `figment::Result`, whose
+    // `Err` is large; it is a test fixture, not a hot path, so allow it.
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn cluster_section_parses_from_toml() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                r#"
+                    [cluster]
+                    enabled = true
+                    node_id = "node-b"
+                    address = "http://10.0.0.8:8080"
+                    redis_url = "redis://redis:6379"
+                    heartbeat_ttl_secs = 30
+                    heartbeat_interval_secs = 10
+                "#,
+            )?;
+            let cfg = Config::load().expect("load config with [cluster]");
+            assert!(cfg.cluster.enabled);
+            assert_eq!(cfg.cluster.node_id, "node-b");
+            assert_eq!(cfg.cluster.address, "http://10.0.0.8:8080");
+            assert_eq!(cfg.cluster.redis_url, "redis://redis:6379");
+            assert_eq!(cfg.cluster.heartbeat_ttl_secs, 30);
+            assert_eq!(cfg.cluster.heartbeat_interval_secs, 10);
+            // An untouched section keeps its default.
+            assert!(!cfg.payments.enabled);
+            Ok(())
+        });
     }
 }

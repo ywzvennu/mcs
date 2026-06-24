@@ -37,6 +37,11 @@ mcs-observability = { path = "../mcs-observability" }
 # and member path deps are allowed (only the root manifest is off-limits). Used
 # to build the optional game-creation payment gate from `[payments]` config.
 mcs-payments = { path = "../mcs-payments" }
+# Clustering primitives for multi-node support (#68). The server is the single
+# place the Redis-backed registry is constructed, so it enables the `redis`
+# feature here. Cluster mode is off by default; with it disabled no Redis
+# connection is opened and the state stays single-node/local.
+mcs-cluster = { path = "../mcs-cluster", features = ["redis"] }
 
 axum.workspace = true
 tokio.workspace = true
@@ -48,9 +53,13 @@ tracing.workspace = true
 time.workspace = true
 anyhow.workspace = true
 rand.workspace = true
+# Generate a stable-per-process node id when `[cluster].node_id` is unset.
+uuid.workspace = true
 
 [dev-dependencies]
 # Drive the assembled router in-process without binding a socket.
 tower = { workspace = true }
 # Parse the JSON body of `/variants` in smoke tests.
 serde_json.workspace = true
+# `figment::Jail` for isolated config-loading tests (the `test` feature gates it).
+figment = { workspace = true, features = ["test"] }
