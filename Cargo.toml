@@ -1,0 +1,97 @@
+# MCS — Modular Chess Server
+#
+# Virtual workspace manifest. Each component lives in its own crate under
+# `crates/*`. Shared package metadata, dependency versions, and lints are
+# defined here so individual crates stay terse and consistent. New crates only
+# need to add their own directory (the `members` glob picks them up) and opt
+# into shared dependencies via `dep.workspace = true` — no edits to this file
+# are required for the common case, which keeps parallel work conflict-free.
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ywzvennu/mcs"
+homepage = "https://github.com/ywzvennu/mcs"
+authors = ["MCS contributors"]
+
+# Centralized dependency versions. Entries are only resolved when a member crate
+# actually references them, so this list can stay ahead of current usage.
+[workspace.dependencies]
+# Async runtime & utilities
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors & misc
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+rand = "0.8"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# HTTP / WebSocket transport
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "request-id"] }
+
+# Persistence
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio",
+  "tls-rustls",
+  "macros",
+  "migrate",
+  "sqlite",
+  "postgres",
+  "uuid",
+  "time",
+] }
+
+# Configuration
+figment = { version = "0.10", features = ["env", "toml"] }
+
+# Auth (JWT sessions)
+jsonwebtoken = "9"
+
+# Chess engines
+shakmaty = "0.27"
+
+# Internal crates (referenced by path so parallel crate PRs don't edit this file)
+mcs-core = { path = "crates/mcs-core" }
+mcs-domain = { path = "crates/mcs-domain" }
+mcs-storage = { path = "crates/mcs-storage" }
+mcs-auth = { path = "crates/mcs-auth" }
+mcs-game = { path = "crates/mcs-game" }
+mcs-api = { path = "crates/mcs-api" }
+mcs-variant-standard = { path = "crates/mcs-variant-standard" }
+
+# Lints applied across every crate (each crate adds `[lints] workspace = true`).
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+todo = "warn"
+dbg_macro = "warn"
+
+# Faster, leaner release builds for a long-running server.
+[profile.release]
+lto = "thin"
+codegen-units = 1

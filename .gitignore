@@ -1,0 +1,36 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Environment / secrets
+.env
+.env.*
+*.local
+
+# SQLite dev databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+
+# ---------------------------------------------------------------------------
+# LLM / AI assistant material — NEVER commit. These are local-only working
+# notes and must not be pushed to the repository.
+# ---------------------------------------------------------------------------
+CLAUDE.md
+CLAUDE.local.md
+GEMINI.md
+.cursorrules
+.cursor/
+.aider*
+.claude/
+*.plan.md
+/notes/
+/scratch/
