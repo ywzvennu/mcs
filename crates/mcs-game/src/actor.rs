@@ -16,8 +16,8 @@ use std::sync::Arc;
 use mcs_core::{
     Action, ActionEffect, Color, EndReason, GameSession, GameStatus, Outcome, PlayerView,
 };
-use mcs_domain::{Game, GameId, GameLifecycle, TimeControl};
-use mcs_storage::GameRepo;
+use mcs_domain::{Clock, Game, GameId, GameLifecycle, TimeControl};
+use mcs_storage::{ActionLogRepo, GameRepo, RecordedAction};
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -120,17 +120,28 @@ impl GameHandle {
     /// Submits `action` on behalf of `player`, advancing the game.
     ///
     /// On success the actor has already applied the action to the session,
-    /// broadcast the produced events to all subscribers, and — if the action
-    /// finished the game — persisted the final result through the injected
-    /// [`GameRepo`]. The returned [`ActionEffect`] mirrors what the session
-    /// produced.
+    /// broadcast the produced events to all subscribers, durably recorded the
+    /// action in the append-only log and refreshed the game's live snapshot, and
+    /// — if the action finished the game — persisted the final result through the
+    /// injected [`GameRepo`]. The returned [`ActionEffect`] mirrors what the
+    /// session produced.
+    ///
+    /// # At-least-once durability
+    ///
+    /// The session advances *before* the durable record is written, so a
+    /// [`GameSessionError::Storage`] means the move is live in memory but may not
+    /// have been recorded. The actor never rolls the session back: a recovering
+    /// server replays whatever *was* logged, so the worst case is that a server
+    /// crash between the in-memory apply and the (failed) write loses the last
+    /// move — never a corrupt or partially applied one.
     ///
     /// # Errors
     ///
     /// - [`GameSessionError::Game`] if the session rejected the action (illegal,
     ///   out of turn, finished, or malformed);
-    /// - [`GameSessionError::Storage`] if the action finished the game but the
-    ///   result could not be persisted;
+    /// - [`GameSessionError::Storage`] if the action applied but its log entry or
+    ///   snapshot — or, on a finishing move, the final result — could not be
+    ///   persisted;
     /// - [`GameSessionError::ActorUnavailable`] if the actor task has stopped.
     pub async fn submit_action(
         &self,
@@ -257,6 +268,22 @@ pub struct GameActor {
     game_id: GameId,
     session: Box<dyn GameSession>,
     repo: Arc<dyn GameRepo>,
+    /// The append-only action log: each applied player action is recorded here,
+    /// keyed by `(game_id, ply)`. Replaying it reconstructs the game, which is
+    /// how a future "resumed" actor (#58) rebuilds a live session from storage.
+    action_log: Arc<dyn ActionLogRepo>,
+    /// The next half-move index to record. Starts at `0` for a fresh game and is
+    /// bumped after every successful append, so each applied action lands at a
+    /// strictly increasing `ply`. A future resumed constructor (#58) seeds this
+    /// from [`ActionLogRepo::last_ply`] so recording continues where the log
+    /// left off; recovery itself is out of scope here.
+    next_ply: u32,
+    /// A lazily loaded, in-actor copy of the durable [`Game`] record, kept so the
+    /// snapshot can be refreshed after every move with a single
+    /// [`GameRepo::update`] rather than a `get`+`update` round trip per move. It
+    /// is loaded on the first move (and reused by [`persist_finished`], which
+    /// otherwise loads it itself), keeping the actor and the store in step.
+    game: Option<Game>,
     /// Invoked once, after the finished result is persisted, so subsystems such
     /// as ratings or payouts can react without the actor depending on them.
     hook: Arc<dyn GameCompletionHook>,
@@ -295,14 +322,22 @@ impl std::fmt::Debug for GameActor {
 impl GameActor {
     /// Spawns an actor that owns `session` and returns a handle to it.
     ///
-    /// The actor takes ownership of the boxed [`GameSession`] and an
-    /// `Arc<dyn GameRepo>` used to persist the final result when the game ends.
-    /// It runs on a freshly spawned Tokio task until every [`GameHandle`] is
-    /// dropped.
+    /// The actor takes ownership of the boxed [`GameSession`], an
+    /// `Arc<dyn GameRepo>` used to refresh the live snapshot and persist the
+    /// final result, and an `Arc<dyn ActionLogRepo>` used to durably record every
+    /// applied action. It runs on a freshly spawned Tokio task until every
+    /// [`GameHandle`] is dropped.
     ///
-    /// `game_id` identifies the [`Game`] record this session corresponds to;
-    /// the actor loads it, marks it [`GameLifecycle::Finished`] with the
-    /// [`Outcome`], and writes it back through `repo` when play concludes.
+    /// `game_id` identifies the [`Game`] record this session corresponds to; the
+    /// actor refreshes its live snapshot (ply, clocks, side to move) after every
+    /// move, marks it [`GameLifecycle::Finished`] with the [`Outcome`] when play
+    /// concludes, and writes it back through `repo`.
+    ///
+    /// `action_log` receives one [`RecordedAction`] per applied player action,
+    /// at strictly increasing `ply` starting from `0`. A fresh game starts the
+    /// log empty; this constructor never seeds the ply from storage. (A resumed
+    /// constructor that does — for recovery, #58 — is intentionally not part of
+    /// this change.)
     ///
     /// `time_control` arms the authoritative clock: the actor deducts elapsed
     /// time on each move, includes a [`Clock`](mcs_domain::Clock) snapshot in
@@ -318,6 +353,7 @@ impl GameActor {
         game_id: GameId,
         session: Box<dyn GameSession>,
         repo: Arc<dyn GameRepo>,
+        action_log: Arc<dyn ActionLogRepo>,
         hook: Arc<dyn GameCompletionHook>,
         time_control: TimeControl,
     ) -> GameHandle {
@@ -325,6 +361,7 @@ impl GameActor {
             game_id,
             session,
             repo,
+            action_log,
             hook,
             time_control,
             Box::new(SystemTimeSource),
@@ -340,6 +377,7 @@ impl GameActor {
         game_id: GameId,
         session: Box<dyn GameSession>,
         repo: Arc<dyn GameRepo>,
+        action_log: Arc<dyn ActionLogRepo>,
         hook: Arc<dyn GameCompletionHook>,
         time_control: TimeControl,
         time: Box<dyn TimeSource>,
@@ -370,6 +408,9 @@ impl GameActor {
             game_id,
             session,
             repo,
+            action_log,
+            next_ply: 0,
+            game: None,
             hook,
             events: events_tx,
             clock,
@@ -526,12 +567,21 @@ impl GameActor {
     }
 
     /// Applies an action, updates the clock, broadcasts the resulting events
-    /// (with a live clock snapshot), and persists on game end.
+    /// (with a live clock snapshot), durably records the action, refreshes the
+    /// game's live snapshot, and persists the final result on game end.
     ///
     /// Before applying, it re-checks the clock: a player who tries to move after
     /// already flagging loses on time rather than having their late move
     /// accepted. After a successful, non-finishing move it records the elapsed
     /// time against the mover and starts the opponent's clock.
+    ///
+    /// Durability is ordered append-then-snapshot: the action lands in the
+    /// append-only log first (the authoritative history a recovering server
+    /// replays), then the live snapshot is refreshed, and finally — on a
+    /// finishing move — the lifecycle is marked finished and the completion hook
+    /// runs. The in-memory session is never rolled back, so a storage failure
+    /// surfaces as [`GameSessionError::Storage`] while leaving play consistent;
+    /// see the at-least-once note on [`GameHandle::submit_action`].
     async fn submit_action(
         &mut self,
         player: Color,
@@ -563,7 +613,7 @@ impl GameActor {
 
         // Broadcast to live observers. A send error only means there are no
         // subscribers right now, which is not a failure of the action.
-        let event = match clock_snapshot {
+        let event = match clock_snapshot.clone() {
             Some(snapshot) => {
                 GameEvent::with_clock(effect.events.clone(), effect.status.clone(), snapshot)
             }
@@ -571,9 +621,17 @@ impl GameActor {
         };
         let _ = self.events.send(event);
 
-        // When the game has just finished, durably record the result. This is
-        // done after the in-memory apply so that a transient storage failure
-        // does not lose the move; callers can retry persistence separately.
+        // Durably record the move: append the action-log row first (the
+        // authoritative history), then refresh the live snapshot. Both happen
+        // after the in-memory apply, so a storage failure leaves the move live in
+        // memory and surfaces to the caller — recovery replays whatever is logged.
+        let finished = effect.status.is_finished();
+        self.record_action(player, action, clock_snapshot.as_ref(), finished, now)
+            .await?;
+
+        // When the game has just finished, durably mark the lifecycle finished
+        // and run the completion hook. The snapshot above already captured the
+        // final ply and clocks; this is the terminal transition on top of it.
         if let GameStatus::Finished(outcome) = &effect.status {
             self.persist_finished(outcome.clone()).await?;
         }
@@ -581,9 +639,112 @@ impl GameActor {
         Ok(effect)
     }
 
-    /// Loads the [`Game`] record, marks it finished with `outcome`, writes it
-    /// back, and runs the completion hook. Idempotent: persists — and runs the
-    /// hook — at most once per actor.
+    /// Records one applied player action: appends it to the action log at the
+    /// next ply, then refreshes the cached [`Game`]'s live snapshot and persists
+    /// it.
+    ///
+    /// `clock` is the post-move clock snapshot (`None` for an untimed game); its
+    /// whole-millisecond remaining times are stored both on the log row and on
+    /// the game snapshot. `finished` records whether this move ended the game, so
+    /// the snapshot reports no side to move once play is over.
+    ///
+    /// On the first call the [`Game`] record is loaded and cached; later calls
+    /// reuse and mutate that copy, so each move costs a single
+    /// [`GameRepo::update`] rather than a `get`+`update`.
+    ///
+    /// # Errors
+    ///
+    /// [`GameSessionError::Storage`] if loading the game, appending the log row,
+    /// or writing the snapshot fails. The in-memory session has already advanced;
+    /// the actor does not roll it back.
+    async fn record_action(
+        &mut self,
+        player: Color,
+        action: &Action,
+        clock: Option<&Clock>,
+        finished: bool,
+        now: OffsetDateTime,
+    ) -> Result<(), GameSessionError> {
+        let clock_white_ms = clock.map(|c| whole_millis(c.white_remaining()));
+        let clock_black_ms = clock.map(|c| whole_millis(c.black_remaining()));
+
+        let ply = self.next_ply;
+        let recorded = RecordedAction {
+            ply,
+            player,
+            action: action.clone(),
+            clock_white_ms,
+            clock_black_ms,
+            created_at: now,
+        };
+        if let Err(error) = self.action_log.append(self.game_id, &recorded).await {
+            tracing::error!(
+                game_id = %self.game_id,
+                ply,
+                %error,
+                "failed to append action to the log",
+            );
+            return Err(error.into());
+        }
+        // Only advance the ply once the append has durably succeeded, so a
+        // retried move after a transient failure re-uses the same ply.
+        self.next_ply = ply + 1;
+
+        // Refresh the live snapshot: ply count, both clocks, and whose turn it is
+        // now (or `None` once the game is over). The cached game is loaded lazily
+        // on the first move and reused thereafter.
+        let snapshot_ply = self.next_ply;
+        let side_to_move = if finished {
+            None
+        } else {
+            Some(self.session.to_move())
+        };
+        let game = self.game_mut().await?;
+        game.update_snapshot(
+            snapshot_ply,
+            clock_white_ms,
+            clock_black_ms,
+            side_to_move,
+            now,
+        );
+        let snapshot = game.clone();
+        if let Err(error) = self.repo.update(&snapshot).await {
+            tracing::error!(
+                game_id = %self.game_id,
+                %error,
+                "failed to update the live game snapshot",
+            );
+            return Err(error.into());
+        }
+
+        Ok(())
+    }
+
+    /// Returns a mutable reference to the cached [`Game`] record, loading it from
+    /// the repository on first use.
+    ///
+    /// # Errors
+    ///
+    /// [`GameSessionError::Storage`] if the record cannot be loaded.
+    async fn game_mut(&mut self) -> Result<&mut Game, GameSessionError> {
+        if self.game.is_none() {
+            self.game = Some(self.repo.get(self.game_id).await?);
+        }
+        Ok(self
+            .game
+            .as_mut()
+            .expect("game was just loaded into the cache"))
+    }
+
+    /// Marks the cached [`Game`] record finished with `outcome`, writes it back,
+    /// and runs the completion hook. Idempotent: persists — and runs the hook —
+    /// at most once per actor.
+    ///
+    /// The record is loaded lazily if not already cached (it usually is — a
+    /// finishing move records its snapshot through [`record_action`] first, which
+    /// populates the cache — but a timeout end has no preceding action and so
+    /// loads it here). Marking it finished preserves the live snapshot fields
+    /// (ply, clocks) already written, only flipping the lifecycle and outcome.
     ///
     /// The hook is invoked only after the record is durably persisted, so a
     /// consumer (e.g. a rating updater) sees the finished game in storage. It
@@ -594,10 +755,11 @@ impl GameActor {
             return Ok(());
         }
 
-        let mut game: Game = self.repo.get(self.game_id).await?;
+        let game = self.game_mut().await?;
         game.finish(outcome.clone(), OffsetDateTime::now_utc());
         debug_assert_eq!(game.lifecycle, GameLifecycle::Finished);
-        self.repo.update(&game).await?;
+        let finished = game.clone();
+        self.repo.update(&finished).await?;
         self.persisted = true;
 
         tracing::info!(game_id = %self.game_id, "game finished and persisted");
@@ -605,8 +767,16 @@ impl GameActor {
         // Notify subsystems (ratings, payouts, …) of the result. This runs after
         // the write succeeds so the hook can rely on the finished record being
         // visible, and after `persisted` is set so it fires exactly once.
-        self.hook.on_finished(&game, &outcome).await;
+        self.hook.on_finished(&finished, &outcome).await;
 
         Ok(())
     }
+}
+
+/// Converts a remaining-time [`Duration`](std::time::Duration) to whole
+/// milliseconds for storage, saturating rather than overflowing on an absurdly
+/// large budget. Sub-millisecond remainders are truncated, which is the
+/// conservative choice for a clock that should only ever round *down*.
+fn whole_millis(remaining: std::time::Duration) -> u64 {
+    u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX)
 }

@@ -23,7 +23,7 @@ use mcs_auth::{issue_session, SessionConfig};
 use mcs_core::VariantOptions;
 use mcs_domain::{Game, TimeControl, User};
 use mcs_game::GameActor;
-use mcs_storage::{GameRepo, SqlxStorage};
+use mcs_storage::{ActionLogRepo, GameRepo, SqlxStorage};
 use mcs_variant_standard::{register, STANDARD_VARIANT_ID};
 
 // ---------------------------------------------------------------------------
@@ -118,8 +118,9 @@ async fn spawn_game(app: &TestApp, white: &User, black: &User) -> mcs_domain::Ga
     // the state's own rating updater, so a game finished over the socket also
     // updates ratings.
     let repo: Arc<dyn GameRepo> = app.storage.clone();
+    let action_log: Arc<dyn ActionLogRepo> = app.storage.clone();
     let hook = app.state.completion_hook().clone();
-    let handle = GameActor::spawn(game_id, session, repo, hook, time_control);
+    let handle = GameActor::spawn(game_id, session, repo, action_log, hook, time_control);
     app.state.game_hub().insert(game_id, handle);
 
     game_id
