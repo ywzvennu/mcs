@@ -1,0 +1,18 @@
+[package]
+name = "mcs-variant-standard"
+description = "Standard chess variant for the MCS server, backed by shakmaty."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mcs-core.workspace = true
+shakmaty.workspace = true
+serde.workspace = true
+serde_json.workspace = true
