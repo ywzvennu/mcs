@@ -22,6 +22,7 @@
 //!
 //! | Method & path        | Handler |
 //! |----------------------|---------|
+//! | `GET /variants`      | list every registered variant ([`variants`]) |
 //! | `GET /auth/nonce`    | issue a single-use SIWE challenge |
 //! | `POST /auth/verify`  | verify the signed challenge, mint a session JWT |
 //! | `GET /ws/game/{id}`  | upgrade to the live-game WebSocket ([`ws`]) |
@@ -61,6 +62,7 @@ pub mod extract;
 pub mod hub;
 pub mod rest;
 pub mod state;
+pub mod variants;
 pub mod ws;
 
 use axum::Router;
@@ -73,6 +75,7 @@ pub use rest::{
     ProfileDto,
 };
 pub use state::{AppState, SiweConfig};
+pub use variants::{VariantDto, VariantListResponse};
 pub use ws::{ClientMessage, ServerMessage, PROTOCOL_VERSION};
 
 /// Builds the top-level HTTP router for the MCS API.
@@ -85,6 +88,7 @@ pub use ws::{ClientMessage, ServerMessage, PROTOCOL_VERSION};
 /// and the [`AuthUser`] extractor are unaffected by those additions.
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .merge(variants::variants_router())
         .merge(auth::auth_router())
         .merge(ws::ws_router())
         // Game creation (`POST /seeks`) is isolated on its own sub-router so a

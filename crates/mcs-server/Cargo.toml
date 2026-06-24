@@ -21,8 +21,10 @@ mcs-storage.workspace = true
 mcs-core.workspace = true
 mcs-auth.workspace = true
 # This binary is the single place variants are registered at startup, which
-# keeps `mcs-api` variant-agnostic. The standard-chess variant is wired in here.
+# keeps `mcs-api` variant-agnostic. All supported variants are wired in here.
 mcs-variant-standard.workspace = true
+mcs-variant-rbc = { path = "../mcs-variant-rbc" }
+mcs-variant-shakmaty = { path = "../mcs-variant-shakmaty" }
 # `mcs-observability` is intentionally referenced by path: it is a leaf
 # observability crate not (yet) listed in `[workspace.dependencies]`, and adding
 # it there would mean editing the root manifest, which this crate must not do.
@@ -42,3 +44,5 @@ rand.workspace = true
 [dev-dependencies]
 # Drive the assembled router in-process without binding a socket.
 tower = { workspace = true }
+# Parse the JSON body of `/variants` in smoke tests.
+serde_json.workspace = true
