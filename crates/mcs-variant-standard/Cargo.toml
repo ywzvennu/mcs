@@ -1,6 +1,6 @@
 [package]
 name = "mcs-variant-standard"
-description = "Standard chess variant for the MCS server, backed by shakmaty."
+description = "Standard chess and Chess960 variants for the MCS server, backed by cozy-chess."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,10 @@ workspace = true
 
 [dependencies]
 mcs-core.workspace = true
-shakmaty.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Permissively licensed (MIT) Chess and Chess960 move-generation engine. Pinned
+# directly here rather than in `[workspace.dependencies]`: it is used only by
+# this crate, and member version deps are allowed (only the root manifest is
+# off-limits for the common case).
+cozy-chess = "0.3"

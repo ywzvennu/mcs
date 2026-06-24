@@ -67,9 +67,6 @@ figment = { version = "0.10", features = ["env", "toml"] }
 # Auth (JWT sessions)
 jsonwebtoken = "9"
 
-# Chess engines
-shakmaty = "0.27"
-
 # Internal crates (referenced by path so parallel crate PRs don't edit this file)
 mcs-core = { path = "crates/mcs-core" }
 mcs-domain = { path = "crates/mcs-domain" }

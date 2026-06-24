@@ -9,8 +9,8 @@ contributors. It is a design reference, not an API specification.
 
 - Support multiple chess variants under a single, uniform server API without
   forcing each variant to know anything about HTTP or storage.
-- Handle both **perfect-information** variants (standard chess, the shakmaty
-  family: one move per turn, full board visible to both players) and
+- Handle both **perfect-information** variants (standard chess and Chess960:
+  one move per turn, full board visible to both players) and
   **imperfect-information** variants (Reconnaissance Blind Chess: sense-then-move
   turn structure, each player sees only a partial, private view of the board).
 - Keep crates small and single-purpose so they can evolve in parallel with
@@ -45,7 +45,6 @@ mcs-server
     |                  mcs-core
     |
     +── mcs-variant-standard ──► mcs-core
-    +── mcs-variant-shakmaty ──► mcs-core
     +── mcs-variant-rbc ───────► mcs-core
 ```
 
@@ -54,8 +53,7 @@ mcs-server
 | Crate | Responsibility |
 |---|---|
 | `mcs-core` | `GameSession` trait, type-erased `Action`/`PlayerView`/`Event`, `VariantRegistry` |
-| `mcs-variant-standard` | Standard FIDE chess backed by `shakmaty` |
-| `mcs-variant-shakmaty` | Atomic, Antichess, Crazyhouse, King of the Hill, Three-check, Racing Kings, Horde, Chess960 via a single generic `ShakmatyGame<S>` adapter |
+| `mcs-variant-standard` | Standard FIDE chess and Chess960, backed by `cozy-chess` (MIT) |
 | `mcs-variant-rbc` | Reconnaissance Blind Chess via `rbc-rs`; enforces per-player view redaction |
 | `mcs-domain` | Pure domain entities: `User`/`EvmAddress`, `Game` (with `variant_options`, live snapshot, `rated` flag), `Seek`, `Challenge`, `Rating`, `Clock`, `TimeControl` |
 | `mcs-storage` | Repository traits + sqlx impl; SQLite (default) or Postgres; `ActionLogRepo`, `RatingRepo`, `ChallengeRepo`, `SeekRepo::claim`; in-memory SQLite pinned to one connection for tests |
@@ -75,7 +73,7 @@ mcs-server
 The central design challenge is that chess variants differ not just in rules but
 in **turn structure** and **information visibility**:
 
-| Property          | Standard / shakmaty family   | Reconnaissance Blind Chess      |
+| Property          | Standard / Chess960          | Reconnaissance Blind Chess      |
 |-------------------|------------------------------|---------------------------------|
 | Actions per turn  | One (move)                   | Two (sense, then move)          |
 | Board visibility  | Full (both players)          | Partial, per-player private     |
@@ -99,15 +97,28 @@ own latest sense. `spectator_view()` is redacted until the game ends. Because th
 actor calls `view_for` per subscriber before broadcasting, the same code path
 handles both families without any variant-specific branching above `mcs-core`.
 
-### The shakmaty family (`mcs-variant-shakmaty`)
+### Standard chess and Chess960 (`mcs-variant-standard`)
 
-Eight shakmaty variants are implemented through a single generic
-`ShakmatyGame<S>` adapter parameterised over a `VariantSpec` type. Each concrete
-variant (Atomic, Antichess, Crazyhouse, King of the Hill, Three-check, Racing
-Kings, Horde, Chess960) is a small spec type that selects a shakmaty position
-type and maps its terminal states onto the `mcs-core` `Outcome`/`EndReason`
-enums. The wire protocol — UCI moves plus resign/draw meta-actions — matches
-`mcs-variant-standard`, so a client speaks one protocol across the whole family.
+Both standard FIDE chess and Chess960 (Fischer Random) are implemented by a
+single `StandardGame` session wrapping a [`cozy-chess`](https://github.com/analog-hors/cozy-chess)
+`Board` — a permissively licensed (MIT) move generator. cozy-chess handles move
+legality, application, FEN, check detection, and terminal status; the adapter
+maps its `GameStatus` onto the `mcs-core` `Outcome`/`EndReason` enums and adds
+the non-board mechanics (resignation, draw offers) the engine does not track. It
+also detects insufficient-material dead positions explicitly, since cozy-chess
+itself keeps those `Ongoing`.
+
+The two variants share one wire protocol — UCI moves plus resign/draw
+meta-actions — and differ only in how castling is spelled:
+
+- **`standard`** uses **classic UCI** castling (`e1g1`, `e1c1`), translated
+  to/from cozy-chess's internal king-captures-rook form at the wire boundary so
+  existing clients are unaffected.
+- **`chess960`** uses **UCI_960** (king-to-rook) castling, e.g. `e1h1`, because
+  the rook's starting file is not fixed. Chess960 accepts `{ "position": 0..=959 }`
+  (Scharnagl number) or `{ "fen": "..." }` options.
+
+`mcs_variant_standard::register` registers both factories.
 
 ### RBC (`mcs-variant-rbc`)
 
@@ -407,27 +418,21 @@ The GitHub Actions CI pipeline runs five jobs on every push and pull request:
 
 ## Licensing
 
-The MCS crates themselves are dual-licensed under **MIT OR Apache-2.0**. You may
-choose either license.
+The MCS crates are dual-licensed under **MIT OR Apache-2.0**, and so is the
+**assembled `mcs-server` binary**: every dependency is permissively licensed, so
+there is no GPL copyleft obligation.
 
-However, `mcs-variant-standard` and `mcs-variant-shakmaty` both depend on the
-[`shakmaty`](https://crates.io/crates/shakmaty) crate, which is licensed under
-**GPL-3.0-or-later**. `mcs-variant-rbc` depends on `rbc-rs`, which is similarly
-GPL-3.0. When any of these variant crates are compiled into the final
-`mcs-server` binary — which is the normal deployment — the assembled binary is a
-combined work that carries **GPL-3.0** copyleft obligations.
+The chess engine behind `mcs-variant-standard` is
+[`cozy-chess`](https://crates.io/crates/cozy-chess) (MIT). The previous engine,
+`shakmaty`, was GPL-3.0-or-later and required a copyleft exception in
+`deny.toml`; replacing it removed both the dependency and the exception, leaving
+the distributed binary free of copyleft. `cargo deny check` enforces the
+permissive allow-list with **no license exceptions** — any GPL dependency
+(direct or transitive) now fails CI.
 
-In practice this means: distributing the compiled `mcs-server` binary (or
-Docker images containing it) requires making the corresponding source available
-under GPL-3.0 terms. The MCS workspace source is already open on GitHub, so
-this obligation is met by default for standard deployments. Operators who build
-derived works should be aware of this requirement.
-
-The `mcs-core` abstraction is designed so that a future deployment could
-substitute variant adapters that do not carry GPL dependencies (e.g. a
-proprietary or permissively-licensed rule engine), in which case the assembled
-binary would carry only MIT-OR-Apache-2.0. The crate boundary between `mcs-core`
-and the variant crates is the natural license boundary.
+The crate boundary between `mcs-core` and the variant crates remains the natural
+license boundary, so a future variant could still introduce a copyleft engine
+behind a clearly scoped exception if ever needed.
 
 ---
 

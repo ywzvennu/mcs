@@ -17,7 +17,9 @@ use mcs_api::{router, AppState, SiweConfig};
 use mcs_auth::SessionConfig;
 use mcs_core::VariantRegistry;
 use mcs_storage::SqlxStorage;
-use mcs_variant_standard::{register as register_standard, STANDARD_VARIANT_ID};
+use mcs_variant_standard::{
+    register as register_standard, CHESS960_VARIANT_ID, STANDARD_VARIANT_ID,
+};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -78,7 +80,8 @@ async fn get_variants_empty_registry() {
     assert_eq!(json["variants"], serde_json::json!([]));
 }
 
-/// A registry with the standard variant should list it with its id and display name.
+/// Registering the standard variant adds both `standard` and `chess960` (the
+/// same crate registers Chess960 too), each with an id and display name.
 #[tokio::test]
 async fn get_variants_lists_standard() {
     let mut registry = VariantRegistry::new();
@@ -98,12 +101,21 @@ async fn get_variants_lists_standard() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response.into_body()).await;
     let variants = json["variants"].as_array().expect("variants is array");
-    assert_eq!(variants.len(), 1);
-    assert_eq!(variants[0]["id"], STANDARD_VARIANT_ID);
-    assert!(variants[0]["display_name"].as_str().is_some());
+    assert_eq!(variants.len(), 2);
+
+    let ids: Vec<&str> = variants
+        .iter()
+        .map(|v| v["id"].as_str().expect("id is string"))
+        .collect();
+    assert!(ids.contains(&STANDARD_VARIANT_ID));
+    assert!(ids.contains(&CHESS960_VARIANT_ID));
+    assert!(variants
+        .iter()
+        .all(|v| v["display_name"].as_str().is_some()));
 }
 
-/// With two variants registered the response contains both, sorted by id.
+/// With the standard crate (standard + chess960) and RBC registered the response
+/// contains all three, sorted by id.
 #[tokio::test]
 async fn get_variants_lists_multiple_sorted() {
     let mut registry = VariantRegistry::new();
@@ -124,7 +136,7 @@ async fn get_variants_lists_multiple_sorted() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response.into_body()).await;
     let variants = json["variants"].as_array().expect("variants is array");
-    assert_eq!(variants.len(), 2);
+    assert_eq!(variants.len(), 3);
 
     // Response must be sorted by id.
     let ids: Vec<&str> = variants
@@ -135,8 +147,9 @@ async fn get_variants_lists_multiple_sorted() {
     sorted.sort_unstable();
     assert_eq!(ids, sorted, "variants should be sorted by id");
 
-    // Both ids must be present.
+    // All ids must be present.
     assert!(ids.contains(&"standard"));
+    assert!(ids.contains(&"chess960"));
     assert!(ids.contains(&"rbc"));
 }
 

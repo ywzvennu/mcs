@@ -1,4 +1,4 @@
-//! End-to-end tests for the standard-chess variant.
+//! End-to-end tests for the standard-chess and Chess960 variants.
 //!
 //! These drive games through the [`GameSession`] boundary using the type-erased
 //! payloads, mirroring how the server uses the variant.
@@ -8,10 +8,10 @@ use mcs_core::{
     VariantFactory, VariantOptions, VariantRegistry,
 };
 
-use crate::factory::{register, StandardVariant};
+use crate::factory::{register, Chess960Variant, StandardVariant};
 use crate::game::StandardGame;
 use crate::wire::{StandardAction, StandardEvent, StandardView};
-use crate::STANDARD_VARIANT_ID;
+use crate::{CHESS960_VARIANT_ID, STANDARD_VARIANT_ID};
 
 /// Helper: wrap a UCI string into a move action payload.
 fn move_action(uci: &str) -> Action {
@@ -30,6 +30,11 @@ fn play_moves(game: &mut StandardGame, ucis: &[&str]) {
             .unwrap_or_else(|e| panic!("move {uci} should be legal: {e}"));
         player = player.opposite();
     }
+}
+
+/// Helper: read back the typed view from a session.
+fn view_of(game: &StandardGame) -> StandardView {
+    game.spectator_view().to_typed().expect("typed view")
 }
 
 #[test]
@@ -179,8 +184,7 @@ fn draw_offer_can_be_declined_and_game_continues() {
     assert_eq!(game.status(), GameStatus::Ongoing);
 
     // The offer is cleared, so the view shows no pending offer.
-    let view: StandardView = game.spectator_view().to_typed().unwrap();
-    assert_eq!(view.draw_offer, None);
+    assert_eq!(view_of(&game).draw_offer, None);
 }
 
 #[test]
@@ -195,26 +199,15 @@ fn accepting_a_nonexistent_offer_is_illegal() {
 fn a_move_clears_a_pending_draw_offer() {
     let mut game = StandardGame::new();
     play_moves(&mut game, &["e2e4"]);
-    // Black offers a draw, then White ignores it by moving.
+    // Black offers a draw, then ignores it by moving.
     game.apply(
         Color::Black,
         &Action::from_typed(&StandardAction::OfferDraw).unwrap(),
     )
     .unwrap();
-    play_moves_from(&mut game, Color::Black, &["e7e5"]);
+    game.apply(Color::Black, &move_action("e7e5")).unwrap();
     // The draw offer should be gone now.
-    let view: StandardView = game.spectator_view().to_typed().unwrap();
-    assert_eq!(view.draw_offer, None);
-}
-
-/// Variant of [`play_moves`] starting from an arbitrary side.
-fn play_moves_from(game: &mut StandardGame, first: Color, ucis: &[&str]) {
-    let mut player = first.opposite(); // the side that just moved was `first`
-    for uci in ucis {
-        game.apply(player.opposite(), &move_action(uci))
-            .unwrap_or_else(|e| panic!("move {uci} should be legal: {e}"));
-        player = player.opposite();
-    }
+    assert_eq!(view_of(&game).draw_offer, None);
 }
 
 #[test]
@@ -235,11 +228,26 @@ fn stalemate_is_a_draw() {
         Some(Outcome::draw(EndReason::Stalemate)),
         "expected stalemate, got {:?} (fen: {})",
         game.outcome(),
-        match game.spectator_view().to_typed::<StandardView>() {
-            Ok(v) => v.fen,
-            Err(_) => "<unavailable>".to_owned(),
-        }
+        view_of(&game).fen,
     );
+}
+
+#[test]
+fn insufficient_material_is_a_draw() {
+    // A lone black knight on e3 sits next to the White king on e2; capturing it
+    // leaves king-versus-king, a dead position that cozy-chess itself keeps
+    // `Ongoing` but which we terminate as an insufficient-material draw.
+    let mut game = StandardGame::from_fen("4k3/8/8/8/8/4n3/4K3/8 w - - 0 1").unwrap();
+    let effect = game.apply(Color::White, &move_action("e2e3")).unwrap();
+    assert!(effect.status.is_finished());
+    assert_eq!(
+        game.outcome(),
+        Some(Outcome::draw(EndReason::InsufficientMaterial)),
+        "fen: {}",
+        view_of(&game).fen
+    );
+    // The GameEnded event is emitted alongside the move.
+    assert_eq!(effect.events.len(), 2);
 }
 
 #[test]
@@ -269,13 +277,129 @@ fn view_is_perfect_information_and_round_trips() {
 }
 
 #[test]
+fn view_fen_is_correct_after_opening_move() {
+    let mut game = StandardGame::new();
+    play_moves(&mut game, &["e2e4"]);
+    assert_eq!(
+        view_of(&game).fen,
+        "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"
+    );
+}
+
+#[test]
 fn view_reports_check() {
     let mut game = StandardGame::new();
-    // 1. e4 e5 2. Bc4 Nc6 3. Qh5 ... now Black faces threats but is not in
-    // check; deliver a check instead via a fast line.
     play_moves(&mut game, &["e2e4", "f7f5", "d1h5"]); // Qh5+ checks the Black king.
-    let view: StandardView = game.spectator_view().to_typed().unwrap();
-    assert!(view.check, "Black should be in check after Qh5+");
+    assert!(view_of(&game).check, "Black should be in check after Qh5+");
+}
+
+// --- Castling: classic-UCI round-trip for the standard variant ---------------
+
+#[test]
+fn standard_kingside_castle_uses_classic_uci() {
+    let mut game = StandardGame::new();
+    // Clear the kingside for White: 1.e4 e5 2.Nf3 Nc6 3.Bc4 Bc5.
+    play_moves(&mut game, &["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "f8c5"]);
+
+    // The legal-move list offers the castle in classic UCI (`e1g1`), NOT the
+    // cozy-chess king-to-rook form (`e1h1`).
+    let moves = view_of(&game).legal_moves_uci;
+    assert!(moves.contains(&"e1g1".to_owned()), "got: {moves:?}");
+    assert!(!moves.contains(&"e1h1".to_owned()), "got: {moves:?}");
+
+    // Playing `e1g1` actually castles: king to g1, rook to f1, and the emitted
+    // SAN is `O-O`.
+    let effect = game.apply(Color::White, &move_action("e1g1")).unwrap();
+    let event: StandardEvent = effect.events[0].to_typed().unwrap();
+    match event {
+        StandardEvent::MovePlayed { uci, san, fen } => {
+            assert_eq!(uci, "e1g1");
+            assert_eq!(san, "O-O");
+            assert!(
+                fen.starts_with("r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQ1RK1"),
+                "fen after O-O: {fen}"
+            );
+        }
+        other => panic!("expected MovePlayed, got {other:?}"),
+    }
+}
+
+#[test]
+fn standard_queenside_castle_uses_classic_uci() {
+    // Reach a position where White can castle queenside (b1, c1, d1 cleared) in
+    // a fresh standard game, then castle with the classic UCI `e1c1`.
+    let mut game = StandardGame::new();
+    play_moves(
+        &mut game,
+        &[
+            "d2d4", "d7d5", "b1c3", "b8c6", "c1f4", "c8f5", "d1d2", "d8d7",
+        ],
+    );
+
+    // The queenside castle is offered as classic UCI `e1c1`, not `e1a1`.
+    let moves = view_of(&game).legal_moves_uci;
+    assert!(moves.contains(&"e1c1".to_owned()), "got: {moves:?}");
+    assert!(!moves.contains(&"e1a1".to_owned()), "got: {moves:?}");
+
+    let effect = game.apply(Color::White, &move_action("e1c1")).unwrap();
+    let event: StandardEvent = effect.events[0].to_typed().unwrap();
+    match event {
+        StandardEvent::MovePlayed { uci, san, fen } => {
+            assert_eq!(uci, "e1c1");
+            assert_eq!(san, "O-O-O");
+            // King to c1, rook to d1.
+            assert!(
+                fen.starts_with("r3kbnr/pppqpppp/2n5/3p1b2/3P1B2/2N5/PPPQPPPP/2KR1BNR"),
+                "fen after O-O-O: {fen}"
+            );
+        }
+        other => panic!("expected MovePlayed, got {other:?}"),
+    }
+    assert_eq!(game.to_move(), Color::Black);
+}
+
+#[test]
+fn promotion_to_queen_is_played_and_rendered() {
+    // White pawn on b7 promotes by capturing the rook on a8.
+    let mut game = StandardGame::from_fen("r3k3/1P6/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+    let effect = game.apply(Color::White, &move_action("b7a8q")).unwrap();
+    let event: StandardEvent = effect.events[0].to_typed().unwrap();
+    match event {
+        StandardEvent::MovePlayed { uci, san, fen } => {
+            assert_eq!(uci, "b7a8q");
+            assert_eq!(san, "bxa8=Q+");
+            assert!(fen.starts_with("Q3k3/8/8/8/8/8/8/4K3"), "fen: {fen}");
+        }
+        other => panic!("expected MovePlayed, got {other:?}"),
+    }
+}
+
+#[test]
+fn en_passant_capture_is_legal_and_applied() {
+    // 1.e4 a6 2.e5 d5 — now White can take d5 en passant via e5d6.
+    let mut game = StandardGame::new();
+    play_moves(&mut game, &["e2e4", "a7a6", "e4e5", "d7d5"]);
+
+    // The en-passant square is recorded in the view's FEN.
+    assert!(
+        view_of(&game).fen.contains(" d6 "),
+        "fen should record the ep square: {}",
+        view_of(&game).fen
+    );
+    // `e5d6` is offered and captures the d5 pawn.
+    let moves = view_of(&game).legal_moves_uci;
+    assert!(moves.contains(&"e5d6".to_owned()), "got: {moves:?}");
+
+    let effect = game.apply(Color::White, &move_action("e5d6")).unwrap();
+    let event: StandardEvent = effect.events[0].to_typed().unwrap();
+    match event {
+        StandardEvent::MovePlayed { san, fen, .. } => {
+            assert_eq!(san, "exd6");
+            // The captured pawn is gone: no black pawn remains on d5.
+            assert!(fen.starts_with("rnbqkbnr/1pp1pppp/p2P4/8"), "fen: {fen}");
+        }
+        other => panic!("expected MovePlayed, got {other:?}"),
+    }
 }
 
 #[test]
@@ -358,6 +482,11 @@ fn factory_metadata_is_correct() {
     assert_eq!(factory.id(), STANDARD_VARIANT_ID);
     assert_eq!(factory.id(), "standard");
     assert_eq!(factory.display_name(), "Standard Chess");
+
+    let factory = Chess960Variant;
+    assert_eq!(factory.id(), CHESS960_VARIANT_ID);
+    assert_eq!(factory.id(), "chess960");
+    assert_eq!(factory.display_name(), "Chess960");
 }
 
 #[test]
@@ -376,6 +505,7 @@ fn registry_integration_drives_a_move_through_box_dyn() {
     register(&mut registry);
 
     assert!(registry.ids().contains(&STANDARD_VARIANT_ID));
+    assert!(registry.ids().contains(&CHESS960_VARIANT_ID));
 
     let mut game: Box<dyn GameSession> = registry
         .new_game(STANDARD_VARIANT_ID, &VariantOptions::default())
@@ -394,4 +524,106 @@ fn registry_integration_drives_a_move_through_box_dyn() {
     let view: StandardView = game.spectator_view().to_typed().unwrap();
     assert_eq!(view.side_to_move, Color::Black);
     assert!(view.fen.starts_with("rnbqkbnr/pppppppp/8/8/4P3"));
+}
+
+// --- Chess960 ----------------------------------------------------------------
+
+#[test]
+fn chess960_factory_builds_from_scharnagl_position() {
+    let factory = Chess960Variant;
+    let opts = VariantOptions::new(serde_json::json!({ "position": 518 }));
+    let game = factory.new_game(&opts).expect("position 518 is valid");
+    // Position 518 is the classical setup.
+    assert_eq!(game.variant_id(), "chess960");
+    assert_eq!(game.to_move(), Color::White);
+    let view: StandardView = game.spectator_view().to_typed().unwrap();
+    assert!(
+        view.fen
+            .starts_with("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"),
+        "fen: {}",
+        view.fen
+    );
+}
+
+#[test]
+fn chess960_rejects_out_of_range_position() {
+    let factory = Chess960Variant;
+    let opts = VariantOptions::new(serde_json::json!({ "position": 960 }));
+    let err = factory.new_game(&opts).unwrap_err();
+    assert!(matches!(err, GameError::InvalidActionPayload(_)));
+}
+
+#[test]
+fn chess960_default_options_use_classical_setup() {
+    let factory = Chess960Variant;
+    let game = factory
+        .new_game(&VariantOptions::default())
+        .expect("default options build a game");
+    assert_eq!(game.variant_id(), "chess960");
+    assert_eq!(game.to_move(), Color::White);
+}
+
+#[test]
+fn chess960_castles_with_king_to_rook_uci() {
+    // A position with the king on e1 and rooks on a1/h1, both castles available.
+    // In Chess960 the castle UCI targets the *rook's* square — `e1a1` queenside
+    // and `e1h1` kingside — which is exactly how it differs from the classic
+    // `e1c1` / `e1g1` the standard variant uses.
+    let game =
+        StandardGame::from_fen("r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w HAha - 0 1").unwrap();
+    assert_eq!(game.variant_id(), "chess960");
+
+    let moves = view_of(&game).legal_moves_uci;
+    assert!(
+        moves.contains(&"e1a1".to_owned()) && moves.contains(&"e1h1".to_owned()),
+        "expected king-to-rook castles e1a1 and e1h1; got: {moves:?}"
+    );
+    // The classic-UCI spellings are NOT used by the Chess960 variant.
+    assert!(!moves.contains(&"e1c1".to_owned()), "got: {moves:?}");
+    assert!(!moves.contains(&"e1g1".to_owned()), "got: {moves:?}");
+
+    // Castle queenside (king-to-a-rook) and confirm king→c1, rook→d1.
+    let mut game = game;
+    let effect = game.apply(Color::White, &move_action("e1a1")).unwrap();
+    let event: StandardEvent = effect.events[0].to_typed().unwrap();
+    match event {
+        StandardEvent::MovePlayed { uci, san, fen } => {
+            assert_eq!(uci, "e1a1");
+            assert_eq!(san, "O-O-O");
+            assert!(
+                fen.starts_with("r3k2r/pppppppp/8/8/8/8/PPPPPPPP/2KR3R"),
+                "fen after 960 O-O-O: {fen}"
+            );
+        }
+        other => panic!("expected MovePlayed, got {other:?}"),
+    }
+}
+
+#[test]
+fn chess960_full_game_reaches_checkmate() {
+    // Play Fool's-mate-style moves from the classical 960 layout (position 518),
+    // which behaves exactly like standard chess, to reach a terminal state.
+    let mut game = StandardGame::chess960(518).unwrap();
+    play_moves(&mut game, &["f2f3", "e7e5", "g2g4", "d8h4"]);
+    assert_eq!(
+        game.outcome(),
+        Some(Outcome::win(Color::Black, EndReason::Checkmate))
+    );
+    assert!(game.status().is_finished());
+}
+
+#[test]
+fn chess960_from_fen_via_factory() {
+    let factory = Chess960Variant;
+    // Shredder FEN (rook files in the castling field) is accepted for the
+    // off-centre rook placements Chess960 allows.
+    let opts = VariantOptions::new(serde_json::json!({
+        "fen": "nrbbqknr/pppppppp/8/8/8/8/PPPPPPPP/NRBBQKNR w HBhb - 0 1"
+    }));
+    let mut game = factory.new_game(&opts).expect("valid 960 fen");
+    assert_eq!(game.variant_id(), "chess960");
+    // A simple knight move from the corner is legal.
+    let effect = game.apply(Color::White, &move_action("a1b3")).unwrap();
+    assert!(!effect.status.is_finished());
+    assert_eq!(game.to_move(), Color::Black);
 }

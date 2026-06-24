@@ -10,8 +10,8 @@
 //! - connects [`SqlxStorage`](mcs_storage::SqlxStorage) (which builds the pool
 //!   and runs migrations);
 //! - builds a [`VariantRegistry`](mcs_core::VariantRegistry) and **registers
-//!   all supported variants** (standard, RBC, and the shakmaty family) here,
-//!   keeping `mcs-api` variant-agnostic;
+//!   all supported variants** (standard, Chess960, and RBC) here, keeping
+//!   `mcs-api` variant-agnostic;
 //! - constructs the [`AppState`](mcs_api::AppState) and the top-level router via
 //!   [`mcs_api::router`], adds a `GET /health` endpoint, and wraps everything in
 //!   the request-id and HTTP-trace Tower layers from `mcs-observability`.
@@ -62,9 +62,8 @@ async fn health() -> Json<Health> {
 /// [`VariantRegistry`](mcs_core::VariantRegistry):
 ///
 /// - **standard** — ordinary FIDE chess (`mcs-variant-standard`);
-/// - **rbc** — Reconnaissance Blind Chess (`mcs-variant-rbc`);
-/// - **atomic, antichess, crazyhouse, kingofthehill, threecheck, racingkings,
-///   horde, chess960** — the shakmaty family (`mcs-variant-shakmaty`).
+/// - **chess960** — Fischer Random Chess (`mcs-variant-standard`);
+/// - **rbc** — Reconnaissance Blind Chess (`mcs-variant-rbc`).
 ///
 /// After registration the count of registered variants is logged at `INFO`
 /// level so operators can confirm all variants loaded.
@@ -87,9 +86,9 @@ pub fn build_state(
     session_secret: Vec<u8>,
 ) -> anyhow::Result<AppState> {
     let mut variants = VariantRegistry::new();
+    // `mcs_variant_standard::register` adds both `standard` and `chess960`.
     mcs_variant_standard::register(&mut variants);
     mcs_variant_rbc::register(&mut variants);
-    mcs_variant_shakmaty::register_all(&mut variants);
     tracing::info!(count = variants.ids().len(), "variant registry built");
 
     let session_config = SessionConfig::new(

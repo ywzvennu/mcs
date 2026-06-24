@@ -35,14 +35,13 @@ COPY crates/mcs-rating/Cargo.toml       crates/mcs-rating/Cargo.toml
 COPY crates/mcs-server/Cargo.toml       crates/mcs-server/Cargo.toml
 COPY crates/mcs-storage/Cargo.toml      crates/mcs-storage/Cargo.toml
 COPY crates/mcs-variant-rbc/Cargo.toml           crates/mcs-variant-rbc/Cargo.toml
-COPY crates/mcs-variant-shakmaty/Cargo.toml       crates/mcs-variant-shakmaty/Cargo.toml
 COPY crates/mcs-variant-standard/Cargo.toml       crates/mcs-variant-standard/Cargo.toml
 
 # Create stub lib/main files so `cargo build` can resolve and cache deps without
 # any real source code.  They will be overwritten by the full COPY below.
 RUN for crate in mcs-api mcs-auth mcs-cluster mcs-core mcs-domain mcs-game \
         mcs-observability mcs-payments mcs-rating mcs-storage \
-        mcs-variant-rbc mcs-variant-shakmaty mcs-variant-standard; do \
+        mcs-variant-rbc mcs-variant-standard; do \
         mkdir -p crates/$crate/src && echo "pub fn _stub() {}" > crates/$crate/src/lib.rs; \
     done && \
     mkdir -p crates/mcs-server/src && \

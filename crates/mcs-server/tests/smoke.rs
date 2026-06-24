@@ -5,7 +5,7 @@
 //! bound — to assert the wiring is sound: `GET /health` returns `200 OK`, the
 //! API's `GET /auth/nonce` route is actually mounted (proving the `mcs-api`
 //! router was merged), and `GET /variants` lists the expected variant ids
-//! (proving standard, RBC, and the shakmaty family are all registered).
+//! (proving standard, Chess960, and RBC are all registered).
 
 use std::sync::Arc;
 
@@ -100,20 +100,21 @@ async fn variants_endpoint_lists_all_registered_variants() {
         .map(|v| v["id"].as_str().expect("id is string"))
         .collect();
 
-    // Verify standard, RBC, and a representative sample of the shakmaty family
-    // are present — proving all three register calls fired at startup.
-    for expected in &["standard", "rbc", "atomic", "chess960", "antichess"] {
+    // Verify the full set is present — proving both register calls fired at
+    // startup (`mcs_variant_standard::register` adds standard + chess960, and
+    // `mcs_variant_rbc::register` adds rbc).
+    for expected in &["standard", "chess960", "rbc"] {
         assert!(
             ids.contains(expected),
             "expected variant '{expected}' to be registered; got: {ids:?}"
         );
     }
 
-    // The full set: standard + rbc + 8 shakmaty variants = 10 total.
+    // The full set: standard + chess960 + rbc = 3 total.
     assert_eq!(
         ids.len(),
-        10,
-        "expected 10 registered variants; got {}: {ids:?}",
+        3,
+        "expected 3 registered variants; got {}: {ids:?}",
         ids.len()
     );
 }

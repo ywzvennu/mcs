@@ -25,7 +25,7 @@ use crate::state::AppState;
 /// `display_name` is a human-readable label suitable for UI elements.
 #[derive(Debug, Clone, Serialize)]
 pub struct VariantDto {
-    /// The stable, machine-facing identifier (e.g. `"standard"`, `"atomic"`).
+    /// The stable, machine-facing identifier (e.g. `"standard"`, `"chess960"`).
     pub id: String,
     /// A human-readable label for the variant (e.g. `"Standard Chess"`).
     pub display_name: String,
