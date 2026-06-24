@@ -113,11 +113,13 @@ async fn start_game(state: &AppState, white: UserId, black: UserId) -> (GameId, 
         .expect("persist active game");
 
     let repo = state.game_repo().clone();
+    let action_log = state.action_log().clone();
     let hook = state.completion_hook().clone();
     let handle = GameActor::spawn(
         game_id,
         standard_session(),
         repo,
+        action_log,
         hook,
         TimeControl::Unlimited,
     );

@@ -14,15 +14,18 @@
 //! ## Architecture
 //!
 //! - [`GameActor::spawn`] takes ownership of a `Box<dyn GameSession>`, an
-//!   `Arc<dyn GameRepo>`, and an `Arc<dyn GameCompletionHook>`, spawns the actor
-//!   task, and returns a [`GameHandle`].
+//!   `Arc<dyn GameRepo>`, an `Arc<dyn ActionLogRepo>`, and an
+//!   `Arc<dyn GameCompletionHook>`, spawns the actor task, and returns a
+//!   [`GameHandle`].
 //! - [`GameHandle`] forwards each call over an `mpsc` command channel and
 //!   awaits the actor's reply. Cloning it is cheap, so every connection can
 //!   hold one.
 //! - On every successful [`submit_action`](GameHandle::submit_action) the actor
 //!   broadcasts a [`GameEvent`] to all [`subscribe`](GameHandle::subscribe)rs
-//!   over a [`tokio::sync::broadcast`] channel, and — when the action ends the
-//!   game — records the final result through the injected
+//!   over a [`tokio::sync::broadcast`] channel, durably records the action in the
+//!   injected [`ActionLogRepo`](mcs_storage::ActionLogRepo) and refreshes the
+//!   game's live snapshot through the [`GameRepo`](mcs_storage::GameRepo), and —
+//!   when the action ends the game — records the final result through that same
 //!   [`GameRepo`](mcs_storage::GameRepo).
 //! - The actor owns an authoritative [`ClockEngine`]: it deducts elapsed time on
 //!   each move, attaches a [`Clock`](mcs_domain::Clock) snapshot to every
@@ -47,11 +50,12 @@
 //! use mcs_core::{Action, Color, GameSession};
 //! use mcs_domain::{GameId, TimeControl};
 //! use mcs_game::{GameActor, NoopHook};
-//! use mcs_storage::GameRepo;
+//! use mcs_storage::{ActionLogRepo, GameRepo};
 //!
 //! # async fn run(
 //! #     session: Box<dyn GameSession>,
 //! #     repo: Arc<dyn GameRepo>,
+//! #     action_log: Arc<dyn ActionLogRepo>,
 //! #     game_id: GameId,
 //! #     action: Action,
 //! # ) {
@@ -61,7 +65,7 @@
 //! };
 //! // No completion side effect here; production wires in a rating updater.
 //! let hook = Arc::new(NoopHook);
-//! let handle = GameActor::spawn(game_id, session, repo, hook, time_control);
+//! let handle = GameActor::spawn(game_id, session, repo, action_log, hook, time_control);
 //!
 //! // A connected client subscribes to the live stream...
 //! let mut events = handle.subscribe();

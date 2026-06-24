@@ -374,11 +374,21 @@ async fn create_paired_game(state: &AppState, pairing: Pairing) -> ApiResult<Gam
     state.game_repo().create(&game).await?;
 
     // Spawn the actor over the same backing store and register its handle so the
-    // WebSocket endpoint can find the live game by id. The completion hook
-    // applies the Glicko-2 rating update when this game finishes.
+    // WebSocket endpoint can find the live game by id. The actor records each
+    // move to the action log and refreshes the live snapshot through the game
+    // repo as play proceeds; the completion hook applies the Glicko-2 rating
+    // update when this game finishes.
     let repo: Arc<dyn mcs_storage::GameRepo> = state.game_repo().clone();
+    let action_log: Arc<dyn mcs_storage::ActionLogRepo> = state.action_log().clone();
     let hook = state.completion_hook().clone();
-    let handle = GameActor::spawn(game.id, session, repo, hook, pairing.time_control);
+    let handle = GameActor::spawn(
+        game.id,
+        session,
+        repo,
+        action_log,
+        hook,
+        pairing.time_control,
+    );
     state.game_hub().insert(game.id, handle);
 
     Ok(game)

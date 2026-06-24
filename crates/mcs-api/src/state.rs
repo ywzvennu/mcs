@@ -11,7 +11,7 @@ use mcs_auth::SessionConfig;
 use mcs_core::VariantRegistry;
 use mcs_game::{GameCompletionHook, Matchmaker};
 use mcs_payments::{PaymentRequirements, PaymentVerifier};
-use mcs_storage::{GameRepo, RatingRepo, Repositories, SeekRepo, UserRepo};
+use mcs_storage::{ActionLogRepo, GameRepo, RatingRepo, Repositories, SeekRepo, UserRepo};
 use time::Duration;
 
 use crate::hub::GameHub;
@@ -165,6 +165,12 @@ pub struct AppState {
     variants: Arc<VariantRegistry>,
     matchmaker: Arc<Matchmaker>,
     game_repo: Arc<dyn GameRepo>,
+    /// The append-only action log handed to every spawned
+    /// [`GameActor`](mcs_game::GameActor): the actor records each applied move
+    /// here and refreshes the live snapshot through [`game_repo`](Self::game_repo)
+    /// as play proceeds. Held as `Arc<dyn ActionLogRepo>`, derived from the same
+    /// backing store as every other handle.
+    action_log: Arc<dyn ActionLogRepo>,
     /// The completion hook handed to every spawned [`GameActor`](mcs_game::GameActor):
     /// on game end it applies the Glicko-2 rating update for both players. Held
     /// as `Arc<dyn GameCompletionHook>` so the actor stays decoupled from the
@@ -211,7 +217,7 @@ impl AppState {
         siwe_config: SiweConfig,
     ) -> Self
     where
-        S: Repositories + GameRepo + SeekRepo + UserRepo + RatingRepo + 'static,
+        S: Repositories + GameRepo + SeekRepo + UserRepo + RatingRepo + ActionLogRepo + 'static,
     {
         // Coerce the one concrete `Arc<S>` into each trait object the layers
         // need. Every coercion shares the same allocation, so all handles read
@@ -219,6 +225,7 @@ impl AppState {
         let repositories: Arc<dyn Repositories> = storage.clone();
         let seek_repo: Arc<dyn SeekRepo> = storage.clone();
         let rating_repo: Arc<dyn RatingRepo> = storage.clone();
+        let action_log: Arc<dyn ActionLogRepo> = storage.clone();
         let game_repo: Arc<dyn GameRepo> = storage;
 
         // The rating updater is the game-completion hook: when an actor ends a
@@ -235,6 +242,7 @@ impl AppState {
             variants,
             matchmaker: Arc::new(Matchmaker::new(seek_repo)),
             game_repo,
+            action_log,
             completion_hook,
             // Payments are off by default: the router behaves exactly as before
             // until a caller opts in via `with_payment`.
@@ -340,6 +348,18 @@ impl AppState {
         &self.game_repo
     }
 
+    /// Returns the action-log handle handed to each spawned game actor.
+    ///
+    /// When a seek pairs, the endpoint passes a clone of this to
+    /// [`GameActor::spawn`](mcs_game::GameActor::spawn); the actor appends each
+    /// applied move to it (and refreshes the live snapshot through
+    /// [`game_repo`](Self::game_repo)) as play proceeds, building the durable
+    /// move history a recovering server replays.
+    #[must_use]
+    pub fn action_log(&self) -> &Arc<dyn ActionLogRepo> {
+        &self.action_log
+    }
+
     /// Returns the game-completion hook handed to each spawned game actor.
     ///
     /// When a seek pairs, the endpoint passes a clone of this to
@@ -366,6 +386,7 @@ impl std::fmt::Debug for AppState {
             .field("variants", &self.variants)
             .field("matchmaker", &self.matchmaker)
             .field("game_repo", &"<dyn GameRepo>")
+            .field("action_log", &"<dyn ActionLogRepo>")
             .field("completion_hook", &"<dyn GameCompletionHook>")
             .field("payment_gate", &self.payment_gate)
             .finish()

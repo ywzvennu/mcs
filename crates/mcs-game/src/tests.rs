@@ -15,7 +15,7 @@ use mcs_core::{
     Action, Color, EndReason, GameError, GameSession, Outcome, VariantOptions, VariantRegistry,
 };
 use mcs_domain::{Game, GameId, GameLifecycle, TimeControl, UserId};
-use mcs_storage::{GameRepo, StorageError, StorageResult};
+use mcs_storage::{ActionLogRepo, GameRepo, RecordedAction, StorageError, StorageResult};
 use mcs_variant_standard::register;
 use mcs_variant_standard::wire::StandardAction;
 use time::OffsetDateTime;
@@ -45,9 +45,25 @@ impl MockGameRepo {
         Arc::new(repo)
     }
 
-    /// Returns the games recorded by `update`, in order.
+    /// Returns the games recorded by `update`, in order. The actor now writes a
+    /// live-snapshot update after every move plus a final finishing write, so
+    /// this includes both; use [`finished_updates`](Self::finished_updates) to
+    /// isolate the terminal write.
     fn updated_games(&self) -> Vec<Game> {
         self.updates.lock().unwrap().clone()
+    }
+
+    /// Returns only the updates that wrote a [`GameLifecycle::Finished`] record,
+    /// i.e. the terminal persist (and any redundant repeat, of which there must
+    /// be none).
+    fn finished_updates(&self) -> Vec<Game> {
+        self.updates
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|g| g.lifecycle == GameLifecycle::Finished)
+            .cloned()
+            .collect()
     }
 }
 
@@ -90,8 +106,9 @@ impl GameRepo for MockGameRepo {
     }
 }
 
-/// A [`GameRepo`] whose `update` always fails, to exercise the persistence
-/// error path on game end.
+/// A [`GameRepo`] whose `update` fails only for the **finishing** write, to
+/// exercise the persistence error path on game end while letting the
+/// per-move live-snapshot updates (which the actor now also performs) succeed.
 #[derive(Debug)]
 struct FailingUpdateRepo {
     game: Game,
@@ -111,8 +128,14 @@ impl GameRepo for FailingUpdateRepo {
         }
     }
 
-    async fn update(&self, _game: &Game) -> StorageResult<()> {
-        Err(StorageError::Backend("write failed".to_owned()))
+    async fn update(&self, game: &Game) -> StorageResult<()> {
+        // Ongoing live-snapshot updates succeed; only the terminal write fails,
+        // so the failure lands on game end exactly as these tests intend.
+        if game.lifecycle == GameLifecycle::Finished {
+            Err(StorageError::Backend("write failed".to_owned()))
+        } else {
+            Ok(())
+        }
     }
 
     async fn list_recent(&self, _limit: u32) -> StorageResult<Vec<Game>> {
@@ -125,6 +148,74 @@ impl GameRepo for FailingUpdateRepo {
 
     async fn list_unfinished(&self) -> StorageResult<Vec<Game>> {
         unreachable!()
+    }
+}
+
+// --------------------------------------------------------------------------
+// In-memory ActionLogRepo mock.
+//
+// Records every appended `RecordedAction` in call order so tests can assert the
+// actor logged exactly one row per applied move, with the right ply, player,
+// action, and clocks. `append` rejects a duplicate ply, mirroring the real
+// append-only contract.
+// --------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct MockActionLogRepo {
+    actions: Mutex<Vec<RecordedAction>>,
+}
+
+impl MockActionLogRepo {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Returns the recorded actions, in append order.
+    fn recorded(&self) -> Vec<RecordedAction> {
+        self.actions.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl ActionLogRepo for MockActionLogRepo {
+    async fn append(&self, _game_id: GameId, action: &RecordedAction) -> StorageResult<()> {
+        let mut actions = self.actions.lock().unwrap();
+        if actions.iter().any(|a| a.ply == action.ply) {
+            return Err(StorageError::Conflict(format!(
+                "duplicate ply {}",
+                action.ply
+            )));
+        }
+        actions.push(action.clone());
+        Ok(())
+    }
+
+    async fn list(&self, _game_id: GameId) -> StorageResult<Vec<RecordedAction>> {
+        Ok(self.recorded())
+    }
+
+    async fn last_ply(&self, _game_id: GameId) -> StorageResult<Option<u32>> {
+        Ok(self.actions.lock().unwrap().iter().map(|a| a.ply).max())
+    }
+}
+
+/// An [`ActionLogRepo`] whose `append` always fails, to exercise the
+/// record-on-move error path.
+#[derive(Debug)]
+struct FailingAppendLog;
+
+#[async_trait]
+impl ActionLogRepo for FailingAppendLog {
+    async fn append(&self, _game_id: GameId, _action: &RecordedAction) -> StorageResult<()> {
+        Err(StorageError::Backend("append failed".to_owned()))
+    }
+
+    async fn list(&self, _game_id: GameId) -> StorageResult<Vec<RecordedAction>> {
+        Ok(Vec::new())
+    }
+
+    async fn last_ply(&self, _game_id: GameId) -> StorageResult<Option<u32>> {
+        Ok(None)
     }
 }
 
@@ -201,6 +292,7 @@ async fn fools_mate_finishes_and_persists_with_correct_outcome() {
         game_id,
         standard_session(),
         repo.clone(),
+        MockActionLogRepo::new(),
         Arc::new(NoopHook),
         TimeControl::Unlimited,
     );
@@ -215,18 +307,19 @@ async fn fools_mate_finishes_and_persists_with_correct_outcome() {
         Some(Outcome::win(Color::Black, EndReason::Checkmate))
     );
 
-    // The actor persisted exactly once, transitioning the record to Finished
-    // with that same outcome.
-    let updated = repo.updated_games();
+    // The actor wrote the finishing record exactly once, transitioning it to
+    // Finished with that same outcome. (Per-move snapshot writes also occur; we
+    // isolate the terminal write here.)
+    let finished = repo.finished_updates();
     assert_eq!(
-        updated.len(),
+        finished.len(),
         1,
-        "the game should be persisted exactly once"
+        "the finished game should be persisted exactly once"
     );
-    assert_eq!(updated[0].id, game_id);
-    assert_eq!(updated[0].lifecycle, GameLifecycle::Finished);
+    assert_eq!(finished[0].id, game_id);
+    assert_eq!(finished[0].lifecycle, GameLifecycle::Finished);
     assert_eq!(
-        updated[0].outcome,
+        finished[0].outcome,
         Some(Outcome::win(Color::Black, EndReason::Checkmate))
     );
 }
@@ -239,6 +332,7 @@ async fn events_are_broadcast_to_subscribers() {
         game_id,
         standard_session(),
         repo,
+        MockActionLogRepo::new(),
         Arc::new(NoopHook),
         TimeControl::Unlimited,
     );
@@ -290,6 +384,7 @@ async fn out_of_turn_action_is_rejected() {
         game_id,
         standard_session(),
         repo.clone(),
+        MockActionLogRepo::new(),
         Arc::new(NoopHook),
         TimeControl::Unlimited,
     );
@@ -317,6 +412,7 @@ async fn illegal_action_is_rejected() {
         game_id,
         standard_session(),
         repo.clone(),
+        MockActionLogRepo::new(),
         Arc::new(NoopHook),
         TimeControl::Unlimited,
     );
@@ -341,6 +437,7 @@ async fn acting_after_finish_is_rejected_and_persists_only_once() {
         game_id,
         standard_session(),
         repo.clone(),
+        MockActionLogRepo::new(),
         Arc::new(NoopHook),
         TimeControl::Unlimited,
     );
@@ -354,8 +451,11 @@ async fn acting_after_finish_is_rejected_and_persists_only_once() {
         .unwrap_err();
     assert!(matches!(err, GameSessionError::Game(GameError::Finished)));
 
-    // ...and the rejected action triggers no additional persistence.
-    assert_eq!(repo.updated_games().len(), 1);
+    // ...and the rejected action triggers no additional persistence: the four
+    // applied moves each wrote a live snapshot and the finishing move added one
+    // terminal write (5 total), and the rejected move adds nothing.
+    assert_eq!(repo.finished_updates().len(), 1);
+    assert_eq!(repo.updated_games().len(), 5);
 }
 
 #[tokio::test]
@@ -366,6 +466,7 @@ async fn views_and_legal_actions_are_served_through_the_handle() {
         game_id,
         standard_session(),
         repo,
+        MockActionLogRepo::new(),
         Arc::new(NoopHook),
         TimeControl::Unlimited,
     );
@@ -398,6 +499,7 @@ async fn persistence_failure_on_game_end_surfaces_as_storage_error() {
         game_id,
         standard_session(),
         repo,
+        MockActionLogRepo::new(),
         Arc::new(NoopHook),
         TimeControl::Unlimited,
     );
@@ -438,6 +540,7 @@ async fn handle_is_cloneable_and_clones_share_one_session() {
         game_id,
         standard_session(),
         repo,
+        MockActionLogRepo::new(),
         Arc::new(NoopHook),
         TimeControl::Unlimited,
     );
@@ -515,6 +618,7 @@ async fn move_events_carry_live_clock_snapshots() {
         game_id,
         standard_session(),
         repo,
+        MockActionLogRepo::new(),
         Arc::new(NoopHook),
         tc,
         Box::new(SharedTimeSource(time.clone())),
@@ -558,6 +662,7 @@ async fn player_who_stops_moving_loses_on_time() {
         game_id,
         standard_session(),
         repo.clone(),
+        MockActionLogRepo::new(),
         Arc::new(NoopHook),
         tc,
         Box::new(SharedTimeSource(time.clone())),
@@ -603,6 +708,7 @@ async fn moving_after_flagging_is_rejected() {
         game_id,
         standard_session(),
         repo.clone(),
+        MockActionLogRepo::new(),
         Arc::new(NoopHook),
         tc,
         Box::new(SharedTimeSource(time.clone())),
@@ -631,6 +737,7 @@ async fn unlimited_game_never_flags_and_omits_clock() {
         game_id,
         standard_session(),
         repo.clone(),
+        MockActionLogRepo::new(),
         Arc::new(NoopHook),
         TimeControl::Unlimited,
         Box::new(SharedTimeSource(time.clone())),
@@ -662,6 +769,7 @@ async fn dropping_all_handles_stops_the_actor() {
         game_id,
         standard_session(),
         repo,
+        MockActionLogRepo::new(),
         Arc::new(NoopHook),
         TimeControl::Unlimited,
     );
@@ -729,6 +837,7 @@ async fn completion_hook_fires_once_with_finished_game_and_outcome() {
         game_id,
         standard_session(),
         repo,
+        MockActionLogRepo::new(),
         hook.clone(),
         TimeControl::Unlimited,
     );
@@ -755,6 +864,7 @@ async fn completion_hook_does_not_fire_while_the_game_is_ongoing() {
         game_id,
         standard_session(),
         repo,
+        MockActionLogRepo::new(),
         hook.clone(),
         TimeControl::Unlimited,
     );
@@ -781,6 +891,7 @@ async fn completion_hook_is_not_run_when_persistence_fails() {
         game_id,
         standard_session(),
         repo,
+        MockActionLogRepo::new(),
         hook.clone(),
         TimeControl::Unlimited,
     );
@@ -811,4 +922,190 @@ async fn completion_hook_is_not_run_when_persistence_fails() {
         hook.calls().is_empty(),
         "the hook must not fire when persistence fails"
     );
+}
+
+// --------------------------------------------------------------------------
+// Action-log recording and live-snapshot integration tests.
+//
+// These assert the actor's durability contract: every applied player action is
+// appended to the log exactly once at a monotonically increasing ply, carrying
+// the right player, the exact `Action`, and clock millis matching the post-move
+// snapshot; and the game's live snapshot tracks the position move by move. The
+// finishing move still records its action *and* marks the game finished.
+// --------------------------------------------------------------------------
+
+/// Plays a full Fool's-mate game through the actor with a real-time clock driven
+/// by a manual time source, and asserts the action log and live snapshot track
+/// every move — including the mating move, which is both logged and finishing.
+#[tokio::test(start_paused = true)]
+async fn each_applied_move_is_recorded_and_snapshots_the_live_game() {
+    let game_id = GameId::new();
+    let repo = MockGameRepo::with_game(real_time_game(game_id, 300, 2));
+    let log = MockActionLogRepo::new();
+    let time = Arc::new(ManualTimeSource::new(OffsetDateTime::UNIX_EPOCH));
+    let tc = TimeControl::RealTime {
+        initial: Duration::from_secs(300),
+        increment: Duration::from_secs(2),
+    };
+    let handle = GameActor::spawn_with_time_source(
+        game_id,
+        standard_session(),
+        repo.clone(),
+        log.clone(),
+        Arc::new(NoopHook),
+        tc,
+        Box::new(SharedTimeSource(time.clone())),
+    );
+
+    // Each side spends one second per move, so the post-move clocks are
+    // predictable: mover loses 1s, gains the 2s increment (net +1s).
+    let moves = [
+        (Color::White, "f2f3"),
+        (Color::Black, "e7e5"),
+        (Color::White, "g2g4"),
+        (Color::Black, "d8h4"),
+    ];
+    for (player, uci) in moves {
+        time.advance(Duration::from_secs(1)).await;
+        handle.submit_action(player, mv(uci)).await.unwrap();
+    }
+
+    // Exactly one recorded action per applied move, at plies 0..4, with the
+    // right player and the exact `Action` submitted.
+    let recorded = log.recorded();
+    assert_eq!(recorded.len(), 4, "one log row per applied move");
+    for (i, ((player, uci), row)) in moves.iter().zip(&recorded).enumerate() {
+        assert_eq!(row.ply, i as u32, "plies increase monotonically from 0");
+        assert_eq!(row.player, *player);
+        assert_eq!(row.action, mv(uci), "the exact submitted action is logged");
+        // Timed game: both clocks are recorded.
+        assert!(row.clock_white_ms.is_some());
+        assert!(row.clock_black_ms.is_some());
+    }
+
+    // After White's first move (1s spent, +2s increment): 300 - 1 + 2 = 301s.
+    assert_eq!(recorded[0].clock_white_ms, Some(301_000));
+    assert_eq!(recorded[0].clock_black_ms, Some(300_000));
+    // After Black's reply: White unchanged, Black 300 - 1 + 2 = 301s.
+    assert_eq!(recorded[1].clock_white_ms, Some(301_000));
+    assert_eq!(recorded[1].clock_black_ms, Some(301_000));
+
+    // The live snapshot tracks the position: the final write before the finish
+    // recorded ply 4 with the same clocks the log carries. We assert the
+    // snapshot writes (lifecycle still Active) advance the ply each move.
+    let snapshots: Vec<_> = repo
+        .updated_games()
+        .into_iter()
+        .filter(|g| g.lifecycle == GameLifecycle::Active)
+        .collect();
+    assert_eq!(
+        snapshots.len(),
+        4,
+        "one live-snapshot write per applied move"
+    );
+    for (i, snap) in snapshots.iter().enumerate() {
+        assert_eq!(snap.ply, i as u32 + 1, "snapshot ply counts applied moves");
+    }
+    // The first three moves leave a side to move; the mating move clears it.
+    assert_eq!(snapshots[0].side_to_move, Some(Color::Black));
+    assert_eq!(snapshots[1].side_to_move, Some(Color::White));
+    assert_eq!(snapshots[2].side_to_move, Some(Color::Black));
+    assert_eq!(
+        snapshots[3].side_to_move, None,
+        "the finishing move records no side to move"
+    );
+    // Snapshot clocks match the log's clock readings for the same move.
+    assert_eq!(snapshots[0].clock_white_ms, recorded[0].clock_white_ms);
+    assert_eq!(snapshots[0].clock_black_ms, recorded[0].clock_black_ms);
+
+    // The finishing move both logged its action and finished the game.
+    let finished = repo.finished_updates();
+    assert_eq!(finished.len(), 1, "the game is finished exactly once");
+    assert_eq!(finished[0].lifecycle, GameLifecycle::Finished);
+    assert_eq!(
+        finished[0].outcome,
+        Some(Outcome::win(Color::Black, EndReason::Checkmate))
+    );
+    assert_eq!(
+        handle.outcome().await.unwrap(),
+        Some(Outcome::win(Color::Black, EndReason::Checkmate))
+    );
+}
+
+/// An untimed game records `None` clocks on every log row and snapshot.
+#[tokio::test]
+async fn untimed_game_records_no_clocks() {
+    let game_id = GameId::new();
+    let repo = MockGameRepo::with_game(active_game(game_id));
+    let log = MockActionLogRepo::new();
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo.clone(),
+        log.clone(),
+        Arc::new(NoopHook),
+        TimeControl::Unlimited,
+    );
+
+    handle
+        .submit_action(Color::White, mv("e2e4"))
+        .await
+        .unwrap();
+
+    let recorded = log.recorded();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].ply, 0);
+    assert_eq!(recorded[0].player, Color::White);
+    assert!(recorded[0].clock_white_ms.is_none());
+    assert!(recorded[0].clock_black_ms.is_none());
+
+    let snapshots = repo.updated_games();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].ply, 1);
+    assert_eq!(snapshots[0].side_to_move, Some(Color::Black));
+    assert!(snapshots[0].clock_white_ms.is_none());
+}
+
+#[tokio::test]
+async fn append_failure_surfaces_as_storage_error_without_corrupting_the_session() {
+    let game_id = GameId::new();
+    let repo = MockGameRepo::with_game(active_game(game_id));
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo.clone(),
+        Arc::new(FailingAppendLog),
+        Arc::new(NoopHook),
+        TimeControl::Unlimited,
+    );
+
+    // The move applies in memory but its log append fails, surfacing as a
+    // storage error rather than a game error.
+    let err = handle
+        .submit_action(Color::White, mv("e2e4"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GameSessionError::Storage(_)));
+
+    // The in-memory session is not rolled back: the move is live, so it is now
+    // Black's turn. (At-least-once: the move is live but was not durably
+    // recorded; recovery replays only what was logged.)
+    assert_eq!(
+        handle.status().await.unwrap(),
+        mcs_core::GameStatus::Ongoing
+    );
+    // White moving again is rejected as out of turn — proof the apply advanced
+    // the side to move rather than being undone.
+    let out_of_turn = handle
+        .submit_action(Color::White, mv("d2d4"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        out_of_turn,
+        GameSessionError::Game(GameError::NotYourTurn)
+    ));
+
+    // A failed append wrote no snapshot (the actor returns before updating it),
+    // and the rejected out-of-turn move is not recorded either.
+    assert!(repo.updated_games().is_empty());
 }
