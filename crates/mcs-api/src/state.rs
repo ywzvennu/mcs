@@ -5,17 +5,40 @@
 //! either an [`Arc`] or a small, cloneable config value — so axum can hand a
 //! fresh copy to each request without contention.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use mcs_auth::SessionConfig;
 use mcs_core::VariantRegistry;
-use mcs_game::{GameCompletionHook, Matchmaker};
+use mcs_domain::{GameId, GameLifecycle};
+use mcs_game::{recover_game, GameCompletionHook, GameHandle, Matchmaker};
 use mcs_payments::{PaymentRequirements, PaymentVerifier};
+use mcs_storage::error::StorageError;
 use mcs_storage::{ActionLogRepo, GameRepo, RatingRepo, Repositories, SeekRepo, UserRepo};
 use time::Duration;
+use tokio::sync::Mutex;
 
+use crate::error::ApiError;
 use crate::hub::GameHub;
 use crate::rating::RatingUpdateHook;
+
+/// A serializer for the recover-and-insert critical section, keyed by [`GameId`].
+///
+/// `get_or_recover` may be called concurrently for the same absent game (two
+/// clients connecting to a cold node at once). Rebuilding an actor is expensive
+/// and — more importantly — must happen **exactly once**: a second actor would
+/// double-record the action log and split the live game across two broadcast
+/// channels. This map hands out one [`Mutex`] per game id so that, for a given
+/// game, only one task at a time runs the load-recover-insert sequence; the
+/// others wait, then observe the freshly inserted handle on their re-check of
+/// the hub.
+///
+/// The outer mutex guards only the brief lookup/creation of a per-id lock and is
+/// never held across recovery; the per-id lock is what is held across the
+/// `.await`-heavy recovery. Both are [`tokio::sync::Mutex`]es, never a
+/// [`std`] lock, so no guard is ever held across an `.await` in a way that could
+/// block the runtime.
+type RecoveryLocks = Arc<Mutex<HashMap<GameId, Arc<Mutex<()>>>>>;
 
 /// Configuration for the Sign-In with Ethereum (EIP-4361) challenge that the
 /// server hands to wallets at `GET /auth/nonce`.
@@ -183,6 +206,10 @@ pub struct AppState {
     /// [`RequirePaymentLayer`](mcs_payments::RequirePaymentLayer). Configure it
     /// with [`with_payment`](AppState::with_payment).
     payment_gate: Option<PaymentGate>,
+    /// Per-game serialization for [`get_or_recover`](AppState::get_or_recover),
+    /// so two concurrent connects to the same absent game rebuild its actor only
+    /// once. See [`RecoveryLocks`]. Shared across clones via the inner [`Arc`].
+    recovery_locks: RecoveryLocks,
 }
 
 impl AppState {
@@ -247,6 +274,7 @@ impl AppState {
             // Payments are off by default: the router behaves exactly as before
             // until a caller opts in via `with_payment`.
             payment_gate: None,
+            recovery_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -370,6 +398,109 @@ impl AppState {
     pub fn completion_hook(&self) -> &Arc<dyn GameCompletionHook> {
         &self.completion_hook
     }
+
+    /// Resolves the live [`GameHandle`] for `game_id`, rebuilding its actor from
+    /// the durable log on demand if it is not already running here.
+    ///
+    /// This is what lets *any* node — including a freshly restarted process —
+    /// serve an in-progress game on first access, rather than relying on an eager
+    /// in-memory handle (#65). It complements the M3 startup recovery (#58):
+    /// instead of replaying every unfinished game up front, a game is revived
+    /// lazily the first time a client reaches for it.
+    ///
+    /// The resolution is:
+    ///
+    /// 1. **Fast path** — if the [`game_hub`](Self::game_hub) already holds a
+    ///    live handle, return it immediately (no storage access, no lock).
+    /// 2. Otherwise load the [`Game`](mcs_domain::Game) through
+    ///    [`GameRepo::get`]. A game that does not exist yields `Ok(None)`; a game
+    ///    whose [`lifecycle`](mcs_domain::Game::lifecycle) is
+    ///    [`Finished`](GameLifecycle::Finished) also yields `Ok(None)`, because a
+    ///    finished game has no live actor to drive.
+    /// 3. Otherwise rebuild a resumed actor with
+    ///    [`mcs_game::recover_game`] — replaying the action log and resuming the
+    ///    clocks — [`insert`](GameHub::insert) the handle into the hub, and
+    ///    return it.
+    ///
+    /// # Concurrency
+    ///
+    /// Two concurrent calls for the same absent game must rebuild it **once**.
+    /// Step 3 runs under a per-game lock (see [`RecoveryLocks`]): the first caller
+    /// recovers and inserts; every other caller, after taking the same lock,
+    /// re-checks the hub and finds the handle the first inserted — so exactly one
+    /// actor is ever spawned. The lock is a [`tokio::sync::Mutex`], so it is held
+    /// safely across the `.await`-heavy recovery without blocking the runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Internal`] if storage cannot be read (other than a
+    /// plain not-found, which is reported as `Ok(None)`) or if recovery fails —
+    /// for example a variant that is no longer registered, or a durable log that
+    /// diverges from the rebuilt session. Recovery failures are logged with the
+    /// game id and collapsed to a generic internal error for the caller.
+    pub async fn get_or_recover(&self, game_id: GameId) -> Result<Option<GameHandle>, ApiError> {
+        // 1. Fast path: already live. The common case for a warm node.
+        if let Some(handle) = self.game_hub.get(game_id) {
+            return Ok(Some(handle));
+        }
+
+        // Take the per-game recovery lock so that, for this id, only one task
+        // runs the load-recover-insert sequence below. The outer map lock is
+        // released immediately; only the per-id lock is held across recovery.
+        let per_game = {
+            let mut locks = self.recovery_locks.lock().await;
+            Arc::clone(locks.entry(game_id).or_default())
+        };
+        let _guard = per_game.lock().await;
+
+        // 2. Re-check the hub now that we hold the lock: a racing caller may have
+        //    recovered and inserted the handle while we were waiting.
+        if let Some(handle) = self.game_hub.get(game_id) {
+            return Ok(Some(handle));
+        }
+
+        // 3. Load the durable record. A missing game is `Ok(None)`, not an error;
+        //    any other storage failure is a genuine internal error.
+        let game = match self.game_repo.get(game_id).await {
+            Ok(game) => game,
+            Err(StorageError::NotFound) => return Ok(None),
+            Err(error) => {
+                tracing::error!(%game_id, %error, "failed to load game for recovery");
+                return Err(ApiError::Internal(format!(
+                    "failed to load game {game_id}: {error}"
+                )));
+            }
+        };
+
+        // A finished game has no live actor; nothing to revive.
+        if game.lifecycle == GameLifecycle::Finished {
+            return Ok(None);
+        }
+
+        // Rebuild a resumed actor from the log and register it. Handing the
+        // actor the same `Arc<dyn _>` handles a freshly created game receives
+        // keeps both paths writing to one backing store.
+        let handle = recover_game(
+            &game,
+            &self.variants,
+            Arc::clone(&self.action_log),
+            Arc::clone(&self.game_repo),
+            Arc::clone(&self.completion_hook),
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(%game_id, %error, "failed to recover game");
+            ApiError::Internal(format!("failed to recover game {game_id}: {error}"))
+        })?;
+
+        // Insert under the lock so the re-check above is the only window any
+        // racing caller can observe — they will find this handle, not spawn a
+        // second actor. A pre-existing handle would mean a double-spawn, which
+        // the lock prevents; defensively drop whatever `insert` returns.
+        let _previous = self.game_hub.insert(game_id, handle.clone());
+
+        Ok(Some(handle))
+    }
 }
 
 // `SessionConfig` deliberately has no `Debug` derive that exposes the secret
@@ -389,6 +520,6 @@ impl std::fmt::Debug for AppState {
             .field("action_log", &"<dyn ActionLogRepo>")
             .field("completion_hook", &"<dyn GameCompletionHook>")
             .field("payment_gate", &self.payment_gate)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
