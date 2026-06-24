@@ -624,13 +624,23 @@ async fn game_socket(
     //    a `RematchAccept` can create the swapped follow-up game.
     let table = state.table_hub().get_or_create(game_id);
 
-    // 8. Apply the configured per-message size limit (#99) so the axum runtime
+    // 8. Connection caps (#100): reserve a slot against the global and per-user
+    //    WebSocket connection caps *before* upgrading. Over the cap, reject the
+    //    upgrade with 429 (and a short Retry-After) rather than opening a socket
+    //    we would immediately have to refuse. The returned guard releases the
+    //    slot on every close path via its `Drop`. These caps are per node.
+    let conn_guard = state.ws_connections().try_open(user_id).ok_or_else(|| {
+        tracing::debug!(%user_id, "rejecting WS upgrade: connection cap reached");
+        ApiError::TooManyRequests("websocket connection limit reached".to_owned())
+    })?;
+
+    // 9. Apply the configured per-message size limit (#99) so the axum runtime
     //    rejects frames above the threshold before they reach the application,
     //    protecting memory against rogue large-frame attacks.
     let max_msg = state.ws_max_message_bytes();
     let upgrade = upgrade.max_message_size(max_msg);
 
-    // 9. Upgrade. From here the connection task owns the socket and the handle.
+    // 10. Upgrade. From here the connection task owns the socket and the handle.
     Ok(upgrade.on_upgrade(move |socket| {
         run_connection(RunConnection {
             socket,
@@ -641,6 +651,7 @@ async fn game_socket(
             state,
             game,
             table,
+            conn_guard,
         })
     }))
 }
@@ -670,6 +681,10 @@ struct RunConnection {
     /// This game's table side-channel: the live rematch event stream and the
     /// pending-offer state.
     table: Arc<TableChannel>,
+    /// The reserved WebSocket connection-cap slot (#100). Held for the whole
+    /// connection so its `Drop` releases the global/per-user count on every exit
+    /// path; never read, just owned.
+    conn_guard: crate::limits::WsConnectionGuard,
 }
 
 /// A scope guard that keeps the active-WebSocket-connections gauge accurate
@@ -733,7 +748,13 @@ async fn run_connection(conn: RunConnection) {
         state,
         game,
         table,
+        conn_guard,
     } = conn;
+
+    // Hold the connection-cap reservation (#100) for the whole task: its `Drop`
+    // releases the global/per-user slot on every exit path. Bound to a named
+    // local so it is not dropped early.
+    let _conn_guard = conn_guard;
 
     // Track this socket on the active-connections gauge (#88). The guard's
     // `Drop` decrements it, so *every* exit path of this task — a snapshot send

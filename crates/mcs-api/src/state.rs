@@ -21,6 +21,9 @@ use tokio::sync::Mutex;
 
 use crate::error::ApiError;
 use crate::hub::GameHub;
+use crate::limits::{
+    LimitsConfig, LiveGameCountingHook, LiveGameRegistry, RateLimiter, WsConnectionRegistry,
+};
 use crate::presence::{InProcessPresence, PresenceTracker};
 use crate::rating::RatingUpdateHook;
 use crate::table::TableHub;
@@ -213,7 +216,16 @@ pub struct AppState {
     /// on game end it applies the Glicko-2 rating update for both players. Held
     /// as `Arc<dyn GameCompletionHook>` so the actor stays decoupled from the
     /// concrete [`RatingUpdateHook`].
+    ///
+    /// This is the **wrapped** hook handed to actors: a
+    /// [`LiveGameCountingHook`](crate::limits::LiveGameCountingHook) around the
+    /// rating hook, so a finished game both updates ratings and frees the two
+    /// players' live-game slots.
     completion_hook: Arc<dyn GameCompletionHook>,
+    /// The unwrapped inner completion hook (the Glicko-2 rating updater), kept so
+    /// [`with_limits`](AppState::with_limits) can re-wrap it around a freshly
+    /// built live-game registry without double-wrapping the counting decorator.
+    inner_completion_hook: Arc<dyn GameCompletionHook>,
     /// The optional x402 payment gate for game creation (#45).
     ///
     /// `None` by default — `POST /seeks` is free and the router is unchanged.
@@ -256,6 +268,23 @@ pub struct AppState {
     ///
     /// Default: 1 MiB — matches the `[http].max_ws_message_bytes` default.
     ws_max_message_bytes: usize,
+    /// Abuse-protection limits configuration (#100): the per-IP rate tiers, the
+    /// WebSocket connection caps, the per-user live-game cap, and the optional
+    /// trusted proxy header. All limits are **per node** (see [`crate::limits`]).
+    limits: LimitsConfig,
+    /// Per-IP token-bucket limiter for `GET /auth/nonce`.
+    nonce_limiter: RateLimiter,
+    /// Per-IP token-bucket limiter for `POST /auth/verify`.
+    verify_limiter: RateLimiter,
+    /// Per-IP token-bucket limiter for the game-creation routes (`POST /seeks`,
+    /// `POST /challenges`).
+    create_limiter: RateLimiter,
+    /// The live-game WebSocket connection registry (global + per-user caps).
+    ws_connections: WsConnectionRegistry,
+    /// The per-user live-game registry, enforcing the simultaneous-games cap.
+    /// Shared with the completion hook so a finished game frees both players'
+    /// slots.
+    live_games: LiveGameRegistry,
 }
 
 /// This node's membership view: how the WebSocket router decides game ownership.
@@ -360,11 +389,21 @@ impl AppState {
         let action_log: Arc<dyn ActionLogRepo> = storage.clone();
         let game_repo: Arc<dyn GameRepo> = storage;
 
+        // Abuse-protection limits (#100): start from the defaults; the server
+        // overrides them from `[limits]` config via `with_limits`.
+        let limits = LimitsConfig::default();
+        let live_games = LiveGameRegistry::new(limits.max_games_per_user);
+
         // The rating updater is the game-completion hook: when an actor ends a
         // game, it recomputes both players' Glicko-2 ratings over this same
-        // store. Holding it as the abstract trait keeps `mcs-game` decoupled.
-        let completion_hook: Arc<dyn GameCompletionHook> =
-            Arc::new(RatingUpdateHook::new(rating_repo));
+        // store. Holding it as the abstract trait keeps `mcs-game` decoupled. It
+        // is wrapped in a `LiveGameCountingHook` so the same "game finished"
+        // signal that updates ratings also frees both players' live-game slots.
+        let rating_hook: Arc<dyn GameCompletionHook> = Arc::new(RatingUpdateHook::new(rating_repo));
+        let completion_hook: Arc<dyn GameCompletionHook> = Arc::new(LiveGameCountingHook::new(
+            live_games.clone(),
+            Arc::clone(&rating_hook),
+        ));
 
         Self {
             storage: repositories,
@@ -377,6 +416,7 @@ impl AppState {
             game_repo,
             action_log,
             completion_hook,
+            inner_completion_hook: rating_hook,
             // Payments are off by default: the router behaves exactly as before
             // until a caller opts in via `with_payment`.
             payment_gate: None,
@@ -396,6 +436,17 @@ impl AppState {
             recovery_locks: Arc::new(Mutex::new(HashMap::new())),
             // 1 MiB default; matches `[http].max_ws_message_bytes` default.
             ws_max_message_bytes: 1024 * 1024,
+            // Abuse-protection limits default to the conservative built-ins; the
+            // server overrides them from `[limits]` via `with_limits`.
+            nonce_limiter: RateLimiter::new(limits.nonce),
+            verify_limiter: RateLimiter::new(limits.verify),
+            create_limiter: RateLimiter::new(limits.create),
+            ws_connections: WsConnectionRegistry::new(
+                limits.max_ws_connections,
+                limits.max_ws_connections_per_user,
+            ),
+            live_games,
+            limits,
         }
     }
 
@@ -495,6 +546,84 @@ impl AppState {
     #[must_use]
     pub fn ws_max_message_bytes(&self) -> usize {
         self.ws_max_message_bytes
+    }
+
+    /// Overrides the abuse-protection limits, returning the modified state
+    /// (builder style).
+    ///
+    /// The default — installed by [`AppState::new`] — is
+    /// [`LimitsConfig::default`]. The server calls this with the values from its
+    /// `[limits]` config so the per-IP rate tiers, the WebSocket connection caps,
+    /// and the per-user live-game cap all reflect the deployment's settings.
+    ///
+    /// This rebuilds the rate limiters, the connection registry, and the
+    /// live-game registry from `limits`. Because the live-game registry is shared
+    /// with the completion hook installed in [`AppState::new`], the previous
+    /// registry instance is replaced here together with that hook so the
+    /// finish-time release continues to target the active registry.
+    #[must_use]
+    pub fn with_limits(mut self, limits: LimitsConfig) -> Self {
+        self.nonce_limiter = RateLimiter::new(limits.nonce);
+        self.verify_limiter = RateLimiter::new(limits.verify);
+        self.create_limiter = RateLimiter::new(limits.create);
+        self.ws_connections = WsConnectionRegistry::new(
+            limits.max_ws_connections,
+            limits.max_ws_connections_per_user,
+        );
+
+        // Rebuild the live-game registry from the new cap and re-wrap the
+        // *inner* (rating) hook around it, so a finished game frees slots on
+        // *this* registry. Wrapping the inner hook (not the currently wrapped
+        // one) avoids stacking a second counting decorator, which would
+        // double-release each slot.
+        let live_games = LiveGameRegistry::new(limits.max_games_per_user);
+        self.completion_hook = Arc::new(LiveGameCountingHook::new(
+            live_games.clone(),
+            Arc::clone(&self.inner_completion_hook),
+        ));
+        self.live_games = live_games;
+
+        self.limits = limits;
+        self
+    }
+
+    /// Returns the abuse-protection limits configuration (#100).
+    #[must_use]
+    pub fn limits(&self) -> &LimitsConfig {
+        &self.limits
+    }
+
+    /// Returns the per-IP rate limiter for `GET /auth/nonce`.
+    #[must_use]
+    pub fn nonce_limiter(&self) -> &RateLimiter {
+        &self.nonce_limiter
+    }
+
+    /// Returns the per-IP rate limiter for `POST /auth/verify`.
+    #[must_use]
+    pub fn verify_limiter(&self) -> &RateLimiter {
+        &self.verify_limiter
+    }
+
+    /// Returns the per-IP rate limiter for the game-creation routes
+    /// (`POST /seeks`, `POST /challenges`).
+    #[must_use]
+    pub fn create_limiter(&self) -> &RateLimiter {
+        &self.create_limiter
+    }
+
+    /// Returns the live-game WebSocket connection registry (global + per-user
+    /// caps). The WS handler reserves a slot here before upgrading.
+    #[must_use]
+    pub fn ws_connections(&self) -> &WsConnectionRegistry {
+        &self.ws_connections
+    }
+
+    /// Returns the per-user live-game registry enforcing the simultaneous-games
+    /// cap.
+    #[must_use]
+    pub fn live_games(&self) -> &LiveGameRegistry {
+        &self.live_games
     }
 
     /// Enables the x402 payment gate on game creation, returning the modified
@@ -675,8 +804,28 @@ impl AppState {
         rated: bool,
         options: VariantOptions,
     ) -> Result<Game, ApiError> {
+        // 0. Abuse cap (#100): reserve a live-game slot for both players before
+        //    creating anything. If either player is already at the per-user cap
+        //    the reservation fails as a unit (no slot is bumped) and creation is
+        //    politely refused with 429. The slots are released when the game
+        //    finishes, via the `LiveGameCountingHook` completion hook. This cap
+        //    is per node — see [`crate::limits`].
+        if !self.live_games.try_reserve_pair(white, black) {
+            return Err(ApiError::TooManyRequests(
+                "a player has reached the maximum number of simultaneous live games".to_owned(),
+            ));
+        }
+
         // 1. Instantiate a fresh session for the agreed variant.
-        let session = self.variants.new_game(variant_id, &options)?;
+        let session = match self.variants.new_game(variant_id, &options) {
+            Ok(session) => session,
+            Err(error) => {
+                // Roll back the reservation so a bad variant does not leak slots.
+                self.live_games.release(white);
+                self.live_games.release(black);
+                return Err(error.into());
+            }
+        };
 
         // 2. Build and persist the durable record, already `Active`.
         let mut game = Game::new(
@@ -689,7 +838,13 @@ impl AppState {
             OffsetDateTime::now_utc(),
         );
         game.lifecycle = GameLifecycle::Active;
-        self.game_repo.create(&game).await?;
+        if let Err(error) = self.game_repo.create(&game).await {
+            // Roll back the reservation: the game was never spawned, so its
+            // completion hook will never run to release the slots.
+            self.live_games.release(white);
+            self.live_games.release(black);
+            return Err(error.into());
+        }
 
         // 3. Spawn the actor over the same backing store and 4. register its
         //    handle so the WebSocket endpoint can find the live game by id.
@@ -838,6 +993,9 @@ impl std::fmt::Debug for AppState {
             .field("presence", &"<dyn PresenceTracker>")
             .field("online_ttl", &self.online_ttl)
             .field("ws_max_message_bytes", &self.ws_max_message_bytes)
+            .field("limits", &self.limits)
+            .field("ws_connections", &self.ws_connections)
+            .field("live_games", &self.live_games)
             .finish_non_exhaustive()
     }
 }

@@ -72,6 +72,7 @@ pub mod error;
 pub mod extract;
 pub mod history;
 pub mod hub;
+pub mod limits;
 pub mod metrics;
 pub mod presence;
 pub mod rating;
@@ -92,6 +93,9 @@ pub use error::{ApiError, ApiResult};
 pub use extract::AuthUser;
 pub use history::{MoveEntry, MovesResponse};
 pub use hub::GameHub;
+pub use limits::{
+    LimitsConfig, LiveGameRegistry, RateDecision, RateLimitTier, RateLimiter, WsConnectionRegistry,
+};
 pub use metrics::{
     GAMES_CREATED_TOTAL, GAMES_LIVE, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION,
     RATING_UPDATES_TOTAL, WS_CONNECTIONS_ACTIVE,
@@ -139,6 +143,8 @@ pub use ws::{ClientMessage, OwnerInfo, RedirectBody, ServerMessage, PROTOCOL_VER
 /// The Prometheus recorder and the `GET /metrics` scrape endpoint are installed
 /// by the composition root (`mcs-server`), which owns the exporter.
 pub fn router(state: AppState) -> Router {
+    use axum::middleware::from_fn_with_state;
+
     // Game creation is gated when (and only when) a payment gate is configured.
     // The layer wraps the one-route `create_seek_router` so cancellation, reads,
     // auth, and the WebSocket all stay free.
@@ -150,11 +156,27 @@ pub fn router(state: AppState) -> Router {
         None => rest::create_seek_router(),
     };
 
+    // Per-IP rate limiting on the abuse-prone routes (#100). Each tier wraps only
+    // its own route(s): the auth nonce/verify routes and the game-creation routes
+    // (`POST /seeks`, `POST /challenges`). The layer runs before the route's auth
+    // extractor so an over-limit caller is throttled cheaply, without a DB read.
+    // All limits are **per node** — see [`limits`].
+    let nonce =
+        auth::nonce_router().layer(from_fn_with_state(state.clone(), limits::rate_limit_nonce));
+    let verify =
+        auth::verify_router().layer(from_fn_with_state(state.clone(), limits::rate_limit_verify));
+    let create_seeks =
+        create_seeks.layer(from_fn_with_state(state.clone(), limits::rate_limit_create));
+    let create_challenges = challenges::create_challenge_router()
+        .layer(from_fn_with_state(state.clone(), limits::rate_limit_create));
+
     Router::new()
         .merge(variants::variants_router())
-        .merge(auth::auth_router())
+        .merge(nonce)
+        .merge(verify)
         .merge(ws::ws_router())
         .merge(create_seeks)
+        .merge(create_challenges)
         .merge(rest::accept_seek_router())
         .merge(rest::cancel_seek_router())
         .merge(challenges::challenges_router())

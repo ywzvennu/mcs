@@ -150,13 +150,27 @@ pub struct ChallengeListResponse {
 // Router
 // ---------------------------------------------------------------------------
 
-/// Builds the challenges sub-router.
+/// Builds the challenge **creation** sub-router: the single
+/// `POST /challenges` route.
+///
+/// Isolated from the rest of the challenge lifecycle so [`crate::router`] can
+/// wrap *only* this creation route in the per-IP rate-limit layer (#100), the
+/// same way `POST /seeks` is rate-limited. `GET /challenges` and the
+/// accept/decline/cancel routes stay on [`challenges_router`] and are not
+/// throttled by the creation tier.
+pub fn create_challenge_router() -> Router<AppState> {
+    Router::new().route("/challenges", post(create_challenge))
+}
+
+/// Builds the challenges sub-router for everything except creation.
 ///
 /// Every route is authenticated (each handler takes an [`AuthUser`]). The
 /// router is merged into [`crate::router`] alongside the seek and read routers.
+/// `POST /challenges` lives on its own [`create_challenge_router`] so the
+/// creation rate limit (#100) scopes to it alone.
 pub fn challenges_router() -> Router<AppState> {
     Router::new()
-        .route("/challenges", post(create_challenge).get(list_challenges))
+        .route("/challenges", axum::routing::get(list_challenges))
         .route("/challenges/{id}/accept", post(accept_challenge))
         .route("/challenges/{id}/decline", post(decline_challenge))
         .route("/challenges/{id}", delete(cancel_challenge))

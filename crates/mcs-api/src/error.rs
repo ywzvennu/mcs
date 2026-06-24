@@ -21,6 +21,7 @@
 //! | `Unauthorized`          | 401         |
 //! | `Forbidden`             | 403         |
 //! | `UnprocessableEntity`   | 422         |
+//! | `TooManyRequests`       | 429         |
 //! | `Internal`              | 500         |
 
 use axum::{
@@ -89,6 +90,13 @@ pub enum ApiError {
     #[error("unprocessable entity: {0}")]
     UnprocessableEntity(String),
 
+    /// The caller has exceeded an abuse-protection limit — a per-IP rate limit
+    /// or a per-user resource cap (#100).
+    ///
+    /// Maps to HTTP **429 Too Many Requests**.
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
+
     /// An unexpected server-side failure. The detail is **logged** but
     /// **never** included in the response body to avoid leaking internals.
     ///
@@ -107,6 +115,7 @@ impl ApiError {
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -122,6 +131,7 @@ impl ApiError {
             ApiError::Unauthorized(_) => "Unauthorized",
             ApiError::Forbidden(_) => "Forbidden",
             ApiError::UnprocessableEntity(_) => "Unprocessable Entity",
+            ApiError::TooManyRequests(_) => "Too Many Requests",
             ApiError::Internal(_) => "Internal Server Error",
         }
     }
@@ -138,7 +148,8 @@ impl ApiError {
             | ApiError::BadRequest(d)
             | ApiError::Unauthorized(d)
             | ApiError::Forbidden(d)
-            | ApiError::UnprocessableEntity(d) => d.as_str(),
+            | ApiError::UnprocessableEntity(d)
+            | ApiError::TooManyRequests(d) => d.as_str(),
             // Never leak internal detail to the caller.
             ApiError::Internal(_) => "An unexpected internal error occurred.",
         }

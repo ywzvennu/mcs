@@ -112,7 +112,10 @@ pub fn build_state(
     let state = AppState::new(storage, Arc::new(variants), session_config, siwe_config)
         // Thread the WS message-size limit from config into the state so the
         // WebSocket handler can apply it to each upgrade (#99).
-        .with_ws_max_message_bytes(cfg.http.max_ws_message_bytes);
+        .with_ws_max_message_bytes(cfg.http.max_ws_message_bytes)
+        // Abuse-protection limits (#100): per-IP rate tiers, WS connection caps,
+        // and the per-user live-game cap from `[limits]`. All enforced per node.
+        .with_limits(cfg.limits.to_limits_config());
 
     // Optionally gate game creation behind an x402 payment (#45). Off by default:
     // when `[payments].enabled` is false the state is returned untouched and

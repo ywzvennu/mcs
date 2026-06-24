@@ -49,6 +49,25 @@
 //! | `http.max_ws_message_bytes` | `MCS_HTTP__MAX_WS_MESSAGE_BYTES` | `1048576` (1 MiB) |
 //! | `http.hsts` | `MCS_HTTP__HSTS` | `false`                                        |
 //! | `http.hsts_max_age_secs` | `MCS_HTTP__HSTS_MAX_AGE_SECS` | `31536000` (1y) |
+//! | `limits.nonce_per_minute` | `MCS_LIMITS__NONCE_PER_MINUTE` | `10`           |
+//! | `limits.verify_per_minute` | `MCS_LIMITS__VERIFY_PER_MINUTE` | `20`         |
+//! | `limits.create_per_minute` | `MCS_LIMITS__CREATE_PER_MINUTE` | `30`         |
+//! | `limits.max_ws_connections` | `MCS_LIMITS__MAX_WS_CONNECTIONS` | `10000`    |
+//! | `limits.max_ws_connections_per_user` | `MCS_LIMITS__MAX_WS_CONNECTIONS_PER_USER` | `20` |
+//! | `limits.max_games_per_user` | `MCS_LIMITS__MAX_GAMES_PER_USER` | `50`       |
+//! | `limits.trusted_proxy_header` | `MCS_LIMITS__TRUSTED_PROXY_HEADER` | *(none)* |
+//!
+//! # Abuse-protection limits (#100)
+//!
+//! The `[limits]` section adds **per-node** abuse protection: per-IP token-bucket
+//! rate limiting on the abuse-prone routes (`/auth/nonce`, `/auth/verify`,
+//! `POST /seeks`, `POST /challenges`) returning **429 Too Many Requests** with a
+//! `Retry-After` header when exceeded; a global and per-user cap on concurrent
+//! live-game WebSocket connections; and a per-user cap on simultaneous live
+//! games. Every limit lives in this process's memory, so behind a load balancer
+//! the effective cluster-wide limit is up to `N x limit` for `N` nodes —
+//! cluster-wide limiting would need a shared store (e.g. Redis) and is left as
+//! future work. A `0` for any rate or cap disables it.
 //!
 //! # HTTP hardening (#99)
 //!
@@ -196,6 +215,8 @@ pub struct Config {
     pub cors: CorsSettings,
     /// HTTP hardening limits and security-header settings (#99).
     pub http: HttpSettings,
+    /// Abuse-protection limits: per-IP rate limiting and resource caps (#100).
+    pub limits: LimitsSettings,
 }
 
 /// Logging configuration.
@@ -435,6 +456,100 @@ pub struct HttpSettings {
     pub hsts_max_age_secs: u64,
 }
 
+/// Abuse-protection limits: per-IP rate limiting and resource caps (#100).
+///
+/// All limits are enforced **per node** (per server process). In a multi-node
+/// deployment a client's requests may be spread across nodes, so the effective
+/// cluster-wide limit is up to `N x limit` for `N` nodes; cluster-wide limiting
+/// would need a shared store (e.g. Redis) and is deliberately left as future
+/// work, mirroring presence and cluster membership.
+///
+/// The per-IP rate limits are token buckets: a route's `*_per_minute` value is
+/// both the sustained refill rate and the burst ceiling. A value of `0` disables
+/// that particular limit. Likewise a `0` connection/game cap is treated as
+/// "unlimited".
+///
+/// # `config.toml` sample
+///
+/// ```toml
+/// [limits]
+/// # Per-IP request rates (requests per minute). 0 disables a limit.
+/// nonce_per_minute = 10           # GET  /auth/nonce
+/// verify_per_minute = 20          # POST /auth/verify
+/// create_per_minute = 30          # POST /seeks, POST /challenges
+///
+/// # Concurrent live-game WebSocket connections (this node).
+/// max_ws_connections = 10000      # global cap; 0 = unlimited
+/// max_ws_connections_per_user = 20
+///
+/// # Simultaneous live games a single user may play (this node).
+/// max_games_per_user = 50         # 0 = unlimited
+///
+/// # Trust a reverse-proxy header for the real client IP. Leave unset when the
+/// # server is exposed directly; a client can spoof this header otherwise.
+/// # trusted_proxy_header = "x-forwarded-for"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsSettings {
+    /// Per-IP request rate for `GET /auth/nonce`, in requests per minute. `0`
+    /// disables the limit. Default: `10`.
+    pub nonce_per_minute: u32,
+    /// Per-IP request rate for `POST /auth/verify`, in requests per minute. `0`
+    /// disables the limit. Default: `20`.
+    pub verify_per_minute: u32,
+    /// Per-IP request rate for the game-creation routes (`POST /seeks`,
+    /// `POST /challenges`), in requests per minute. `0` disables the limit.
+    /// Default: `30`.
+    pub create_per_minute: u32,
+    /// Global cap on concurrent live-game WebSocket connections on this node.
+    /// `0` disables the cap. Default: `10000`.
+    pub max_ws_connections: u32,
+    /// Per-user cap on concurrent live-game WebSocket connections on this node.
+    /// `0` disables the cap. Default: `20`.
+    pub max_ws_connections_per_user: u32,
+    /// Per-user cap on simultaneous live games on this node. `0` disables the
+    /// cap. Default: `50`.
+    pub max_games_per_user: u32,
+    /// Optional trusted reverse-proxy header to read the real client IP from
+    /// (e.g. `"x-forwarded-for"`). Unset (the default) uses the socket peer
+    /// address. **Only** set this behind a trusted proxy — a client can spoof
+    /// the header otherwise, evading the per-IP rate limits.
+    pub trusted_proxy_header: Option<String>,
+}
+
+impl Default for LimitsSettings {
+    fn default() -> Self {
+        // Mirror `mcs_api::LimitsConfig::default` so the two never drift.
+        Self {
+            nonce_per_minute: 10,
+            verify_per_minute: 20,
+            create_per_minute: 30,
+            max_ws_connections: 10_000,
+            max_ws_connections_per_user: 20,
+            max_games_per_user: 50,
+            trusted_proxy_header: None,
+        }
+    }
+}
+
+impl LimitsSettings {
+    /// Builds the API layer's [`LimitsConfig`](mcs_api::LimitsConfig) from these
+    /// settings, translating each per-minute rate into a token-bucket tier.
+    #[must_use]
+    pub fn to_limits_config(&self) -> mcs_api::LimitsConfig {
+        mcs_api::LimitsConfig {
+            nonce: mcs_api::RateLimitTier::per_minute(self.nonce_per_minute),
+            verify: mcs_api::RateLimitTier::per_minute(self.verify_per_minute),
+            create: mcs_api::RateLimitTier::per_minute(self.create_per_minute),
+            max_ws_connections: self.max_ws_connections,
+            max_ws_connections_per_user: self.max_ws_connections_per_user,
+            max_games_per_user: self.max_games_per_user,
+            trusted_proxy_header: self.trusted_proxy_header.clone(),
+        }
+    }
+}
+
 impl Default for HttpSettings {
     fn default() -> Self {
         Self {
@@ -557,6 +672,7 @@ impl Default for Config {
             cluster: ClusterSettings::default(),
             cors: CorsSettings::default(),
             http: HttpSettings::default(),
+            limits: LimitsSettings::default(),
         }
     }
 }
@@ -955,6 +1071,88 @@ mod tests {
             assert!(cfg.http.hsts);
             assert_eq!(cfg.http.hsts_max_age_secs, 63_072_000);
             // An unrelated section must not be disturbed.
+            assert!(!cfg.payments.enabled);
+            Ok(())
+        });
+    }
+
+    // ── LimitsSettings tests (#100) ──────────────────────────────────────────
+
+    #[test]
+    fn limits_defaults_are_sensible() {
+        let cfg = Config::default();
+        assert_eq!(cfg.limits.nonce_per_minute, 10);
+        assert_eq!(cfg.limits.verify_per_minute, 20);
+        assert_eq!(cfg.limits.create_per_minute, 30);
+        assert_eq!(cfg.limits.max_ws_connections, 10_000);
+        assert_eq!(cfg.limits.max_ws_connections_per_user, 20);
+        assert_eq!(cfg.limits.max_games_per_user, 50);
+        assert!(
+            cfg.limits.trusted_proxy_header.is_none(),
+            "no proxy header is trusted by default"
+        );
+    }
+
+    #[test]
+    fn limits_to_config_mirrors_settings() {
+        let cfg = Config::default();
+        let api = cfg.limits.to_limits_config();
+        assert_eq!(api.nonce.replenish_per_minute, 10);
+        assert_eq!(api.verify.replenish_per_minute, 20);
+        assert_eq!(api.create.replenish_per_minute, 30);
+        assert_eq!(api.max_ws_connections, 10_000);
+        assert_eq!(api.max_ws_connections_per_user, 20);
+        assert_eq!(api.max_games_per_user, 50);
+    }
+
+    /// The default `[limits]` config matches the API layer's own defaults, so the
+    /// two definitions never drift.
+    #[test]
+    fn limits_defaults_match_api_defaults() {
+        let api_default = mcs_api::LimitsConfig::default();
+        let from_cfg = LimitsSettings::default().to_limits_config();
+        assert_eq!(
+            from_cfg.nonce.replenish_per_minute,
+            api_default.nonce.replenish_per_minute
+        );
+        assert_eq!(
+            from_cfg.create.replenish_per_minute,
+            api_default.create.replenish_per_minute
+        );
+        assert_eq!(from_cfg.max_ws_connections, api_default.max_ws_connections);
+        assert_eq!(from_cfg.max_games_per_user, api_default.max_games_per_user);
+    }
+
+    /// The `[limits]` section parses from TOML, overriding only the keys given.
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn limits_section_parses_from_toml() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                r#"
+                    [limits]
+                    nonce_per_minute = 5
+                    verify_per_minute = 7
+                    create_per_minute = 9
+                    max_ws_connections = 100
+                    max_ws_connections_per_user = 3
+                    max_games_per_user = 11
+                    trusted_proxy_header = "x-forwarded-for"
+                "#,
+            )?;
+            let cfg = Config::load().expect("load config with [limits]");
+            assert_eq!(cfg.limits.nonce_per_minute, 5);
+            assert_eq!(cfg.limits.verify_per_minute, 7);
+            assert_eq!(cfg.limits.create_per_minute, 9);
+            assert_eq!(cfg.limits.max_ws_connections, 100);
+            assert_eq!(cfg.limits.max_ws_connections_per_user, 3);
+            assert_eq!(cfg.limits.max_games_per_user, 11);
+            assert_eq!(
+                cfg.limits.trusted_proxy_header.as_deref(),
+                Some("x-forwarded-for")
+            );
+            // An untouched section keeps its default.
             assert!(!cfg.payments.enabled);
             Ok(())
         });
