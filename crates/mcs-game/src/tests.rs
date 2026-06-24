@@ -20,7 +20,7 @@ use mcs_variant_standard::register;
 use mcs_variant_standard::wire::StandardAction;
 use time::OffsetDateTime;
 
-use crate::{GameActor, GameSessionError};
+use crate::{GameActor, GameCompletionHook, GameSessionError, NoopHook};
 
 // --------------------------------------------------------------------------
 // In-memory GameRepo mock.
@@ -192,6 +192,7 @@ async fn fools_mate_finishes_and_persists_with_correct_outcome() {
         game_id,
         standard_session(),
         repo.clone(),
+        Arc::new(NoopHook),
         TimeControl::Unlimited,
     );
 
@@ -225,7 +226,13 @@ async fn fools_mate_finishes_and_persists_with_correct_outcome() {
 async fn events_are_broadcast_to_subscribers() {
     let game_id = GameId::new();
     let repo = MockGameRepo::with_game(active_game(game_id));
-    let handle = GameActor::spawn(game_id, standard_session(), repo, TimeControl::Unlimited);
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo,
+        Arc::new(NoopHook),
+        TimeControl::Unlimited,
+    );
 
     let mut events = handle.subscribe();
 
@@ -274,6 +281,7 @@ async fn out_of_turn_action_is_rejected() {
         game_id,
         standard_session(),
         repo.clone(),
+        Arc::new(NoopHook),
         TimeControl::Unlimited,
     );
 
@@ -300,6 +308,7 @@ async fn illegal_action_is_rejected() {
         game_id,
         standard_session(),
         repo.clone(),
+        Arc::new(NoopHook),
         TimeControl::Unlimited,
     );
 
@@ -323,6 +332,7 @@ async fn acting_after_finish_is_rejected_and_persists_only_once() {
         game_id,
         standard_session(),
         repo.clone(),
+        Arc::new(NoopHook),
         TimeControl::Unlimited,
     );
 
@@ -343,7 +353,13 @@ async fn acting_after_finish_is_rejected_and_persists_only_once() {
 async fn views_and_legal_actions_are_served_through_the_handle() {
     let game_id = GameId::new();
     let repo = MockGameRepo::with_game(active_game(game_id));
-    let handle = GameActor::spawn(game_id, standard_session(), repo, TimeControl::Unlimited);
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo,
+        Arc::new(NoopHook),
+        TimeControl::Unlimited,
+    );
 
     // White has the 20 opening moves plus Resign and OfferDraw.
     let actions = handle.legal_actions(Color::White).await.unwrap();
@@ -369,7 +385,13 @@ async fn persistence_failure_on_game_end_surfaces_as_storage_error() {
     let repo = Arc::new(FailingUpdateRepo {
         game: active_game(game_id),
     });
-    let handle = GameActor::spawn(game_id, standard_session(), repo, TimeControl::Unlimited);
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo,
+        Arc::new(NoopHook),
+        TimeControl::Unlimited,
+    );
 
     handle
         .submit_action(Color::White, mv("f2f3"))
@@ -403,7 +425,13 @@ async fn persistence_failure_on_game_end_surfaces_as_storage_error() {
 async fn handle_is_cloneable_and_clones_share_one_session() {
     let game_id = GameId::new();
     let repo = MockGameRepo::with_game(active_game(game_id));
-    let handle = GameActor::spawn(game_id, standard_session(), repo, TimeControl::Unlimited);
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo,
+        Arc::new(NoopHook),
+        TimeControl::Unlimited,
+    );
     let other = handle.clone();
 
     assert_eq!(handle.game_id(), other.game_id());
@@ -477,6 +505,7 @@ async fn move_events_carry_live_clock_snapshots() {
         game_id,
         standard_session(),
         repo,
+        Arc::new(NoopHook),
         tc,
         Box::new(SharedTimeSource(time.clone())),
     );
@@ -519,6 +548,7 @@ async fn player_who_stops_moving_loses_on_time() {
         game_id,
         standard_session(),
         repo.clone(),
+        Arc::new(NoopHook),
         tc,
         Box::new(SharedTimeSource(time.clone())),
     );
@@ -563,6 +593,7 @@ async fn moving_after_flagging_is_rejected() {
         game_id,
         standard_session(),
         repo.clone(),
+        Arc::new(NoopHook),
         tc,
         Box::new(SharedTimeSource(time.clone())),
     );
@@ -590,6 +621,7 @@ async fn unlimited_game_never_flags_and_omits_clock() {
         game_id,
         standard_session(),
         repo.clone(),
+        Arc::new(NoopHook),
         TimeControl::Unlimited,
         Box::new(SharedTimeSource(time.clone())),
     );
@@ -616,7 +648,13 @@ async fn unlimited_game_never_flags_and_omits_clock() {
 async fn dropping_all_handles_stops_the_actor() {
     let game_id = GameId::new();
     let repo = MockGameRepo::with_game(active_game(game_id));
-    let handle = GameActor::spawn(game_id, standard_session(), repo, TimeControl::Unlimited);
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo,
+        Arc::new(NoopHook),
+        TimeControl::Unlimited,
+    );
 
     // A subscriber held across the drop observes the broadcast channel close
     // once the actor task ends.
@@ -632,5 +670,135 @@ async fn dropping_all_handles_stops_the_actor() {
             Err(tokio::sync::broadcast::error::RecvError::Closed)
         ),
         "expected the broadcast channel to close, got {result:?}"
+    );
+}
+
+// --------------------------------------------------------------------------
+// Completion-hook integration tests.
+//
+// These verify the actor invokes the injected `GameCompletionHook` exactly once
+// when a game finishes — and never while it is ongoing — passing the persisted,
+// finished game and its outcome. A concrete `RatingUpdateHook` is tested in
+// `mcs-api`; here we only assert the actor's contract with the trait.
+// --------------------------------------------------------------------------
+
+/// A [`GameCompletionHook`] that records each `(Game, Outcome)` it is told about,
+/// so a test can assert the actor fired it the expected number of times with the
+/// expected payload.
+#[derive(Debug, Default)]
+struct RecordingHook {
+    calls: Mutex<Vec<(Game, Outcome)>>,
+}
+
+impl RecordingHook {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn calls(&self) -> Vec<(Game, Outcome)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl GameCompletionHook for RecordingHook {
+    async fn on_finished(&self, game: &Game, outcome: &Outcome) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((game.clone(), outcome.clone()));
+    }
+}
+
+#[tokio::test]
+async fn completion_hook_fires_once_with_finished_game_and_outcome() {
+    let game_id = GameId::new();
+    let repo = MockGameRepo::with_game(active_game(game_id));
+    let hook = RecordingHook::new();
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo,
+        hook.clone(),
+        TimeControl::Unlimited,
+    );
+
+    play_fools_mate(&handle).await;
+
+    // The hook fired exactly once, with the persisted finished record and the
+    // checkmate outcome.
+    let calls = hook.calls();
+    assert_eq!(calls.len(), 1, "the hook must fire exactly once");
+    let (game, outcome) = &calls[0];
+    assert_eq!(game.id, game_id);
+    assert_eq!(game.lifecycle, GameLifecycle::Finished);
+    assert_eq!(*outcome, Outcome::win(Color::Black, EndReason::Checkmate));
+    assert_eq!(game.outcome.as_ref(), Some(outcome));
+}
+
+#[tokio::test]
+async fn completion_hook_does_not_fire_while_the_game_is_ongoing() {
+    let game_id = GameId::new();
+    let repo = MockGameRepo::with_game(active_game(game_id));
+    let hook = RecordingHook::new();
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo,
+        hook.clone(),
+        TimeControl::Unlimited,
+    );
+
+    // A non-finishing move must not trigger the completion hook.
+    handle
+        .submit_action(Color::White, mv("e2e4"))
+        .await
+        .unwrap();
+    assert!(
+        hook.calls().is_empty(),
+        "the hook must not fire on an ongoing game"
+    );
+}
+
+#[tokio::test]
+async fn completion_hook_is_not_run_when_persistence_fails() {
+    let game_id = GameId::new();
+    let repo = Arc::new(FailingUpdateRepo {
+        game: active_game(game_id),
+    });
+    let hook = RecordingHook::new();
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo,
+        hook.clone(),
+        TimeControl::Unlimited,
+    );
+
+    // Play to checkmate; the finishing move applies in memory but the write
+    // fails, surfacing as a storage error.
+    handle
+        .submit_action(Color::White, mv("f2f3"))
+        .await
+        .unwrap();
+    handle
+        .submit_action(Color::Black, mv("e7e5"))
+        .await
+        .unwrap();
+    handle
+        .submit_action(Color::White, mv("g2g4"))
+        .await
+        .unwrap();
+    let err = handle
+        .submit_action(Color::Black, mv("d8h4"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GameSessionError::Storage(_)));
+
+    // The hook runs only after a successful persist, so a failed write leaves it
+    // untouched.
+    assert!(
+        hook.calls().is_empty(),
+        "the hook must not fire when persistence fails"
     );
 }

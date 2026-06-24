@@ -30,6 +30,7 @@
 //! | `DELETE /seeks/{id}` | cancel one of the caller's own seeks ([`rest`]) |
 //! | `GET /games/{id}`    | fetch a single game by id ([`rest`]) |
 //! | `GET /games`         | list recent games ([`rest`]) |
+//! | `GET /leaderboard`   | top-rated players for a variant ([`rest`]) |
 //! | `GET /users/{id}`    | a user's public profile ([`rest`]) |
 //! | `GET /profile`       | the authenticated caller's profile ([`rest`]) |
 //!
@@ -60,6 +61,7 @@ pub mod auth;
 pub mod error;
 pub mod extract;
 pub mod hub;
+pub mod rating;
 pub mod rest;
 pub mod state;
 pub mod variants;
@@ -70,9 +72,10 @@ use axum::Router;
 pub use error::{ApiError, ApiResult};
 pub use extract::AuthUser;
 pub use hub::GameHub;
+pub use rating::RatingUpdateHook;
 pub use rest::{
     CancelSeekResponse, CreateSeekRequest, CreateSeekResponse, GameDto, GameListResponse,
-    ProfileDto,
+    LeaderboardEntry, LeaderboardQuery, LeaderboardResponse, ProfileDto, RatingDto,
 };
 pub use state::{AppState, SiweConfig};
 pub use variants::{VariantDto, VariantListResponse};

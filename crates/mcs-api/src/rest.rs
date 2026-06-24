@@ -32,8 +32,8 @@ use time::OffsetDateTime;
 
 use mcs_core::VariantOptions;
 use mcs_domain::{
-    ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Seek, SeekId, TimeControl, User,
-    UserId,
+    ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Rating, Seek, SeekId, TimeControl,
+    User, UserId,
 };
 use mcs_game::{GameActor, Pairing, SubmitOutcome};
 
@@ -46,6 +46,14 @@ const DEFAULT_GAMES_LIMIT: u32 = 20;
 
 /// The largest page size `GET /games` will honour, clamping larger requests.
 const MAX_GAMES_LIMIT: u32 = 100;
+
+/// The default number of entries `GET /leaderboard` returns when no `limit` is
+/// supplied.
+const DEFAULT_LEADERBOARD_LIMIT: u32 = 20;
+
+/// The largest leaderboard page `GET /leaderboard` will honour, clamping larger
+/// requests.
+const MAX_LEADERBOARD_LIMIT: u32 = 200;
 
 // ---------------------------------------------------------------------------
 // Request / response DTOs
@@ -89,11 +97,41 @@ pub enum CreateSeekResponse {
     },
 }
 
+/// A player's Glicko-2 rating, as exposed on the wire.
+///
+/// A thin projection of the domain [`Rating`]: the three Glicko-2 parameters,
+/// flattened so a client can render "1500 ± 350" without reaching into a nested
+/// object's internals.
+#[derive(Debug, Clone, Serialize)]
+pub struct RatingDto {
+    /// Estimated playing strength (Glicko-1 / display scale, centred at 1500).
+    pub value: f64,
+    /// Rating deviation: the uncertainty around `value`. Smaller is more certain.
+    pub deviation: f64,
+    /// Volatility: how consistent the player's recent results have been.
+    pub volatility: f64,
+}
+
+impl From<Rating> for RatingDto {
+    fn from(rating: Rating) -> Self {
+        Self {
+            value: rating.value,
+            deviation: rating.deviation,
+            volatility: rating.volatility,
+        }
+    }
+}
+
 /// The public, serialized view of a [`Game`] record.
 ///
 /// This is the wire shape returned by every game endpoint. It is a thin,
 /// explicit projection of [`Game`] so the HTTP contract does not silently drift
 /// when the domain type gains internal fields.
+///
+/// The two `*_rating` fields carry each player's current rating **for this
+/// game's variant**. They are populated by the single-game lookup
+/// (`GET /games/{id}`) and omitted (left `None`) by the bulk list endpoint,
+/// which would otherwise issue two extra reads per row.
 #[derive(Debug, Clone, Serialize)]
 pub struct GameDto {
     /// The game's stable identifier; open the socket at `/ws/game/{id}`.
@@ -104,6 +142,12 @@ pub struct GameDto {
     pub white: UserId,
     /// The user playing Black.
     pub black: UserId,
+    /// White's current rating for this variant, if looked up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub white_rating: Option<RatingDto>,
+    /// Black's current rating for this variant, if looked up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub black_rating: Option<RatingDto>,
     /// The game's server-side lifecycle state.
     pub lifecycle: GameLifecycle,
     /// The time control in force.
@@ -114,16 +158,32 @@ pub struct GameDto {
 }
 
 impl From<Game> for GameDto {
+    /// Projects a [`Game`] without ratings. Use
+    /// [`with_ratings`](GameDto::with_ratings) to attach them for the
+    /// single-game endpoint.
     fn from(game: Game) -> Self {
         Self {
             id: game.id,
             variant_id: game.variant_id,
             white: game.white,
             black: game.black,
+            white_rating: None,
+            black_rating: None,
             lifecycle: game.lifecycle,
             time_control: game.time_control,
             created_at: game.created_at,
         }
+    }
+}
+
+impl GameDto {
+    /// Attaches both players' current ratings (for the game's variant) to this
+    /// DTO, replacing whatever was there.
+    #[must_use]
+    fn with_ratings(mut self, white: Rating, black: Rating) -> Self {
+        self.white_rating = Some(white.into());
+        self.black_rating = Some(black.into());
+        self
     }
 }
 
@@ -140,6 +200,39 @@ pub struct ListGamesQuery {
     /// Maximum number of games to return. Clamped to [`MAX_GAMES_LIMIT`];
     /// defaults to [`DEFAULT_GAMES_LIMIT`] when absent.
     pub limit: Option<u32>,
+}
+
+/// Query parameters for `GET /leaderboard`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LeaderboardQuery {
+    /// The variant whose leaderboard to return (e.g. `"standard"`). Required.
+    pub variant: String,
+    /// Maximum number of entries to return. Clamped to
+    /// [`MAX_LEADERBOARD_LIMIT`]; defaults to [`DEFAULT_LEADERBOARD_LIMIT`] when
+    /// absent.
+    pub limit: Option<u32>,
+}
+
+/// One ranked entry in a variant's leaderboard.
+#[derive(Debug, Clone, Serialize)]
+pub struct LeaderboardEntry {
+    /// The ranked player's stable identifier.
+    pub user_id: UserId,
+    /// The player's Ethereum address, if their account could be resolved.
+    /// Omitted rather than failing the whole listing if a lookup misses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<EvmAddress>,
+    /// The player's current rating for the requested variant.
+    pub rating: RatingDto,
+}
+
+/// Response body for `GET /leaderboard`: the top players, highest-rated first.
+#[derive(Debug, Clone, Serialize)]
+pub struct LeaderboardResponse {
+    /// The variant this leaderboard is for, echoed back from the request.
+    pub variant: String,
+    /// The ranked players, ordered by rating descending.
+    pub entries: Vec<LeaderboardEntry>,
 }
 
 /// A user's **public** profile.
@@ -200,6 +293,7 @@ pub fn read_router() -> Router<AppState> {
     Router::new()
         .route("/games/{id}", get(get_game))
         .route("/games", get(list_games))
+        .route("/leaderboard", get(leaderboard))
         .route("/users/{id}", get(get_profile))
         .route("/profile", get(my_profile))
 }
@@ -266,9 +360,11 @@ async fn create_paired_game(state: &AppState, pairing: Pairing) -> ApiResult<Gam
     state.game_repo().create(&game).await?;
 
     // Spawn the actor over the same backing store and register its handle so the
-    // WebSocket endpoint can find the live game by id.
+    // WebSocket endpoint can find the live game by id. The completion hook
+    // applies the Glicko-2 rating update when this game finishes.
     let repo: Arc<dyn mcs_storage::GameRepo> = state.game_repo().clone();
-    let handle = GameActor::spawn(game.id, session, repo, pairing.time_control);
+    let hook = state.completion_hook().clone();
+    let handle = GameActor::spawn(game.id, session, repo, hook, pairing.time_control);
     state.game_hub().insert(game.id, handle);
 
     Ok(game)
@@ -323,7 +419,21 @@ async fn get_game(
     Path(id): Path<GameId>,
 ) -> ApiResult<Json<GameDto>> {
     let game = state.storage().games().get(id).await?;
-    Ok(Json(game.into()))
+
+    // Attach each player's current rating for this game's variant. An unrated
+    // player (no row yet) is reported at the Glicko-2 seed, matching what the
+    // rating-update hook would seed them with.
+    let ratings = state.storage().ratings();
+    let white = ratings
+        .get(game.white, &game.variant_id)
+        .await?
+        .unwrap_or_default();
+    let black = ratings
+        .get(game.black, &game.variant_id)
+        .await?
+        .unwrap_or_default();
+
+    Ok(Json(GameDto::from(game).with_ratings(white, black)))
 }
 
 /// `GET /games?limit=` — list the most recently created games, newest first.
@@ -341,6 +451,53 @@ async fn list_games(
     let games = state.storage().games().list_recent(limit).await?;
     Ok(Json(GameListResponse {
         games: games.into_iter().map(GameDto::from).collect(),
+    }))
+}
+
+/// `GET /leaderboard?variant=&limit=` — the top-rated players for a variant.
+///
+/// Returns players ordered by rating descending. `limit` is clamped to
+/// [`MAX_LEADERBOARD_LIMIT`] and defaults to [`DEFAULT_LEADERBOARD_LIMIT`]. Each
+/// entry carries the player's id, current rating, and — where it can be resolved
+/// over the same store — their address. A user lookup that misses leaves
+/// `address` absent rather than failing the whole listing, so a stale rating row
+/// cannot 500 the endpoint.
+async fn leaderboard(
+    State(state): State<AppState>,
+    Query(query): Query<LeaderboardQuery>,
+) -> ApiResult<Json<LeaderboardResponse>> {
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_LEADERBOARD_LIMIT)
+        .min(MAX_LEADERBOARD_LIMIT);
+
+    let ranked = state
+        .storage()
+        .ratings()
+        .leaderboard(&query.variant, limit)
+        .await?;
+
+    let mut entries = Vec::with_capacity(ranked.len());
+    for (user_id, rating) in ranked {
+        // Resolve the address best-effort: a missing user (a rating row with no
+        // surviving account) simply omits the address.
+        let address = state
+            .storage()
+            .users()
+            .get(user_id)
+            .await
+            .ok()
+            .map(|u| u.address);
+        entries.push(LeaderboardEntry {
+            user_id,
+            address,
+            rating: rating.into(),
+        });
+    }
+
+    Ok(Json(LeaderboardResponse {
+        variant: query.variant,
+        entries,
     }))
 }
 

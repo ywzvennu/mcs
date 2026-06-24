@@ -13,8 +13,9 @@
 //!
 //! ## Architecture
 //!
-//! - [`GameActor::spawn`] takes ownership of a `Box<dyn GameSession>` and an
-//!   `Arc<dyn GameRepo>`, spawns the actor task, and returns a [`GameHandle`].
+//! - [`GameActor::spawn`] takes ownership of a `Box<dyn GameSession>`, an
+//!   `Arc<dyn GameRepo>`, and an `Arc<dyn GameCompletionHook>`, spawns the actor
+//!   task, and returns a [`GameHandle`].
 //! - [`GameHandle`] forwards each call over an `mpsc` command channel and
 //!   awaits the actor's reply. Cloning it is cheap, so every connection can
 //!   hold one.
@@ -45,7 +46,7 @@
 //!
 //! use mcs_core::{Action, Color, GameSession};
 //! use mcs_domain::{GameId, TimeControl};
-//! use mcs_game::GameActor;
+//! use mcs_game::{GameActor, NoopHook};
 //! use mcs_storage::GameRepo;
 //!
 //! # async fn run(
@@ -58,7 +59,9 @@
 //!     initial: Duration::from_secs(300),
 //!     increment: Duration::from_secs(2),
 //! };
-//! let handle = GameActor::spawn(game_id, session, repo, time_control);
+//! // No completion side effect here; production wires in a rating updater.
+//! let hook = Arc::new(NoopHook);
+//! let handle = GameActor::spawn(game_id, session, repo, hook, time_control);
 //!
 //! // A connected client subscribes to the live stream...
 //! let mut events = handle.subscribe();
@@ -81,6 +84,7 @@
 
 mod actor;
 mod clock;
+mod completion;
 mod error;
 mod event;
 pub mod matchmaking;
@@ -88,6 +92,7 @@ mod time_source;
 
 pub use actor::{GameActor, GameHandle};
 pub use clock::ClockEngine;
+pub use completion::{GameCompletionHook, NoopHook};
 pub use error::GameSessionError;
 pub use event::GameEvent;
 pub use matchmaking::{Matchmaker, MatchmakingError, Pairing, SubmitOutcome};

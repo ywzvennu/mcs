@@ -17,6 +17,12 @@ mcs-domain.workspace = true
 mcs-storage.workspace = true
 mcs-auth.workspace = true
 mcs-game.workspace = true
+# The Glicko-2 rating engine, with the `domain` feature so we can convert
+# to/from `mcs_domain::Rating` when applying a post-game update. Referenced by
+# path (the workspace manifest carries no `mcs-rating` entry, and the common
+# rule is that crate PRs do not edit the root manifest).
+mcs-rating = { path = "../mcs-rating", features = ["domain"] }
+async-trait.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true

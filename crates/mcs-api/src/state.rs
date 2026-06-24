@@ -9,11 +9,12 @@ use std::sync::Arc;
 
 use mcs_auth::SessionConfig;
 use mcs_core::VariantRegistry;
-use mcs_game::Matchmaker;
-use mcs_storage::{GameRepo, Repositories, SeekRepo, UserRepo};
+use mcs_game::{GameCompletionHook, Matchmaker};
+use mcs_storage::{GameRepo, RatingRepo, Repositories, SeekRepo, UserRepo};
 use time::Duration;
 
 use crate::hub::GameHub;
+use crate::rating::RatingUpdateHook;
 
 /// Configuration for the Sign-In with Ethereum (EIP-4361) challenge that the
 /// server hands to wallets at `GET /auth/nonce`.
@@ -108,6 +109,11 @@ pub struct AppState {
     variants: Arc<VariantRegistry>,
     matchmaker: Arc<Matchmaker>,
     game_repo: Arc<dyn GameRepo>,
+    /// The completion hook handed to every spawned [`GameActor`](mcs_game::GameActor):
+    /// on game end it applies the Glicko-2 rating update for both players. Held
+    /// as `Arc<dyn GameCompletionHook>` so the actor stays decoupled from the
+    /// concrete [`RatingUpdateHook`].
+    completion_hook: Arc<dyn GameCompletionHook>,
 }
 
 impl AppState {
@@ -142,14 +148,21 @@ impl AppState {
         siwe_config: SiweConfig,
     ) -> Self
     where
-        S: Repositories + GameRepo + SeekRepo + UserRepo + 'static,
+        S: Repositories + GameRepo + SeekRepo + UserRepo + RatingRepo + 'static,
     {
         // Coerce the one concrete `Arc<S>` into each trait object the layers
         // need. Every coercion shares the same allocation, so all handles read
         // and write one backing store.
         let repositories: Arc<dyn Repositories> = storage.clone();
         let seek_repo: Arc<dyn SeekRepo> = storage.clone();
+        let rating_repo: Arc<dyn RatingRepo> = storage.clone();
         let game_repo: Arc<dyn GameRepo> = storage;
+
+        // The rating updater is the game-completion hook: when an actor ends a
+        // game, it recomputes both players' Glicko-2 ratings over this same
+        // store. Holding it as the abstract trait keeps `mcs-game` decoupled.
+        let completion_hook: Arc<dyn GameCompletionHook> =
+            Arc::new(RatingUpdateHook::new(rating_repo));
 
         Self {
             storage: repositories,
@@ -159,6 +172,7 @@ impl AppState {
             variants,
             matchmaker: Arc::new(Matchmaker::new(seek_repo)),
             game_repo,
+            completion_hook,
         }
     }
 
@@ -219,6 +233,17 @@ impl AppState {
     pub fn game_repo(&self) -> &Arc<dyn GameRepo> {
         &self.game_repo
     }
+
+    /// Returns the game-completion hook handed to each spawned game actor.
+    ///
+    /// When a seek pairs, the endpoint passes a clone of this to
+    /// [`GameActor::spawn`](mcs_game::GameActor::spawn); the actor invokes it once
+    /// the game finishes, applying the post-game Glicko-2 rating update for both
+    /// players over the same backing store the API reads.
+    #[must_use]
+    pub fn completion_hook(&self) -> &Arc<dyn GameCompletionHook> {
+        &self.completion_hook
+    }
 }
 
 // `SessionConfig` deliberately has no `Debug` derive that exposes the secret
@@ -235,6 +260,7 @@ impl std::fmt::Debug for AppState {
             .field("variants", &self.variants)
             .field("matchmaker", &self.matchmaker)
             .field("game_repo", &"<dyn GameRepo>")
+            .field("completion_hook", &"<dyn GameCompletionHook>")
             .finish()
     }
 }
