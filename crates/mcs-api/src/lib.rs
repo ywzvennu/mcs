@@ -72,8 +72,10 @@ pub mod error;
 pub mod extract;
 pub mod history;
 pub mod hub;
+pub mod metrics;
 pub mod presence;
 pub mod rating;
+pub mod ready;
 pub mod rest;
 pub mod state;
 pub mod table;
@@ -90,8 +92,13 @@ pub use error::{ApiError, ApiResult};
 pub use extract::AuthUser;
 pub use history::{MoveEntry, MovesResponse};
 pub use hub::GameHub;
+pub use metrics::{
+    GAMES_CREATED_TOTAL, GAMES_LIVE, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION,
+    RATING_UPDATES_TOTAL, WS_CONNECTIONS_ACTIVE,
+};
 pub use presence::{InProcessPresence, PresenceTracker};
 pub use rating::RatingUpdateHook;
+pub use ready::ready_router;
 pub use rest::{
     CancelSeekResponse, CreateSeekRequest, CreateSeekResponse, GameDto, GameListResponse,
     LeaderboardEntry, LeaderboardQuery, LeaderboardResponse, ProfileDto, RatingDto,
@@ -121,6 +128,16 @@ pub use ws::{ClientMessage, OwnerInfo, RedirectBody, ServerMessage, PROTOCOL_VER
 /// carrying a valid `X-PAYMENT` header proceeds to the handler. When no gate is
 /// configured (the default), creation is free and this router is byte-for-byte
 /// the one that shipped before payments existed.
+///
+/// # Observability (#88)
+///
+/// Every route is wrapped in the [`metrics::http_metrics`] middleware, which
+/// records a request counter and latency histogram labelled by method, the
+/// matched **route template** (so ids never inflate cardinality), and status.
+/// A `GET /ready` readiness probe ([`ready`]) is merged in: it verifies the
+/// database (and, in a cluster, Redis) are reachable before reporting `200`.
+/// The Prometheus recorder and the `GET /metrics` scrape endpoint are installed
+/// by the composition root (`mcs-server`), which owns the exporter.
 pub fn router(state: AppState) -> Router {
     // Game creation is gated when (and only when) a payment gate is configured.
     // The layer wraps the one-route `create_seek_router` so cancellation, reads,
@@ -144,5 +161,10 @@ pub fn router(state: AppState) -> Router {
         .merge(challenges::rematch_game_router())
         .merge(rest::read_router())
         .merge(history::history_router())
+        .merge(ready::ready_router())
+        // Record per-request metrics for every route above. Applied as the
+        // outermost API layer so the matched route template is already resolved
+        // when the middleware reads it for the low-cardinality `path` label.
+        .layer(axum::middleware::from_fn(metrics::http_metrics))
         .with_state(state)
 }

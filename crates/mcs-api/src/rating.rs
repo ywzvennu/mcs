@@ -162,6 +162,10 @@ impl GameCompletionHook for RatingUpdateHook {
             );
         }
 
+        // Count the rating update (#88): one per finished *rated* game that
+        // reached this point (a casual game returned early above).
+        crate::metrics::record_rating_update();
+
         tracing::info!(
             game_id = %game.id,
             variant_id,

@@ -41,6 +41,12 @@ tracing.workspace = true
 tokio.workspace = true
 time.workspace = true
 hex = "0.4"
+# Metrics facade (#88): handlers and middleware record through these macros into
+# whatever recorder is installed by the composition root. Not in the workspace
+# set, so pinned directly here (member path/version deps are allowed; only the
+# root manifest is off-limits). A no-op recorder is used until `mcs-server`
+# installs the Prometheus exporter, so the macros are always safe to call.
+metrics = "0.24"
 
 [dev-dependencies]
 # Drive the router in-process without binding a socket.

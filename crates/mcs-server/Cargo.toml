@@ -57,6 +57,12 @@ anyhow.workspace = true
 rand.workspace = true
 # Generate a stable-per-process node id when `[cluster].node_id` is unset.
 uuid.workspace = true
+# Prometheus metrics (#88). The composition root owns the exporter: it installs
+# the `metrics-exporter-prometheus` recorder as the global `metrics` sink and
+# renders it at `GET /metrics`. Pinned directly here (not in the workspace set;
+# member version deps are allowed, only the root manifest is off-limits).
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
 [dev-dependencies]
 # Drive the assembled router in-process without binding a socket.
@@ -65,3 +71,7 @@ tower = { workspace = true }
 serde_json.workspace = true
 # `figment::Jail` for isolated config-loading tests (the `test` feature gates it).
 figment = { workspace = true, features = ["test"] }
+# The readiness 503 test breaks the DB by dropping a table on the live pool
+# (via `SqlxStorage::pool`), so it needs a raw `sqlx` query handle.
+sqlx = { workspace = true }
+tokio = { workspace = true }

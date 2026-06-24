@@ -666,6 +666,32 @@ struct RunConnection {
     table: Arc<TableChannel>,
 }
 
+/// A scope guard that keeps the active-WebSocket-connections gauge accurate
+/// (#88).
+///
+/// Constructing it via [`open`](WsConnectionGuard::open) increments
+/// [`WS_CONNECTIONS_ACTIVE`](crate::metrics::WS_CONNECTIONS_ACTIVE); dropping it
+/// decrements the gauge. Holding one for the lifetime of the connection task
+/// means the gauge is released on *every* exit path — a clean close, a client
+/// drop, the actor stopping, or an early-return error — without a decrement at
+/// each branch.
+struct WsConnectionGuard;
+
+impl WsConnectionGuard {
+    /// Records a newly opened connection and returns the guard that will record
+    /// its close on drop.
+    fn open() -> Self {
+        crate::metrics::ws_connection_opened();
+        Self
+    }
+}
+
+impl Drop for WsConnectionGuard {
+    fn drop(&mut self) {
+        crate::metrics::ws_connection_closed();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Connection task
 // ---------------------------------------------------------------------------
@@ -702,6 +728,12 @@ async fn run_connection(conn: RunConnection) {
         game,
         table,
     } = conn;
+
+    // Track this socket on the active-connections gauge (#88). The guard's
+    // `Drop` decrements it, so *every* exit path of this task — a snapshot send
+    // failure, a client disconnect, an actor stop — releases the gauge exactly
+    // once with no manual bookkeeping at each `return`/`break`.
+    let _ws_guard = WsConnectionGuard::open();
 
     // Subscribe *before* taking the snapshot so no event applied between the two
     // can be missed; at worst the client sees a duplicate it can reconcile by
