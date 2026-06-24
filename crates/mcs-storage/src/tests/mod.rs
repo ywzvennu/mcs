@@ -18,10 +18,15 @@ use mcs_core::{EndReason, Outcome};
 use mcs_domain::{
     ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Seek, TimeControl, User, UserId,
 };
-use memory::{InMemoryRepos, MemoryGameRepo, MemorySeekRepo, MemorySessionRepo, MemoryUserRepo};
+use memory::{
+    InMemoryRepos, MemoryGameRepo, MemoryRatingRepo, MemorySeekRepo, MemorySessionRepo,
+    MemoryUserRepo,
+};
 use time::OffsetDateTime;
 
-use crate::{GameRepo, Repositories, SeekRepo, SessionRepo, StorageError, UserRepo};
+use mcs_domain::Rating;
+
+use crate::{GameRepo, RatingRepo, Repositories, SeekRepo, SessionRepo, StorageError, UserRepo};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -321,6 +326,106 @@ async fn session_repo_nonce_per_address_is_independent() {
     // consuming for addr1 must not affect addr2
     assert!(repo.consume_nonce(&addr1, nonce).await.unwrap());
     assert!(repo.consume_nonce(&addr2, nonce).await.unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// RatingRepo tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rating_repo_get_missing_returns_none() {
+    let repo = MemoryRatingRepo::default();
+    let result = repo.get(UserId::new(), "standard").await.unwrap();
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn rating_repo_upsert_then_get() {
+    let repo = MemoryRatingRepo::default();
+    let user = UserId::new();
+    let rating = Rating {
+        value: 1700.0,
+        deviation: 200.0,
+        volatility: 0.05,
+    };
+
+    repo.upsert(user, "standard", &rating).await.unwrap();
+    let fetched = repo.get(user, "standard").await.unwrap();
+    let fetched = fetched.expect("rating must exist after upsert");
+    assert_eq!(fetched.value, rating.value);
+    assert_eq!(fetched.deviation, rating.deviation);
+    assert_eq!(fetched.volatility, rating.volatility);
+}
+
+#[tokio::test]
+async fn rating_repo_upsert_overwrites() {
+    let repo = MemoryRatingRepo::default();
+    let user = UserId::new();
+
+    let first = Rating {
+        value: 1500.0,
+        deviation: 350.0,
+        volatility: 0.06,
+    };
+    repo.upsert(user, "standard", &first).await.unwrap();
+
+    let second = Rating {
+        value: 1620.0,
+        deviation: 180.0,
+        volatility: 0.05,
+    };
+    repo.upsert(user, "standard", &second).await.unwrap();
+
+    let fetched = repo
+        .get(user, "standard")
+        .await
+        .unwrap()
+        .expect("rating must exist");
+    assert_eq!(fetched.value, second.value);
+    assert_eq!(fetched.deviation, second.deviation);
+}
+
+#[tokio::test]
+async fn rating_repo_leaderboard_order_and_limit() {
+    let repo = MemoryRatingRepo::default();
+    let users: Vec<UserId> = (0..5).map(|_| UserId::new()).collect();
+    // Insert in arbitrary order with distinct values.
+    let values = [1200.0_f64, 1800.0, 1500.0, 2000.0, 1100.0];
+    for (uid, v) in users.iter().zip(values.iter()) {
+        let r = Rating {
+            value: *v,
+            deviation: 200.0,
+            volatility: 0.06,
+        };
+        repo.upsert(*uid, "standard", &r).await.unwrap();
+    }
+
+    let board = repo.leaderboard("standard", 3).await.unwrap();
+    assert_eq!(board.len(), 3);
+    // Must be descending by value.
+    assert!(board.windows(2).all(|w| w[0].1.value >= w[1].1.value));
+    assert_eq!(board[0].1.value, 2000.0);
+}
+
+#[tokio::test]
+async fn rating_repo_leaderboard_variant_isolation() {
+    let repo = MemoryRatingRepo::default();
+    let user = UserId::new();
+    repo.upsert(
+        user,
+        "standard",
+        &Rating {
+            value: 1500.0,
+            deviation: 200.0,
+            volatility: 0.06,
+        },
+    )
+    .await
+    .unwrap();
+
+    // A different variant must not appear in the leaderboard.
+    let board = repo.leaderboard("chess960", 10).await.unwrap();
+    assert!(board.is_empty());
 }
 
 // ---------------------------------------------------------------------------
