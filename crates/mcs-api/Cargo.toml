@@ -25,9 +25,6 @@ tracing.workspace = true
 tokio.workspace = true
 time.workspace = true
 hex = "0.4"
-# EIP-4361 message parser, used to read back the exact nonce the wallet signed.
-# Matches the parser inside `mcs-auth` (default features only: no async EIP-1271).
-siwe = { version = "0.6.1", default-features = false }
 
 [dev-dependencies]
 # Drive the router in-process without binding a socket.
@@ -39,6 +36,10 @@ mcs-storage = { workspace = true, features = ["sqlite"] }
 # EIP-191 personal-sign signatures over the SIWE challenge, mirroring a wallet.
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 sha3 = "0.10"
+# EIP-4361 message parser used in test helpers to compute the EIP-191 prehash
+# for signing. Kept as a dev-only dep since the production code now goes through
+# mcs-auth exclusively.
+siwe = { version = "0.6.1", default-features = false }
 # The standard-chess variant, used to spawn a real game session in WS tests.
 mcs-variant-standard = { workspace = true }
 # A real WebSocket client to exercise the live-game socket end to end.

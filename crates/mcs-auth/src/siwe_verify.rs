@@ -100,6 +100,33 @@ fn map_verification_error(err: VerificationError) -> AuthError {
     }
 }
 
+/// Extracts the `Nonce` field from an EIP-4361 message string.
+///
+/// The nonce returned is exactly the value the wallet signed when it produced
+/// its EIP-191 signature over `message`. Callers should use this after
+/// [`verify_siwe`] to obtain the nonce that was cryptographically authenticated,
+/// and then atomically consume it in storage to defeat replay attacks.
+///
+/// # Errors
+///
+/// Returns [`AuthError::InvalidMessage`] if `message` is not a valid EIP-4361
+/// string.
+///
+/// # Examples
+///
+/// ```no_run
+/// # fn demo(message: &str) -> Result<(), mcs_auth::AuthError> {
+/// let nonce = mcs_auth::nonce_from_message(message)?;
+/// // consume `nonce` in your session store to prevent replay
+/// # let _ = nonce;
+/// # Ok(())
+/// # }
+/// ```
+pub fn nonce_from_message(message: &str) -> Result<String, AuthError> {
+    let parsed: Message = message.parse().map_err(|_| AuthError::InvalidMessage)?;
+    Ok(parsed.nonce)
+}
+
 /// Builds an [`EvmAddress`] from the recovered 20 raw address bytes.
 fn address_from_bytes(bytes: &[u8; 20]) -> Result<EvmAddress, AuthError> {
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();

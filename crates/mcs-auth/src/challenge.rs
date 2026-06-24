@@ -86,6 +86,70 @@ pub struct ChallengeParams {
 }
 
 impl ChallengeParams {
+    /// Constructs a new [`ChallengeParams`] with all required and optional
+    /// fields.
+    ///
+    /// This is the canonical way to create a `ChallengeParams` because the
+    /// struct is `#[non_exhaustive]`: callers outside this crate cannot use
+    /// struct literal syntax, so `new` provides a stable, forward-compatible
+    /// constructor.
+    ///
+    /// # Parameters
+    ///
+    /// * `domain` — RFC 3986 authority requesting sign-in (e.g. `"chess.example"`).
+    /// * `address` — the [`EvmAddress`] the user claims to control.
+    /// * `uri` — RFC 3986 URI of the resource being signed into.
+    /// * `chain_id` — EIP-155 chain ID (e.g. `1` for Ethereum mainnet).
+    /// * `nonce` — single-use unpredictable value; use [`generate_nonce`].
+    /// * `issued_at` — when the challenge was created (embedded as `Issued At`).
+    /// * `statement` — optional human-readable statement shown in the wallet.
+    /// * `expiration` — optional expiry; [`verify_siwe`](crate::verify_siwe)
+    ///   will reject the signature after this instant.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use time::OffsetDateTime;
+    /// use mcs_auth::{ChallengeParams, generate_nonce};
+    ///
+    /// let address = "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23".parse().unwrap();
+    /// let params = ChallengeParams::new(
+    ///     "localhost".to_owned(),
+    ///     address,
+    ///     "https://localhost".to_owned(),
+    ///     1,
+    ///     generate_nonce(),
+    ///     OffsetDateTime::now_utc(),
+    ///     Some("Sign in to MCS.".to_owned()),
+    ///     None,
+    /// );
+    /// let message = params.message().unwrap();
+    /// assert!(message.contains("localhost"));
+    /// ```
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        domain: String,
+        address: EvmAddress,
+        uri: String,
+        chain_id: u64,
+        nonce: String,
+        issued_at: OffsetDateTime,
+        statement: Option<String>,
+        expiration: Option<OffsetDateTime>,
+    ) -> Self {
+        Self {
+            domain,
+            address,
+            uri,
+            chain_id,
+            nonce,
+            issued_at,
+            statement,
+            expiration,
+        }
+    }
+
     /// Renders the canonical EIP-4361 message string for the wallet to sign.
     ///
     /// The output is byte-for-byte the string that
@@ -193,6 +257,54 @@ mod tests {
             parse_address_bytes(&sample_address()).unwrap()
         );
         assert!(msg.contains("Nonce: abcdef1234567890Z"));
+    }
+
+    /// Verifies that `ChallengeParams::new` produces exactly the same canonical
+    /// EIP-4361 string as the equivalent struct literal, ensuring the public
+    /// constructor is a lossless wrapper over the internal fields.
+    #[test]
+    fn new_constructor_roundtrips_identical_to_struct_literal() {
+        let issued_at = OffsetDateTime::from_unix_timestamp(1_750_000_000).unwrap();
+        let expiration = OffsetDateTime::from_unix_timestamp(1_750_003_600).unwrap();
+
+        let via_literal = ChallengeParams {
+            domain: "chess.example".to_owned(),
+            address: sample_address(),
+            uri: "https://chess.example/login".to_owned(),
+            chain_id: 1,
+            nonce: "TestNonce12345678XY".to_owned(),
+            issued_at,
+            statement: Some("Sign in to MCS.".to_owned()),
+            expiration: Some(expiration),
+        };
+
+        let via_new = ChallengeParams::new(
+            "chess.example".to_owned(),
+            sample_address(),
+            "https://chess.example/login".to_owned(),
+            1,
+            "TestNonce12345678XY".to_owned(),
+            issued_at,
+            Some("Sign in to MCS.".to_owned()),
+            Some(expiration),
+        );
+
+        let msg_literal = via_literal.message().unwrap();
+        let msg_new = via_new.message().unwrap();
+
+        // The two construction paths must produce byte-for-byte identical output.
+        assert_eq!(
+            msg_literal, msg_new,
+            "ChallengeParams::new must produce the same message as struct literal"
+        );
+
+        // Spot-check key EIP-4361 fields are present in the canonical string.
+        let parsed: siwe::Message = msg_new.parse().unwrap();
+        assert_eq!(parsed.nonce, "TestNonce12345678XY");
+        assert_eq!(parsed.chain_id, 1);
+        assert_eq!(parsed.statement.as_deref(), Some("Sign in to MCS."));
+        assert!(msg_new.contains("Nonce: TestNonce12345678XY"));
+        assert!(msg_new.contains("chess.example"));
     }
 
     #[test]
