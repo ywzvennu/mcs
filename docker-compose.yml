@@ -1,0 +1,115 @@
+# MCS cluster-capable Docker Compose stack
+#
+# Topology
+# --------
+#   redis    – Redis 7 used as the cluster membership / node-registry backend.
+#   node-a   – mcs-server instance #1; binds on host port 8081.
+#   node-b   – mcs-server instance #2; binds on host port 8082.
+#
+# Each node has its own SQLite file mounted from a named volume, making per-node
+# state fully isolated.  If you need shared game state between nodes you should
+# instead configure a shared Postgres instance (see ops/README.md).
+#
+# Reverse-proxy / game-id-aware load balancing
+# --------------------------------------------
+# Clients that are not game-aware (e.g. a plain browser) can sit behind any
+# layer-7 proxy (nginx, Caddy, Traefik).  WebSocket connections for a specific
+# game MUST be routed to the node that owns that game; the server advertises each
+# node's `MCS_CLUSTER__ADDRESS` so a smart LB (or the client SDK) can redirect
+# to the correct node.  A simple sticky-session rule (cookie or IP hash) is
+# sufficient for single-user clients; for production deployments a game-id-aware
+# upstream selector is recommended.
+#
+# Usage
+# -----
+#   docker compose up --build       # first run — builds the image
+#   docker compose up -d            # detached
+#   docker compose down -v          # stop and remove volumes
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - mcs-net
+
+  node-a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+    volumes:
+      - node-a-data:/data
+    environment:
+      MCS_BIND: "0.0.0.0:8080"
+      MCS_DATABASE_URL: "sqlite:///data/mcs.db?mode=rwc"
+      MCS_LOG__FORMAT: "json"
+      # REQUIRED: replace with a stable, high-entropy value (>= 32 bytes).
+      # All nodes MUST share the same secret so tokens are valid on any node.
+      MCS_SESSION__SECRET: "change-me-to-a-long-random-secret-min-32-bytes"
+      # Cluster settings
+      MCS_CLUSTER__ENABLED: "true"
+      MCS_CLUSTER__NODE_ID: "node-a"
+      MCS_CLUSTER__ADDRESS: "http://node-a:8080"
+      MCS_CLUSTER__REDIS_URL: "redis://redis:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - mcs-net
+
+  node-b:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+    volumes:
+      - node-b-data:/data
+    environment:
+      MCS_BIND: "0.0.0.0:8080"
+      MCS_DATABASE_URL: "sqlite:///data/mcs.db?mode=rwc"
+      MCS_LOG__FORMAT: "json"
+      # REQUIRED: must match node-a's secret exactly.
+      MCS_SESSION__SECRET: "change-me-to-a-long-random-secret-min-32-bytes"
+      # Cluster settings
+      MCS_CLUSTER__ENABLED: "true"
+      MCS_CLUSTER__NODE_ID: "node-b"
+      MCS_CLUSTER__ADDRESS: "http://node-b:8080"
+      MCS_CLUSTER__REDIS_URL: "redis://redis:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - mcs-net
+
+volumes:
+  # Each node gets its own SQLite file.  This means game seeks and completed
+  # games are owned by the node that created them.  Switching to a shared
+  # Postgres instance removes this constraint; see ops/README.md.
+  node-a-data:
+  node-b-data:
+
+networks:
+  mcs-net:
+    driver: bridge
