@@ -1,20 +1,15 @@
-# cargo-deny configuration for the MCS workspace.
-#
+# cargo-deny configuration for the MCS workspace (schema for cargo-deny 0.18+).
 # Docs: https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-# Warn on unmaintained crates but do not fail the build on them.
-unmaintained = "warn"
-# Fail on crates with known security vulnerabilities.
+# Check unmaintained advisories across the whole tree; warn on yanked crates.
+# Security vulnerabilities fail the check by default.
+unmaintained = "all"
 yanked = "warn"
-# No advisories are ignored — the dependency tree is currently clean.
+ignore = []
 
 [licenses]
-# Fail if an unlicensed crate is encountered.
-unlicensed = "deny"
-# Fail on copyleft licenses that would impose obligations on the binary.
-copyleft = "deny"
-# OSI-approved permissive licences in common use across the Rust ecosystem.
+# Deny-by-default: every crate's license must be on this allow-list.
 allow = [
   "MIT",
   "Apache-2.0",
@@ -24,34 +19,34 @@ allow = [
   "Unicode-DFS-2016",
   "BSD-2-Clause",
   "BSD-3-Clause",
-  "OpenSSL",
   "Zlib",
   "CC0-1.0",
+  "MPL-2.0",
+  "BSL-1.0",
+  "OpenSSL",
+  "CDLA-Permissive-2.0",
 ]
+confidence-threshold = 0.8
 
-[[licenses.clarify]]
-# `ring` ships its own OpenSSL-derived crypto code. Its LICENSE file is a
-# combination of ISC (the bulk of ring), MIT, and OpenSSL-derived code.
-# cargo-deny sees it as a non-standard expression; we clarify it here so the
-# license check passes without having to mark the whole crate as allowed.
-name = "ring"
-version = "*"
-expression = "MIT AND ISC AND OpenSSL"
-license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+# `shakmaty` (the chess move-generation library used by the standard and other
+# variants) is licensed GPL-3.0-or-later. MCS's own crates are MIT OR Apache-2.0,
+# but linking shakmaty means the *distributed server binary* is subject to
+# GPL-3.0 copyleft. This exception scopes the GPL allowance to shakmaty alone, so
+# any other GPL-licensed dependency would still fail the check. See the
+# project's licensing notes; revisit if a permissively-licensed engine replaces
+# shakmaty.
+[[licenses.exceptions]]
+crate = "shakmaty"
+allow = ["GPL-3.0-or-later"]
 
 [bans]
-# Two versions of the same crate in the dependency tree are common during
-# ecosystem transitions; treat them as warnings rather than hard errors so CI
-# stays green while upstream crates converge on newer releases.
+# The lock file carries some duplicate versions during ecosystem transitions;
+# surface them as warnings rather than hard failures.
 multiple-versions = "warn"
-# Wildcard dependencies in published crates are sloppy; warn about them.
 wildcards = "warn"
-# Deny crates that are known to be problematic or have been replaced upstream.
-deny = []
 
 [sources]
-# Allow crates from crates.io and from git sources (rbc-rs is a git dep).
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The RBC variant depends on the project's own public git crate.
 allow-git = ["https://github.com/ywzvennu/rbc-rs"]
