@@ -351,14 +351,20 @@ async fn create_paired_game(state: &AppState, pairing: Pairing) -> ApiResult<Gam
     // Instantiate a fresh session for the agreed variant. The matchmaker only
     // pairs seeks of the same `variant_id`, so this resolves the one both
     // players asked for.
+    // The variant options the session is built from. Seeks do not yet carry
+    // per-game options, so this defaults to the variant's own defaults; it is
+    // stored on the record so the game can be re-created on recovery via
+    // `VariantRegistry::new_game(variant_id, &variant_options)`.
+    let variant_options = VariantOptions::default();
     let session = state
         .variants()
-        .new_game(&pairing.variant_id, &VariantOptions::default())?;
+        .new_game(&pairing.variant_id, &variant_options)?;
 
     // Build and persist the durable record. Play starts immediately on pairing,
     // so the record is created already `Active` rather than `Created`.
     let mut game = Game::new(
         pairing.variant_id,
+        variant_options,
         pairing.white,
         pairing.black,
         pairing.time_control.clone(),

@@ -28,6 +28,7 @@
 //! behave identically on SQLite and Postgres.
 
 use async_trait::async_trait;
+use mcs_core::Color;
 use mcs_domain::{
     ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Rating, Seek, SeekId, User, UserId,
 };
@@ -155,9 +156,42 @@ fn decode_color_pref(s: &str) -> Result<ColorPreference, StorageError> {
     }
 }
 
+/// Encodes a [`Color`] as its lowercase column discriminant.
+fn encode_color(color: Color) -> &'static str {
+    match color {
+        Color::White => "white",
+        Color::Black => "black",
+    }
+}
+
+/// Decodes a [`Color`] from its column discriminant.
+fn decode_color(s: &str) -> Result<Color, StorageError> {
+    match s {
+        "white" => Ok(Color::White),
+        "black" => Ok(Color::Black),
+        other => Err(StorageError::Serialization(format!(
+            "unknown color {other:?}"
+        ))),
+    }
+}
+
+/// Encodes an optional millisecond clock as the signed integer column form.
+///
+/// The values originate as `u64` but fit comfortably in `i64` for any
+/// realistic clock; conversion is lossless across the supported range.
+fn encode_clock(ms: Option<u64>) -> Option<i64> {
+    ms.map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+}
+
 // ---------------------------------------------------------------------------
 // Row mapping
 // ---------------------------------------------------------------------------
+
+/// The full column list used by every `games` read, kept in one place so the
+/// row-mapping in [`game_from_row`] stays in lock-step with the queries.
+const GAME_SELECT: &str = "SELECT id, variant_id, variant_options, white, black, lifecycle, \
+     outcome, time_control, ply, clock_white_ms, clock_black_ms, side_to_move, \
+     created_at, updated_at FROM games";
 
 /// Reconstructs a [`User`] from a database row.
 fn user_from_row(row: &DbRow) -> Result<User, StorageError> {
@@ -175,17 +209,42 @@ fn game_from_row(row: &DbRow) -> Result<Game, StorageError> {
         Some(json) => Some(decode_json(&json)?),
         None => None,
     };
+    let side_to_move = match row.try_get::<Option<String>, _>("side_to_move")? {
+        Some(s) => Some(decode_color(&s)?),
+        None => None,
+    };
     Ok(Game {
         id: decode_id::<GameId>(&row.try_get::<String, _>("id")?)?,
         variant_id: row.try_get::<String, _>("variant_id")?,
+        variant_options: decode_json(&row.try_get::<String, _>("variant_options")?)?,
         white: decode_id::<UserId>(&row.try_get::<String, _>("white")?)?,
         black: decode_id::<UserId>(&row.try_get::<String, _>("black")?)?,
         lifecycle: decode_lifecycle(&row.try_get::<String, _>("lifecycle")?)?,
         outcome,
         time_control: decode_json(&row.try_get::<String, _>("time_control")?)?,
+        ply: decode_u32(row.try_get::<i64, _>("ply")?, "ply")?,
+        clock_white_ms: decode_clock(row.try_get::<Option<i64>, _>("clock_white_ms")?)?,
+        clock_black_ms: decode_clock(row.try_get::<Option<i64>, _>("clock_black_ms")?)?,
+        side_to_move,
         created_at: decode_time(&row.try_get::<String, _>("created_at")?)?,
         updated_at: decode_time(&row.try_get::<String, _>("updated_at")?)?,
     })
+}
+
+/// Converts a signed integer column into a `u32`, rejecting negatives.
+fn decode_u32(value: i64, field: &str) -> Result<u32, StorageError> {
+    u32::try_from(value)
+        .map_err(|_| StorageError::Serialization(format!("{field} out of range: {value}")))
+}
+
+/// Converts an optional signed clock column (milliseconds) into a `u64`.
+fn decode_clock(value: Option<i64>) -> Result<Option<u64>, StorageError> {
+    value
+        .map(|ms| {
+            u64::try_from(ms)
+                .map_err(|_| StorageError::Serialization(format!("clock out of range: {ms}")))
+        })
+        .transpose()
 }
 
 /// Reconstructs a [`Seek`] from a database row.
@@ -360,16 +419,22 @@ impl GameRepo for SqlxStorage {
         let outcome = game.outcome.as_ref().map(encode_json).transpose()?;
         sqlx::query(
             "INSERT INTO games \
-             (id, variant_id, white, black, lifecycle, outcome, time_control, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+             (id, variant_id, variant_options, white, black, lifecycle, outcome, time_control, \
+              ply, clock_white_ms, clock_black_ms, side_to_move, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(game.id.to_string())
         .bind(game.variant_id.clone())
+        .bind(encode_json(&game.variant_options)?)
         .bind(game.white.to_string())
         .bind(game.black.to_string())
         .bind(encode_lifecycle(game.lifecycle))
         .bind(outcome)
         .bind(encode_json(&game.time_control)?)
+        .bind(i64::from(game.ply))
+        .bind(encode_clock(game.clock_white_ms))
+        .bind(encode_clock(game.clock_black_ms))
+        .bind(game.side_to_move.map(encode_color))
         .bind(encode_time(game.created_at)?)
         .bind(encode_time(game.updated_at)?)
         .execute(&self.pool)
@@ -378,28 +443,32 @@ impl GameRepo for SqlxStorage {
     }
 
     async fn get(&self, id: GameId) -> StorageResult<Game> {
-        let row = sqlx::query(
-            "SELECT id, variant_id, white, black, lifecycle, outcome, time_control, \
-             created_at, updated_at FROM games WHERE id = $1",
-        )
-        .bind(id.to_string())
-        .fetch_one(&self.pool)
-        .await?;
+        let row = sqlx::query(&format!("{GAME_SELECT} WHERE id = $1"))
+            .bind(id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
         game_from_row(&row)
     }
 
     async fn update(&self, game: &Game) -> StorageResult<()> {
         let outcome = game.outcome.as_ref().map(encode_json).transpose()?;
         let affected = sqlx::query(
-            "UPDATE games SET variant_id = $1, white = $2, black = $3, lifecycle = $4, \
-             outcome = $5, time_control = $6, created_at = $7, updated_at = $8 WHERE id = $9",
+            "UPDATE games SET variant_id = $1, variant_options = $2, white = $3, black = $4, \
+             lifecycle = $5, outcome = $6, time_control = $7, ply = $8, clock_white_ms = $9, \
+             clock_black_ms = $10, side_to_move = $11, created_at = $12, updated_at = $13 \
+             WHERE id = $14",
         )
         .bind(game.variant_id.clone())
+        .bind(encode_json(&game.variant_options)?)
         .bind(game.white.to_string())
         .bind(game.black.to_string())
         .bind(encode_lifecycle(game.lifecycle))
         .bind(outcome)
         .bind(encode_json(&game.time_control)?)
+        .bind(i64::from(game.ply))
+        .bind(encode_clock(game.clock_white_ms))
+        .bind(encode_clock(game.clock_black_ms))
+        .bind(game.side_to_move.map(encode_color))
         .bind(encode_time(game.created_at)?)
         .bind(encode_time(game.updated_at)?)
         .bind(game.id.to_string())
@@ -414,26 +483,34 @@ impl GameRepo for SqlxStorage {
     }
 
     async fn list_recent(&self, limit: u32) -> StorageResult<Vec<Game>> {
-        let rows = sqlx::query(
-            "SELECT id, variant_id, white, black, lifecycle, outcome, time_control, \
-             created_at, updated_at FROM games ORDER BY created_at DESC LIMIT $1",
-        )
+        let rows = sqlx::query(&format!("{GAME_SELECT} ORDER BY created_at DESC LIMIT $1"))
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(game_from_row).collect()
+    }
+
+    async fn list_for_user(&self, user: UserId, limit: u32) -> StorageResult<Vec<Game>> {
+        let uid = user.to_string();
+        let rows = sqlx::query(&format!(
+            "{GAME_SELECT} WHERE white = $1 OR black = $2 ORDER BY created_at DESC LIMIT $3"
+        ))
+        .bind(&uid)
+        .bind(&uid)
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(game_from_row).collect()
     }
 
-    async fn list_for_user(&self, user: UserId, limit: u32) -> StorageResult<Vec<Game>> {
-        let uid = user.to_string();
-        let rows = sqlx::query(
-            "SELECT id, variant_id, white, black, lifecycle, outcome, time_control, \
-             created_at, updated_at FROM games WHERE white = $1 OR black = $2 \
-             ORDER BY created_at DESC LIMIT $3",
-        )
-        .bind(&uid)
-        .bind(&uid)
-        .bind(i64::from(limit))
+    async fn list_unfinished(&self) -> StorageResult<Vec<Game>> {
+        // Anything not yet `finished` is unfinished — `created` and `active`
+        // games. Ordering by `created_at` (oldest first) gives recovery a
+        // stable, deterministic processing order.
+        let rows = sqlx::query(&format!(
+            "{GAME_SELECT} WHERE lifecycle != $1 ORDER BY created_at"
+        ))
+        .bind(encode_lifecycle(GameLifecycle::Finished))
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(game_from_row).collect()

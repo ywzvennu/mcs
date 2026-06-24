@@ -98,6 +98,7 @@ fn standard_session() -> Box<dyn GameSession> {
 async fn start_game(state: &AppState, white: UserId, black: UserId) -> (GameId, GameHandle) {
     let mut game = Game::new(
         STANDARD_VARIANT_ID.to_owned(),
+        VariantOptions::default(),
         white,
         black,
         TimeControl::Unlimited,

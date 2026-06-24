@@ -14,7 +14,7 @@ mod memory;
 #[cfg(feature = "sqlite")]
 mod sqlx_sqlite;
 
-use mcs_core::{EndReason, Outcome};
+use mcs_core::{EndReason, Outcome, VariantOptions};
 use mcs_domain::{
     ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Seek, TimeControl, User, UserId,
 };
@@ -49,6 +49,7 @@ fn sample_user() -> User {
 fn sample_game(white: UserId, black: UserId) -> Game {
     Game::new(
         "standard".to_owned(),
+        VariantOptions::default(),
         white,
         black,
         TimeControl::Unlimited,
@@ -212,6 +213,35 @@ async fn game_repo_list_for_user() {
 
     let carol_games = repo.list_for_user(carol, 10).await.unwrap();
     assert_eq!(carol_games.len(), 2);
+}
+
+#[tokio::test]
+async fn game_repo_list_unfinished_excludes_finished() {
+    let repo = MemoryGameRepo::default();
+    let white = UserId::new();
+    let black = UserId::new();
+
+    // A created game, an active game, and a finished game.
+    let created = sample_game(white, black);
+    repo.create(&created).await.unwrap();
+
+    let mut active = sample_game(white, black);
+    active.lifecycle = GameLifecycle::Active;
+    repo.create(&active).await.unwrap();
+
+    let mut finished = sample_game(white, black);
+    finished.finish(
+        Outcome::win(mcs_core::Color::White, EndReason::Checkmate),
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10),
+    );
+    repo.create(&finished).await.unwrap();
+
+    let unfinished = repo.list_unfinished().await.unwrap();
+    let ids: Vec<GameId> = unfinished.iter().map(|g| g.id).collect();
+    assert_eq!(unfinished.len(), 2);
+    assert!(ids.contains(&created.id));
+    assert!(ids.contains(&active.id));
+    assert!(!ids.contains(&finished.id));
 }
 
 // ---------------------------------------------------------------------------
