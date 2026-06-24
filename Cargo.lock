@@ -1218,6 +1218,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcs-variant-shakmaty"
+version = "0.1.0"
+dependencies = [
+ "mcs-core",
+ "serde",
+ "serde_json",
+ "shakmaty",
+]
+
+[[package]]
 name = "mcs-variant-standard"
 version = "0.1.0"
 dependencies = [
