@@ -88,20 +88,14 @@ fn uuid_request_id_generates_valid_uuid() {
     use http::Request;
 
     let mut maker = UuidRequestId;
-    let req = Request::builder()
-        .body(())
-        .expect("valid request");
-    let id = maker
-        .make_request_id(&req)
-        .expect("always produces an id");
+    let req = Request::builder().body(()).expect("valid request");
+    let id = maker.make_request_id(&req).expect("always produces an id");
 
     let header_val = id.header_value().to_str().expect("valid utf-8");
     // A UUID v4 is 36 characters: 8-4-4-4-12.
     assert_eq!(header_val.len(), 36, "expected UUID length");
     // Two consecutive IDs must differ.
-    let id2 = maker
-        .make_request_id(&req)
-        .expect("always produces an id");
+    let id2 = maker.make_request_id(&req).expect("always produces an id");
     assert_ne!(
         id.header_value(),
         id2.header_value(),
