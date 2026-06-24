@@ -24,10 +24,13 @@
 //! |---------------------|---------|
 //! | `GET /auth/nonce`   | issue a single-use SIWE challenge |
 //! | `POST /auth/verify` | verify the signed challenge, mint a session JWT |
+//! | `GET /ws/game/{id}` | upgrade to the live-game WebSocket ([`ws`]) |
 //!
-//! The REST game endpoints (#14) and the WebSocket layer (#15) add their own
-//! sub-routers here later; both will protect routes with the [`AuthUser`]
-//! extractor and extend [`AppState`] with a live-game hub. All handlers return
+//! The WebSocket layer (#15, [`ws`]) streams a live game over a single socket,
+//! authenticating with the session JWT passed as a `?token=` query parameter and
+//! resolving the caller's [`Color`](mcs_core::Color) (or spectator) from the
+//! game record in the shared [`GameHub`]. The REST game endpoints (#14) add their
+//! own sub-router here later and reuse the same hub. All HTTP handlers return
 //! [`ApiResult<T>`] so the error contract applies everywhere.
 //!
 //! ## Authentication
@@ -46,13 +49,17 @@
 pub mod auth;
 pub mod error;
 pub mod extract;
+pub mod hub;
 pub mod state;
+pub mod ws;
 
 use axum::Router;
 
 pub use error::{ApiError, ApiResult};
 pub use extract::AuthUser;
+pub use hub::GameHub;
 pub use state::{AppState, SiweConfig};
+pub use ws::{ClientMessage, ServerMessage, PROTOCOL_VERSION};
 
 /// Builds the top-level HTTP router for the MCS API.
 ///
@@ -63,5 +70,8 @@ pub use state::{AppState, SiweConfig};
 /// As later issues land, their sub-routers are merged in here; the auth routes
 /// and the [`AuthUser`] extractor are unaffected by those additions.
 pub fn router(state: AppState) -> Router {
-    Router::new().merge(auth::auth_router()).with_state(state)
+    Router::new()
+        .merge(auth::auth_router())
+        .merge(ws::ws_router())
+        .with_state(state)
 }

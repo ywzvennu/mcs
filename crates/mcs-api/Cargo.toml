@@ -16,6 +16,7 @@ mcs-core.workspace = true
 mcs-domain.workspace = true
 mcs-storage.workspace = true
 mcs-auth.workspace = true
+mcs-game.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -38,3 +39,9 @@ mcs-storage = { workspace = true, features = ["sqlite"] }
 # EIP-191 personal-sign signatures over the SIWE challenge, mirroring a wallet.
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 sha3 = "0.10"
+# The standard-chess variant, used to spawn a real game session in WS tests.
+mcs-variant-standard = { workspace = true }
+# A real WebSocket client to exercise the live-game socket end to end.
+tokio-tungstenite = "0.24"
+# `SinkExt`/`StreamExt` for driving the tungstenite client stream in tests.
+futures = { workspace = true }
