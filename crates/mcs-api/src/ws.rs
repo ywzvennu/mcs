@@ -39,6 +39,46 @@
 //!    (illegal, out of turn, finished, or sent by a spectator) comes back as a
 //!    [`ServerMessage::Error`] without closing the socket.
 //!
+//! # Draw offers
+//!
+//! A draw is just an ordinary board action, so it needs no dedicated message:
+//! a player offers, accepts, or declines a draw by submitting the variant's
+//! `offer_draw` / `accept_draw` / `decline_draw` [`Action`] through
+//! [`ClientMessage::Submit`]. The variant emits the corresponding `draw_offered`
+//! / `draw_declined` events (and ends the game on accept), which the actor
+//! broadcasts as a [`GameEvent`]; both players therefore receive the offer and
+//! its answer as a normal [`ServerMessage::Update`]. Accepting finishes the game
+//! drawn, delivered to both sides in the same update stream.
+//!
+//! # Rematch (the live path, #84)
+//!
+//! Once a game has **finished**, the two players can negotiate a rematch live
+//! over their open sockets — no polling the REST endpoint. Unlike a move, a
+//! rematch is *not* a board action (the board is over), so it travels on a
+//! separate per-game **table side-channel** (see [`crate::table`]) that every
+//! connection subscribes to alongside the actor's board-event stream:
+//!
+//! - A player sends [`ClientMessage::RematchOffer`]; the server records the
+//!   pending offer and publishes [`ServerMessage::RematchOffered`] to both
+//!   sockets.
+//! - The *other* player sends [`ClientMessage::RematchAccept`]; the server
+//!   creates a brand-new game with the colours swapped (the lichess convention,
+//!   reusing the REST rematch colour logic), clears the offer, and publishes
+//!   [`ServerMessage::RematchAccepted`] carrying the new `game_id` so both
+//!   clients open `/ws/game/{game_id}`.
+//! - Either player may send [`ClientMessage::RematchDecline`] to clear a pending
+//!   offer, publishing [`ServerMessage::RematchDeclined`].
+//!
+//! Only the two players may take part (a spectator is answered with an
+//! [`ServerMessage::Error`]); offers are only valid once the game is
+//! [`Finished`](GameStatus::Finished); and the offerer cannot accept their own
+//! offer. A dropped offerer's pending offer is cleared on disconnect.
+//!
+//! The offline [`POST /games/{id}/rematch`](crate::challenges) REST endpoint is
+//! unchanged and remains the path for a player who is *not* connected: it issues
+//! a durable challenge the opponent can accept later. The WS flow here is the
+//! live, both-players-present complement to it.
+//!
 //! # Reconnect & resync
 //!
 //! The game runs in its own actor, wholly independent of any socket: a
@@ -102,12 +142,14 @@ use std::sync::Arc;
 use mcs_auth::verify_session;
 use mcs_cluster::NodeInfo;
 use mcs_core::{Action, Color, GameStatus, PlayerView};
-use mcs_domain::{Clock, GameId};
+use mcs_domain::{Clock, Game, GameId};
 use mcs_game::{GameEvent, GameHandle, GameSessionError, GameSnapshot};
 use mcs_storage::ActionLogRepo;
 
+use crate::challenges::rematch_colors;
 use crate::error::ApiError;
 use crate::state::AppState;
+use crate::table::{TableChannel, TableEvent};
 
 /// The version of the WebSocket game protocol implemented by this module.
 ///
@@ -115,11 +157,19 @@ use crate::state::AppState;
 /// detect a server it does not understand and refuse to proceed. Bump it on any
 /// breaking change to the [`ClientMessage`] / [`ServerMessage`] schema.
 ///
-/// Version `2` enriches the opening snapshot for reconnect/resync — it now
-/// carries `clock`, `ply`, and `side_to_move` alongside the original
-/// `view`/`status`/`your_color` — and adds the `?since_ply=N` catch-up
+/// Version `2` enriched the opening snapshot for reconnect/resync — it carries
+/// `clock`, `ply`, and `side_to_move` alongside the original
+/// `view`/`status`/`your_color` — and added the `?since_ply=N` catch-up
 /// mechanism with its [`ServerMessage::Replay`] frames.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// Version `3` adds the live **rematch** flow (#84): the new client frames
+/// [`ClientMessage::RematchOffer`], [`ClientMessage::RematchAccept`], and
+/// [`ClientMessage::RematchDecline`], and the new server frames
+/// [`ServerMessage::RematchOffered`], [`ServerMessage::RematchAccepted`], and
+/// [`ServerMessage::RematchDeclined`], delivered over a per-game **table
+/// side-channel** (see [`crate::table`]). Draw offers were already supported as
+/// ordinary [`ClientMessage::Submit`] actions and are unchanged.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Connection role
@@ -184,6 +234,28 @@ pub enum ClientMessage {
         /// The message text the client typed.
         text: String,
     },
+    /// Offer the opponent a rematch of the just-finished game (#84).
+    ///
+    /// Valid only from a **player** (a spectator is rejected with a
+    /// [`ServerMessage::Error`]) and only once the game is
+    /// [`Finished`](GameStatus::Finished). Records the pending offer on the game's
+    /// table channel and publishes [`ServerMessage::RematchOffered`] to both
+    /// players. A second offer simply replaces the pending one.
+    RematchOffer,
+    /// Accept the opponent's pending rematch offer (#84).
+    ///
+    /// Valid only from the player who did **not** make the offer: the offerer
+    /// cannot accept their own offer (rejected with a [`ServerMessage::Error`]),
+    /// and an accept with no pending offer is likewise an error. On success the
+    /// server creates a new game with the colours swapped and publishes
+    /// [`ServerMessage::RematchAccepted`] carrying its id.
+    RematchAccept,
+    /// Decline the pending rematch offer (#84).
+    ///
+    /// Clears the pending offer and publishes [`ServerMessage::RematchDeclined`].
+    /// Valid only from a player; a decline with no pending offer is a no-op
+    /// acknowledged silently.
+    RematchDecline,
 }
 
 /// Both sides' remaining clock time, in whole milliseconds, as carried in a
@@ -279,6 +351,32 @@ pub enum ServerMessage {
         /// The broadcast event describing what changed.
         event: GameEvent,
     },
+    /// A player offered a rematch of the finished game (#84).
+    ///
+    /// Published on the game's table side-channel and delivered to **both**
+    /// players' sockets, so each can show the offer. Carries the color, in the
+    /// finished game, of the player who offered.
+    RematchOffered {
+        /// The color of the player who offered the rematch.
+        by: Color,
+    },
+    /// The pending rematch offer was accepted; a new game now exists (#84).
+    ///
+    /// Delivered to both players. The `game_id` identifies the freshly created
+    /// rematch game (colours swapped from the finished one); both clients open
+    /// `/ws/game/{game_id}` to start playing it.
+    RematchAccepted {
+        /// The id of the new rematch game.
+        game_id: GameId,
+    },
+    /// The pending rematch offer was declined; the table is clear again (#84).
+    ///
+    /// Delivered to both players. Carries the color, in the finished game, of the
+    /// player who declined.
+    RematchDeclined {
+        /// The color of the player who declined the rematch.
+        by: Color,
+    },
     /// A recoverable error: the socket stays open and the client may retry.
     ///
     /// Sent when a [`ClientMessage::Submit`] is rejected (illegal, out of turn,
@@ -309,6 +407,23 @@ impl ServerMessage {
     fn error(message: impl Into<String>) -> Self {
         ServerMessage::Error {
             message: message.into(),
+        }
+    }
+}
+
+/// Renders a table side-channel [`TableEvent`] as the matching wire frame.
+///
+/// The table channel carries session-level events (rematch offers and their
+/// answers); each maps one-to-one to a [`ServerMessage`] rematch variant. The
+/// connection task forwards table events to its socket through this conversion,
+/// exactly as it forwards board [`GameEvent`]s through
+/// [`ServerMessage::Update`].
+impl From<TableEvent> for ServerMessage {
+    fn from(event: TableEvent) -> Self {
+        match event {
+            TableEvent::RematchOffered { by } => ServerMessage::RematchOffered { by },
+            TableEvent::RematchAccepted { game_id } => ServerMessage::RematchAccepted { game_id },
+            TableEvent::RematchDeclined { by } => ServerMessage::RematchDeclined { by },
         }
     }
 }
@@ -503,9 +618,52 @@ async fn game_socket(
     let action_log = state.action_log().clone();
     let since_ply = query.since_ply;
 
-    // 7. Upgrade. From here the connection task owns the socket and the handle.
-    Ok(upgrade
-        .on_upgrade(move |socket| run_connection(socket, handle, role, action_log, since_ply)))
+    // 7. Resolve (or create) this game's table side-channel (#84): the connection
+    //    subscribes to it for live rematch events alongside the board stream, and
+    //    the rematch handlers publish onto it. The whole `AppState` is moved in so
+    //    a `RematchAccept` can create the swapped follow-up game.
+    let table = state.table_hub().get_or_create(game_id);
+
+    // 8. Upgrade. From here the connection task owns the socket and the handle.
+    Ok(upgrade.on_upgrade(move |socket| {
+        run_connection(RunConnection {
+            socket,
+            handle,
+            role,
+            action_log,
+            since_ply,
+            state,
+            game,
+            table,
+        })
+    }))
+}
+
+/// The fully-resolved inputs handed to [`run_connection`] once the handshake has
+/// authenticated, routed, and resolved the role.
+///
+/// Bundled into one struct so the connection task's signature stays readable as
+/// it grew the table side-channel, game record, and shared state needed by the
+/// live rematch flow (#84). Every field is owned by the task for its lifetime.
+struct RunConnection {
+    /// The upgraded socket the task drives.
+    socket: WebSocket,
+    /// The live game actor handle.
+    handle: GameHandle,
+    /// How this connection participates (player color or spectator).
+    role: Role,
+    /// The action log, for `?since_ply` catch-up replay.
+    action_log: Arc<dyn ActionLogRepo>,
+    /// The optional catch-up cursor from the handshake query.
+    since_ply: Option<u32>,
+    /// Shared application state, used to create the rematch game on accept.
+    state: AppState,
+    /// The persisted record of *this* (the finished, on rematch) game, the source
+    /// of the rematch's variant, time control, rated flag, and swapped colours.
+    game: Game,
+    /// This game's table side-channel: the live rematch event stream and the
+    /// pending-offer state.
+    table: Arc<TableChannel>,
 }
 
 // ---------------------------------------------------------------------------
@@ -519,7 +677,9 @@ async fn game_socket(
 /// two concurrent sources with [`tokio::select!`]:
 ///
 /// - **broadcast events** from [`GameHandle::subscribe`], each forwarded as a
-///   per-player [`ServerMessage::Update`]; and
+///   per-player [`ServerMessage::Update`];
+/// - **table events** from the game's table side-channel (#84), each forwarded
+///   as the matching [`ServerMessage`] rematch frame; and
 /// - **client frames**, dispatched by [`handle_client_message`].
 ///
 /// The connection is purely an observer of the actor: it never drives the
@@ -527,17 +687,28 @@ async fn game_socket(
 /// (its broadcast channel closes), or a socket write fails — closes the socket
 /// but leaves the game running untouched. A subscriber that lags past the
 /// broadcast buffer is *resynced* with a fresh snapshot rather than dropped.
-async fn run_connection(
-    mut socket: WebSocket,
-    handle: GameHandle,
-    role: Role,
-    action_log: Arc<dyn ActionLogRepo>,
-    since_ply: Option<u32>,
-) {
+///
+/// On exit, if this connection is the player who left a rematch offer
+/// outstanding, that stale offer is cleared from the table so the opponent is
+/// never left able to "accept" an offer whose maker has gone (#84).
+async fn run_connection(conn: RunConnection) {
+    let RunConnection {
+        mut socket,
+        handle,
+        role,
+        action_log,
+        since_ply,
+        state,
+        game,
+        table,
+    } = conn;
+
     // Subscribe *before* taking the snapshot so no event applied between the two
     // can be missed; at worst the client sees a duplicate it can reconcile by
-    // status.
+    // status. Subscribe to the table side-channel in the same spirit, so a
+    // rematch event published during the handshake is delivered once we loop.
     let mut events = handle.subscribe();
+    let mut table_events = table.subscribe();
 
     if let Err(error) = send_snapshot(&mut socket, &handle, role).await {
         tracing::debug!(%error, "failed to send game snapshot; closing socket");
@@ -556,7 +727,7 @@ async fn run_connection(
 
     loop {
         tokio::select! {
-            // Live updates from the actor.
+            // Live board updates from the actor.
             received = events.recv() => match received {
                 Ok(event) => {
                     if forward_event(&mut socket, &handle, role, event).await.is_err() {
@@ -576,16 +747,50 @@ async fn run_connection(
                 Err(RecvError::Closed) => break,
             },
 
+            // Live table updates (rematch offers/answers) from the side-channel.
+            received = table_events.recv() => match received {
+                Ok(event) => {
+                    let message = ServerMessage::from(event);
+                    if socket.send(message.into_ws_message()).await.is_err() {
+                        break;
+                    }
+                }
+                // A lagged table consumer simply drops the gap: table events are
+                // self-describing (each fully states the new offer state), so the
+                // next one resyncs the client without a special path.
+                Err(RecvError::Lagged(skipped)) => {
+                    tracing::debug!(skipped, "ws table subscriber lagged; dropping the gap");
+                }
+                // The table channel was removed; nothing more will arrive here.
+                Err(RecvError::Closed) => {}
+            },
+
             // Frames from the client.
             incoming = socket.recv() => match incoming {
                 Some(Ok(message)) => {
-                    if !handle_client_message(&mut socket, &handle, role, message).await {
+                    let ctx = ClientContext {
+                        handle: &handle,
+                        role,
+                        state: &state,
+                        game: &game,
+                        table: &table,
+                    };
+                    if !handle_client_message(&mut socket, &ctx, message).await {
                         break;
                     }
                 }
                 // A receive error or a closed stream both mean the client is gone.
                 Some(Err(_)) | None => break,
             },
+        }
+    }
+
+    // Disconnect cleanup (#84): if this player left a rematch offer pending, clear
+    // it so the opponent cannot accept an offer whose maker has gone. Clearing
+    // *by this color* leaves any offer the opponent made untouched.
+    if let Role::Player(color) = role {
+        if table.clear_pending_offer_by(color) {
+            tracing::debug!(%color, "cleared the disconnecting player's pending rematch offer");
         }
     }
 }
@@ -720,6 +925,28 @@ async fn forward_event(
     socket.send(update.into_ws_message()).await
 }
 
+/// The per-connection context a client frame is dispatched against.
+///
+/// Borrows everything a [`ClientMessage`] handler may need: the live actor
+/// [`handle`](ClientContext::handle) for board actions, the connection's
+/// [`role`](ClientContext::role), and — for the live rematch flow (#84) — the
+/// shared [`state`](ClientContext::state) (to create the follow-up game), the
+/// finished [`game`](ClientContext::game) record (its terms and colours), and
+/// the [`table`](ClientContext::table) side-channel (the pending offer and the
+/// publish endpoint). Grouped so the handlers take one parameter, not six.
+struct ClientContext<'a> {
+    /// The live game actor handle.
+    handle: &'a GameHandle,
+    /// How this connection participates (player color or spectator).
+    role: Role,
+    /// Shared application state, used to create the rematch game on accept.
+    state: &'a AppState,
+    /// The persisted record of this game (terms and colours for the rematch).
+    game: &'a Game,
+    /// This game's table side-channel (pending offer + publish endpoint).
+    table: &'a TableChannel,
+}
+
 /// Handles one inbound client frame.
 ///
 /// Returns `true` to keep the connection open, `false` to close it (the client
@@ -728,16 +955,14 @@ async fn forward_event(
 /// [`ServerMessage::Error`] frames and keep the socket open.
 async fn handle_client_message(
     socket: &mut WebSocket,
-    handle: &GameHandle,
-    role: Role,
+    ctx: &ClientContext<'_>,
     message: Message,
 ) -> bool {
     match message {
         Message::Text(text) => {
             match serde_json::from_str::<ClientMessage>(&text) {
                 Ok(client_message) => {
-                    if let Some(reply) = process_client_message(handle, role, client_message).await
-                    {
+                    if let Some(reply) = process_client_message(ctx, client_message).await {
                         // A failed write means the socket is gone; stop.
                         if socket.send(reply.into_ws_message()).await.is_err() {
                             return false;
@@ -765,16 +990,18 @@ async fn handle_client_message(
 ///
 /// `Submit` from a player is forwarded to the actor; its broadcast `Update` is
 /// delivered through the subscription, so a successful submit yields no direct
-/// reply (`None`). Errors and spectator submits yield an
-/// [`ServerMessage::Error`]. `Chat` is acknowledged silently for now.
+/// reply (`None`). The rematch frames go through the table side-channel: a
+/// successful offer/accept/decline publishes a [`TableEvent`] to *both* players
+/// (so it returns `None` here — the publishing reaches this socket too), while a
+/// rule violation yields an [`ServerMessage::Error`]. Errors and spectator
+/// submits yield an [`ServerMessage::Error`]. `Chat` is acknowledged silently.
 async fn process_client_message(
-    handle: &GameHandle,
-    role: Role,
+    ctx: &ClientContext<'_>,
     message: ClientMessage,
 ) -> Option<ServerMessage> {
     match message {
-        ClientMessage::Submit { action } => match role {
-            Role::Player(color) => match handle.submit_action(color, action).await {
+        ClientMessage::Submit { action } => match ctx.role {
+            Role::Player(color) => match ctx.handle.submit_action(color, action).await {
                 // The resulting Update reaches the client via the broadcast
                 // subscription, so there is nothing to reply directly.
                 Ok(_) => None,
@@ -786,6 +1013,134 @@ async fn process_client_message(
         },
         // Chat is accepted; broadcasting it to the table is future work.
         ClientMessage::Chat { .. } => None,
+        ClientMessage::RematchOffer => process_rematch_offer(ctx).await,
+        ClientMessage::RematchAccept => process_rematch_accept(ctx).await,
+        ClientMessage::RematchDecline => process_rematch_decline(ctx).await,
+    }
+}
+
+/// Handles a [`ClientMessage::RematchOffer`].
+///
+/// Records the offer and publishes [`TableEvent::RematchOffered`] to both
+/// players, returning `None` on success (the published event reaches this socket
+/// too). Rejected — with an [`ServerMessage::Error`] — for a spectator or while
+/// the game is not yet finished.
+async fn process_rematch_offer(ctx: &ClientContext<'_>) -> Option<ServerMessage> {
+    let color = match player_color(ctx.role) {
+        Ok(color) => color,
+        Err(reply) => return Some(*reply),
+    };
+    if let Err(reply) = ensure_finished(ctx.handle).await {
+        return Some(*reply);
+    }
+
+    ctx.table.set_pending_offer(color);
+    ctx.table.publish(TableEvent::RematchOffered { by: color });
+    None
+}
+
+/// Handles a [`ClientMessage::RematchAccept`].
+///
+/// The accepter must be a player, the game must be finished, and there must be a
+/// pending offer made by the *other* player (a player cannot accept their own
+/// offer). On success it creates the swapped follow-up game, clears the offer,
+/// and publishes [`TableEvent::RematchAccepted`] with the new id. Any rule
+/// violation yields an [`ServerMessage::Error`].
+async fn process_rematch_accept(ctx: &ClientContext<'_>) -> Option<ServerMessage> {
+    let color = match player_color(ctx.role) {
+        Ok(color) => color,
+        Err(reply) => return Some(*reply),
+    };
+    if let Err(reply) = ensure_finished(ctx.handle).await {
+        return Some(*reply);
+    }
+
+    match ctx.table.pending_offer() {
+        // The offerer cannot accept their own offer.
+        Some(offerer) if offerer == color => Some(ServerMessage::error(
+            "you cannot accept your own rematch offer".to_owned(),
+        )),
+        Some(_) => {
+            // Create the new game with colours swapped from the finished one,
+            // reusing the REST rematch colour convention.
+            let (white, black) = rematch_colors(ctx.game);
+            match ctx
+                .state
+                .create_and_spawn_game(
+                    white,
+                    black,
+                    &ctx.game.variant_id,
+                    ctx.game.time_control.clone(),
+                    ctx.game.rated,
+                    ctx.game.variant_options.clone(),
+                )
+                .await
+            {
+                Ok(new_game) => {
+                    ctx.table.clear_pending_offer();
+                    ctx.table.publish(TableEvent::RematchAccepted {
+                        game_id: new_game.id,
+                    });
+                    None
+                }
+                Err(error) => Some(ServerMessage::error(error.safe_detail().to_owned())),
+            }
+        }
+        // Nothing to accept.
+        None => Some(ServerMessage::error(
+            "there is no pending rematch offer to accept".to_owned(),
+        )),
+    }
+}
+
+/// Handles a [`ClientMessage::RematchDecline`].
+///
+/// Clears any pending offer and publishes [`TableEvent::RematchDeclined`] to both
+/// players. A decline from a spectator is rejected; a decline with no pending
+/// offer is acknowledged silently (`None`).
+async fn process_rematch_decline(ctx: &ClientContext<'_>) -> Option<ServerMessage> {
+    let color = match player_color(ctx.role) {
+        Ok(color) => color,
+        Err(reply) => return Some(*reply),
+    };
+
+    if ctx.table.clear_pending_offer().is_some() {
+        ctx.table.publish(TableEvent::RematchDeclined { by: color });
+    }
+    None
+}
+
+/// Resolves the connection's player [`Color`], or — for a spectator — the
+/// rejection [`ServerMessage`] to send back: only the two players may take part
+/// in a rematch (#84).
+///
+/// The error arm carries the reply as `Ok`/`Err` mirrored into the caller's
+/// `Option<ServerMessage>` return; it is returned `Box`ed so the rarely-taken
+/// error path does not bloat the common `Result` on the stack.
+fn player_color(role: Role) -> Result<Color, Box<ServerMessage>> {
+    match role {
+        Role::Player(color) => Ok(color),
+        Role::Spectator => Err(Box::new(ServerMessage::error(
+            "spectators cannot offer or answer a rematch".to_owned(),
+        ))),
+    }
+}
+
+/// Confirms the game is [`Finished`](GameStatus::Finished), or returns the
+/// rejection [`ServerMessage`] (boxed) to send back: a rematch is only valid once
+/// the game is over (#84).
+///
+/// A transient actor error is treated conservatively as "not finished" so a
+/// rematch is never offered against a game whose status cannot be confirmed.
+async fn ensure_finished(handle: &GameHandle) -> Result<(), Box<ServerMessage>> {
+    match handle.status().await {
+        Ok(status) if status.is_finished() => Ok(()),
+        Ok(_) => Err(Box::new(ServerMessage::error(
+            "a rematch can only be offered once the game has finished".to_owned(),
+        ))),
+        Err(_) => Err(Box::new(ServerMessage::error(
+            "the game status is unavailable; try again".to_owned(),
+        ))),
     }
 }
 

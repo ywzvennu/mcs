@@ -23,6 +23,7 @@ use crate::error::ApiError;
 use crate::hub::GameHub;
 use crate::presence::{InProcessPresence, PresenceTracker};
 use crate::rating::RatingUpdateHook;
+use crate::table::TableHub;
 
 /// A serializer for the recover-and-insert critical section, keyed by [`GameId`].
 ///
@@ -187,6 +188,18 @@ pub struct AppState {
     session_config: SessionConfig,
     siwe_config: SiweConfig,
     game_hub: GameHub,
+    /// The per-game **table side-channel** registry (#84): the session-level
+    /// mirror of [`game_hub`](Self::game_hub).
+    ///
+    /// Where the game hub holds each game's *board* actor, this holds each
+    /// game's [`TableChannel`](crate::table::TableChannel) — the
+    /// [`broadcast`](tokio::sync::broadcast) of non-board
+    /// [`TableEvent`](crate::table::TableEvent)s (today, rematch offers and their
+    /// answers) plus the pending rematch offer. The WebSocket endpoint
+    /// subscribes a connection to this alongside the actor's `GameEvent` stream,
+    /// and the rematch action handlers publish onto it. Cheap to clone (it shares
+    /// an [`Arc`] internally), so it keeps `AppState` cheap to clone.
+    table_hub: TableHub,
     variants: Arc<VariantRegistry>,
     matchmaker: Arc<Matchmaker>,
     game_repo: Arc<dyn GameRepo>,
@@ -350,6 +363,7 @@ impl AppState {
             session_config,
             siwe_config,
             game_hub: GameHub::new(),
+            table_hub: TableHub::new(),
             variants,
             matchmaker: Arc::new(Matchmaker::new(seek_repo)),
             game_repo,
@@ -518,6 +532,19 @@ impl AppState {
     #[must_use]
     pub fn game_hub(&self) -> &GameHub {
         &self.game_hub
+    }
+
+    /// Returns the table-side-channel hub (#84): the registry of per-game
+    /// session-level [`TableChannel`](crate::table::TableChannel)s.
+    ///
+    /// The WebSocket endpoint ([`crate::ws`]) resolves a game's channel from it —
+    /// creating it on first use — to subscribe a connection to the table's
+    /// [`TableEvent`](crate::table::TableEvent) stream (rematch offers/answers)
+    /// alongside the board `GameEvent` stream, and the rematch action handlers
+    /// publish onto it. Cheap to clone; shares an [`Arc`] with this state.
+    #[must_use]
+    pub fn table_hub(&self) -> &TableHub {
+        &self.table_hub
     }
 
     /// Returns the registry of game variants used to instantiate sessions.
@@ -763,6 +790,7 @@ impl std::fmt::Debug for AppState {
             .field("session_config", &self.session_config)
             .field("siwe_config", &self.siwe_config)
             .field("game_hub", &self.game_hub)
+            .field("table_hub", &self.table_hub)
             .field("variants", &self.variants)
             .field("matchmaker", &self.matchmaker)
             .field("game_repo", &"<dyn GameRepo>")

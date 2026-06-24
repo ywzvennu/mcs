@@ -76,6 +76,7 @@ pub mod presence;
 pub mod rating;
 pub mod rest;
 pub mod state;
+pub mod table;
 pub mod variants;
 pub mod ws;
 
@@ -97,6 +98,7 @@ pub use rest::{
     UserStatusResponse,
 };
 pub use state::{AppState, Cluster, PaymentGate, SiweConfig, DEFAULT_ONLINE_TTL};
+pub use table::{TableChannel, TableEvent, TableHub};
 pub use variants::{VariantDto, VariantListResponse};
 pub use ws::{ClientMessage, OwnerInfo, RedirectBody, ServerMessage, PROTOCOL_VERSION};
 
