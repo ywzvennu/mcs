@@ -33,6 +33,7 @@ use thiserror::Error;
 use mcs_auth::AuthError;
 use mcs_core::GameError;
 use mcs_domain::DomainError;
+use mcs_game::MatchmakingError;
 use mcs_storage::error::StorageError;
 
 // ---------------------------------------------------------------------------
@@ -336,6 +337,24 @@ impl From<GameError> for ApiError {
                 ApiError::Internal(format!("game serialization error: {detail}"))
             }
             GameError::Other(detail) => ApiError::Internal(format!("game error: {detail}")),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// From<MatchmakingError>
+// ---------------------------------------------------------------------------
+
+/// Maps [`MatchmakingError`] to [`ApiError`].
+///
+/// Matchmaking only fails when its underlying [`SeekRepo`](mcs_storage::SeekRepo)
+/// does, so the error is forwarded through the existing [`StorageError`] mapping
+/// (a not-found seek to 404, a conflict to 409, and backend/serialization
+/// failures to a logged 500 whose detail never reaches the caller).
+impl From<MatchmakingError> for ApiError {
+    fn from(err: MatchmakingError) -> Self {
+        match err {
+            MatchmakingError::Storage(storage) => storage.into(),
         }
     }
 }

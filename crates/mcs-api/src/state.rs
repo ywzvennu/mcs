@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use mcs_auth::SessionConfig;
-use mcs_storage::Repositories;
+use mcs_core::VariantRegistry;
+use mcs_game::Matchmaker;
+use mcs_storage::{GameRepo, Repositories, SeekRepo, UserRepo};
 use time::Duration;
 
 use crate::hub::GameHub;
@@ -80,18 +82,51 @@ impl SiweConfig {
 /// id so a connecting client can stream and submit moves. The hub is itself
 /// cloneable (it shares an [`Arc`] internally), so adding it keeps `AppState`
 /// cheap to clone and the [`AuthUser`](crate::AuthUser) extractor unaffected.
+///
+/// # Game-creation dependencies (#14)
+///
+/// The REST seek/game endpoints need three further pieces of shared state that
+/// the [`Repositories`] aggregate cannot hand out directly (it only lends
+/// `&dyn` references, while both the matchmaker and the actor need owned
+/// `Arc<dyn _>` trait objects):
+///
+/// - [`variants`](AppState::variants) — the [`VariantRegistry`] used to
+///   instantiate a fresh [`GameSession`](mcs_core::GameSession) for a paired
+///   seek. It is populated **by the caller** at start-up (the server registers
+///   `mcs-variant-standard`; tests register it themselves), which keeps this
+///   crate free of a runtime dependency on any concrete variant.
+/// - [`matchmaker`](AppState::matchmaker) — the [`Matchmaker`] that pools open
+///   seeks and pairs compatible ones, built from an `Arc<dyn SeekRepo>`.
+/// - [`game_repo`](AppState::game_repo) — the `Arc<dyn GameRepo>` handed to
+///   each spawned [`GameActor`](mcs_game::GameActor) so it can persist results.
 #[derive(Clone)]
 pub struct AppState {
     storage: Arc<dyn Repositories>,
     session_config: SessionConfig,
     siwe_config: SiweConfig,
     game_hub: GameHub,
+    variants: Arc<VariantRegistry>,
+    matchmaker: Arc<Matchmaker>,
+    game_repo: Arc<dyn GameRepo>,
 }
 
 impl AppState {
-    /// Builds the application state from its dependencies.
+    /// Builds the application state from a single storage handle plus
+    /// configuration.
     ///
-    /// * `storage` — the repository aggregate, already wrapped in an [`Arc`].
+    /// `storage` is taken as a concrete `Arc<S>` whose type implements every
+    /// repository trait the API needs ([`Repositories`] for the existing
+    /// handlers, plus [`SeekRepo`] for the matchmaker and [`GameRepo`] for actor
+    /// spawning). The trait-object handles are derived internally by cloning the
+    /// same `Arc` and coercing it independently, so all of them share one
+    /// backing store — exactly the property the live-game path relies on, where
+    /// the API reads through `Arc<dyn Repositories>` and an actor persists
+    /// through `Arc<dyn GameRepo>` over the very same database.
+    ///
+    /// * `storage` — the backing store, implementing all repository traits.
+    /// * `variants` — the registry of game variants, pre-populated by the
+    ///   caller (the server registers `mcs-variant-standard`; tests do the
+    ///   same). Held behind an [`Arc`] so the clone stays cheap.
     /// * `session_config` — JWT signing/verification parameters, shared by the
     ///   `/auth/verify` handler (issuance) and the [`AuthUser`](crate::AuthUser)
     ///   extractor (verification).
@@ -100,16 +135,30 @@ impl AppState {
     /// The [`game_hub`](AppState::game_hub) starts empty; games are inserted as
     /// they are created.
     #[must_use]
-    pub fn new(
-        storage: Arc<dyn Repositories>,
+    pub fn new<S>(
+        storage: Arc<S>,
+        variants: Arc<VariantRegistry>,
         session_config: SessionConfig,
         siwe_config: SiweConfig,
-    ) -> Self {
+    ) -> Self
+    where
+        S: Repositories + GameRepo + SeekRepo + UserRepo + 'static,
+    {
+        // Coerce the one concrete `Arc<S>` into each trait object the layers
+        // need. Every coercion shares the same allocation, so all handles read
+        // and write one backing store.
+        let repositories: Arc<dyn Repositories> = storage.clone();
+        let seek_repo: Arc<dyn SeekRepo> = storage.clone();
+        let game_repo: Arc<dyn GameRepo> = storage;
+
         Self {
-            storage,
+            storage: repositories,
             session_config,
             siwe_config,
             game_hub: GameHub::new(),
+            variants,
+            matchmaker: Arc::new(Matchmaker::new(seek_repo)),
+            game_repo,
         }
     }
 
@@ -141,6 +190,35 @@ impl AppState {
     pub fn game_hub(&self) -> &GameHub {
         &self.game_hub
     }
+
+    /// Returns the registry of game variants used to instantiate sessions.
+    ///
+    /// The seek/game-creation endpoints (#14) call
+    /// [`new_game`](VariantRegistry::new_game) on it to build a fresh
+    /// [`GameSession`](mcs_core::GameSession) for a paired seek.
+    #[must_use]
+    pub fn variants(&self) -> &Arc<VariantRegistry> {
+        &self.variants
+    }
+
+    /// Returns the seek-pool matchmaker.
+    ///
+    /// `POST /seeks` submits to it and `DELETE /seeks/{id}` cancels through it.
+    #[must_use]
+    pub fn matchmaker(&self) -> &Arc<Matchmaker> {
+        &self.matchmaker
+    }
+
+    /// Returns the game repository handle used to spawn game actors.
+    ///
+    /// When a seek pairs, the endpoint persists the new [`Game`](mcs_domain::Game)
+    /// and hands a clone of this handle to
+    /// [`GameActor::spawn`](mcs_game::GameActor::spawn) so the actor can record
+    /// the result when play concludes.
+    #[must_use]
+    pub fn game_repo(&self) -> &Arc<dyn GameRepo> {
+        &self.game_repo
+    }
 }
 
 // `SessionConfig` deliberately has no `Debug` derive that exposes the secret
@@ -154,6 +232,9 @@ impl std::fmt::Debug for AppState {
             .field("session_config", &self.session_config)
             .field("siwe_config", &self.siwe_config)
             .field("game_hub", &self.game_hub)
+            .field("variants", &self.variants)
+            .field("matchmaker", &self.matchmaker)
+            .field("game_repo", &"<dyn GameRepo>")
             .finish()
     }
 }

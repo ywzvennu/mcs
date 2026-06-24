@@ -18,20 +18,29 @@
 //! ## Routers and endpoints
 //!
 //! [`router`] assembles the top-level [`axum::Router`] from per-area
-//! sub-routers. Today it mounts the **auth** endpoints ([`auth::auth_router`]):
+//! sub-routers:
 //!
-//! | Method & path       | Handler |
-//! |---------------------|---------|
-//! | `GET /auth/nonce`   | issue a single-use SIWE challenge |
-//! | `POST /auth/verify` | verify the signed challenge, mint a session JWT |
-//! | `GET /ws/game/{id}` | upgrade to the live-game WebSocket ([`ws`]) |
+//! | Method & path        | Handler |
+//! |----------------------|---------|
+//! | `GET /auth/nonce`    | issue a single-use SIWE challenge |
+//! | `POST /auth/verify`  | verify the signed challenge, mint a session JWT |
+//! | `GET /ws/game/{id}`  | upgrade to the live-game WebSocket ([`ws`]) |
+//! | `POST /seeks`        | post a seek; queue it or pair it into a game ([`rest`]) |
+//! | `DELETE /seeks/{id}` | cancel one of the caller's own seeks ([`rest`]) |
+//! | `GET /games/{id}`    | fetch a single game by id ([`rest`]) |
+//! | `GET /games`         | list recent games ([`rest`]) |
+//! | `GET /users/{id}`    | a user's public profile ([`rest`]) |
+//! | `GET /profile`       | the authenticated caller's profile ([`rest`]) |
 //!
 //! The WebSocket layer (#15, [`ws`]) streams a live game over a single socket,
 //! authenticating with the session JWT passed as a `?token=` query parameter and
 //! resolving the caller's [`Color`](mcs_core::Color) (or spectator) from the
-//! game record in the shared [`GameHub`]. The REST game endpoints (#14) add their
-//! own sub-router here later and reuse the same hub. All HTTP handlers return
-//! [`ApiResult<T>`] so the error contract applies everywhere.
+//! game record in the shared [`GameHub`]. The REST game endpoints (#14, [`rest`])
+//! create those games — pairing seeks, spawning actors, and registering them in
+//! the same hub — and read them back over plain HTTP. Game creation is isolated
+//! on [`rest::seek_router`] so a future x402 payment middleware can wrap only it.
+//! All HTTP handlers return [`ApiResult<T>`] so the error contract applies
+//! everywhere.
 //!
 //! ## Authentication
 //!
@@ -50,6 +59,7 @@ pub mod auth;
 pub mod error;
 pub mod extract;
 pub mod hub;
+pub mod rest;
 pub mod state;
 pub mod ws;
 
@@ -58,6 +68,10 @@ use axum::Router;
 pub use error::{ApiError, ApiResult};
 pub use extract::AuthUser;
 pub use hub::GameHub;
+pub use rest::{
+    CancelSeekResponse, CreateSeekRequest, CreateSeekResponse, GameDto, GameListResponse,
+    ProfileDto,
+};
 pub use state::{AppState, SiweConfig};
 pub use ws::{ClientMessage, ServerMessage, PROTOCOL_VERSION};
 
@@ -73,5 +87,10 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(auth::auth_router())
         .merge(ws::ws_router())
+        // Game creation (`POST /seeks`) is isolated on its own sub-router so a
+        // future x402 payment middleware can wrap only it; see
+        // [`rest::seek_router`].
+        .merge(rest::seek_router())
+        .merge(rest::read_router())
         .with_state(state)
 }
