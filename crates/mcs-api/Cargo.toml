@@ -26,6 +26,12 @@ mcs-rating = { path = "../mcs-rating", features = ["domain"] }
 # Referenced by path: `mcs-payments` is not in `[workspace.dependencies]`, and
 # member path deps are allowed (only the root manifest is off-limits).
 mcs-payments = { path = "../mcs-payments" }
+# Clustering primitives for cluster-aware WebSocket routing (#68). Referenced by
+# path with NO Redis feature: the API layer only ever holds an
+# `Arc<dyn NodeRegistry>` and computes ownership via the pure HRW directory, so
+# it links no backend. The Redis-backed registry is constructed solely by
+# `mcs-server` when cluster mode is explicitly enabled.
+mcs-cluster = { path = "../mcs-cluster" }
 async-trait.workspace = true
 axum.workspace = true
 serde.workspace = true

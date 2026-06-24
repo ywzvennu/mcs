@@ -29,7 +29,9 @@ async fn main() -> anyhow::Result<()> {
 
     let session_secret = resolve_session_secret(&cfg);
 
-    let app = build_app(&cfg, session_secret)
+    // `cluster` is `Some` only when cluster mode is enabled; single-node it is
+    // `None` and the server runs exactly as before.
+    let (app, cluster) = build_app(&cfg, session_secret)
         .await
         .context("building the application")?;
 
@@ -46,6 +48,12 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serving HTTP")?;
+
+    // Graceful shutdown drained; leave the cluster registry promptly so survivors
+    // notice this node's departure without waiting for its TTL to lapse.
+    if let Some(cluster) = cluster {
+        cluster.shutdown().await;
+    }
 
     tracing::info!("mcs-server shut down cleanly");
     Ok(())

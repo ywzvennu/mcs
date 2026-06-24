@@ -23,6 +23,7 @@
 //! [`main`]: ../mcs_server/fn.main.html
 #![doc(html_root_url = "https://docs.rs/mcs-server")]
 
+pub mod cluster;
 pub mod config;
 
 use std::sync::Arc;
@@ -35,6 +36,7 @@ use mcs_storage::SqlxStorage;
 use serde::Serialize;
 use tower::ServiceBuilder;
 
+pub use cluster::ClusterRuntime;
 pub use config::Config;
 
 /// The body returned by the `GET /health` liveness endpoint.
@@ -201,20 +203,33 @@ pub async fn recover_games(state: &AppState) -> anyhow::Result<usize> {
 /// This is the config-driven entry point used by [`main`](crate): it connects
 /// [`SqlxStorage`](mcs_storage::SqlxStorage) (building the pool and running
 /// migrations), builds the state, **recovers any games that were in progress**
-/// (see [`recover_games`]) into the live-game hub, then assembles the router.
+/// (see [`recover_games`]) into the live-game hub, **wires cluster membership**
+/// (see [`cluster::setup`]) when `[cluster].enabled`, then assembles the router.
 /// The session `secret` is supplied separately so the caller controls the
 /// ephemeral-secret policy.
+///
+/// Returns the assembled [`Router`] together with an optional [`ClusterRuntime`]:
+/// `Some` when cluster mode is enabled (the caller must
+/// [`shutdown`](ClusterRuntime::shutdown) it on graceful shutdown to leave the
+/// registry promptly), `None` for a single-node server.
 ///
 /// # Errors
 ///
 /// Returns an error if the storage backend cannot be connected, its migrations
-/// fail to apply, or the unfinished-games query fails. Individual games that
-/// cannot be recovered are logged and skipped, never aborting startup.
+/// fail to apply, the unfinished-games query fails, or — when cluster mode is
+/// enabled — the Redis connection or initial node registration fails. Individual
+/// games that cannot be recovered are logged and skipped, never aborting startup.
 ///
 /// [`main`]: ../mcs_server/fn.main.html
-pub async fn build_app(cfg: &Config, session_secret: Vec<u8>) -> anyhow::Result<Router> {
+pub async fn build_app(
+    cfg: &Config,
+    session_secret: Vec<u8>,
+) -> anyhow::Result<(Router, Option<ClusterRuntime>)> {
     let storage = Arc::new(SqlxStorage::connect(&cfg.database_url).await?);
     let state = build_state(cfg, storage, session_secret);
     recover_games(&state).await?;
-    Ok(router(state))
+    // Wire cluster membership when enabled (no-op otherwise; the state keeps its
+    // single-node local registry and no Redis connection is opened).
+    let (state, cluster) = cluster::setup(cfg, state).await?;
+    Ok((router(state), cluster))
 }

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use mcs_auth::SessionConfig;
+use mcs_cluster::{LocalRegistry, NodeInfo, NodeRegistry};
 use mcs_core::VariantRegistry;
 use mcs_domain::{GameId, GameLifecycle};
 use mcs_game::{recover_game, GameCompletionHook, GameHandle, Matchmaker};
@@ -206,11 +207,73 @@ pub struct AppState {
     /// [`RequirePaymentLayer`](mcs_payments::RequirePaymentLayer). Configure it
     /// with [`with_payment`](AppState::with_payment).
     payment_gate: Option<PaymentGate>,
+    /// The cluster-routing setup (#68): the membership registry plus this node's
+    /// identity, used by the WebSocket path to decide whether *this* node owns a
+    /// game or should redirect the client to the owning node.
+    ///
+    /// Never `None`: state is created single-node, with a
+    /// [`LocalRegistry`](mcs_cluster::LocalRegistry) over a synthetic local node
+    /// whose [`live_nodes`](mcs_cluster::NodeRegistry::live_nodes) reports only
+    /// itself — so [`owner`](mcs_cluster::owner) always resolves to this node and
+    /// routing is a no-op, exactly the pre-cluster behaviour. A multi-node
+    /// deployment swaps in a real registry via [`with_cluster`](AppState::with_cluster).
+    cluster: Cluster,
     /// Per-game serialization for [`get_or_recover`](AppState::get_or_recover),
     /// so two concurrent connects to the same absent game rebuild its actor only
     /// once. See [`RecoveryLocks`]. Shared across clones via the inner [`Arc`].
     recovery_locks: RecoveryLocks,
 }
+
+/// This node's membership view: how the WebSocket router decides game ownership.
+///
+/// Holds the shared [`NodeRegistry`] (the live-membership source) together with
+/// this process's own [`NodeInfo`]. The router asks the registry for the live
+/// set, computes the rendezvous [`owner`](mcs_cluster::owner) of a game id, and
+/// compares it to [`this_node`](Cluster::this_node) to choose between *serve*
+/// and *redirect*.
+///
+/// The single-node default wraps a [`LocalRegistry`], whose `live_nodes` returns
+/// only this node — so every game resolves to this node and the router never
+/// redirects.
+#[derive(Clone)]
+pub struct Cluster {
+    /// The membership registry. Shared (`Arc`) so the state stays cheap to clone.
+    registry: Arc<dyn NodeRegistry>,
+    /// This process's identity and externally reachable address.
+    this_node: NodeInfo,
+}
+
+impl Cluster {
+    /// Returns the shared membership registry.
+    #[must_use]
+    pub fn registry(&self) -> &Arc<dyn NodeRegistry> {
+        &self.registry
+    }
+
+    /// Returns this node's identity and address.
+    #[must_use]
+    pub fn this_node(&self) -> &NodeInfo {
+        &self.this_node
+    }
+}
+
+impl std::fmt::Debug for Cluster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `Arc<dyn NodeRegistry>` is not `Debug`; summarize the identity instead.
+        f.debug_struct("Cluster")
+            .field("registry", &"<dyn NodeRegistry>")
+            .field("this_node", &self.this_node)
+            .finish()
+    }
+}
+
+/// The synthetic node id used by the single-node default registry.
+///
+/// A deployment that never enables clustering still computes ownership through
+/// the same code path; this fixed id labels the lone local node so
+/// [`owner`](mcs_cluster::owner) has something to resolve to. The address is
+/// irrelevant single-node (the router never redirects to it).
+const LOCAL_NODE_ID: &str = "local";
 
 impl AppState {
     /// Builds the application state from a single storage handle plus
@@ -274,8 +337,56 @@ impl AppState {
             // Payments are off by default: the router behaves exactly as before
             // until a caller opts in via `with_payment`.
             payment_gate: None,
+            // Single-node by default: a `LocalRegistry` over a synthetic local
+            // node, so the WS router computes ownership through the same path a
+            // cluster would but always resolves to *this* node — no redirect, no
+            // Redis, byte-for-byte the pre-cluster behaviour. A multi-node
+            // deployment overrides this via `with_cluster`.
+            cluster: Cluster {
+                this_node: NodeInfo::new(LOCAL_NODE_ID, ""),
+                registry: Arc::new(LocalRegistry::new(NodeInfo::new(LOCAL_NODE_ID, ""))),
+            },
             recovery_locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Enables cluster-aware WebSocket routing, returning the modified state
+    /// (builder style).
+    ///
+    /// This does **not** change the [`AppState::new`] signature: state is created
+    /// single-node (a [`LocalRegistry`] over a synthetic local node, so every
+    /// game owns to this node and nothing is ever redirected), and a multi-node
+    /// deployment chains `with_cluster(..)` to swap in real membership.
+    ///
+    /// Once set, the WS handler ([`crate::ws`]) consults `registry.live_nodes()`
+    /// and the rendezvous [`owner`](mcs_cluster::owner) of the game id before
+    /// upgrading: if `this_node` owns the game it is served locally (recovering
+    /// the actor from the durable log on demand — the failover path); otherwise
+    /// the client is told to reconnect to the owning node rather than upgraded.
+    ///
+    /// * `registry` — the shared membership source (e.g. a
+    ///   [`RedisNodeRegistry`](mcs_cluster::RedisNodeRegistry), constructed and
+    ///   registered by the server). The API holds it only as
+    ///   `Arc<dyn NodeRegistry>`, so it links no backend itself.
+    /// * `this_node` — this process's identity and externally reachable address,
+    ///   the same `NodeInfo` registered with `registry`.
+    #[must_use]
+    pub fn with_cluster(mut self, registry: Arc<dyn NodeRegistry>, this_node: NodeInfo) -> Self {
+        self.cluster = Cluster {
+            registry,
+            this_node,
+        };
+        self
+    }
+
+    /// Returns the cluster-routing setup (registry + this node's identity).
+    ///
+    /// The WebSocket handler uses this to decide between serving a game locally
+    /// and redirecting to its owner. The single-node default always resolves
+    /// ownership to this node, so the returned value is never `None`.
+    #[must_use]
+    pub fn cluster(&self) -> &Cluster {
+        &self.cluster
     }
 
     /// Enables the x402 payment gate on game creation, returning the modified
@@ -520,6 +631,7 @@ impl std::fmt::Debug for AppState {
             .field("action_log", &"<dyn ActionLogRepo>")
             .field("completion_hook", &"<dyn GameCompletionHook>")
             .field("payment_gate", &self.payment_gate)
+            .field("cluster", &self.cluster)
             .finish_non_exhaustive()
     }
 }
