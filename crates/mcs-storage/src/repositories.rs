@@ -1,6 +1,6 @@
 //! Aggregate repository handle.
 
-use crate::{GameRepo, SeekRepo, SessionRepo, UserRepo};
+use crate::{GameRepo, RatingRepo, SeekRepo, SessionRepo, UserRepo};
 
 /// A single handle that exposes all repository traits.
 ///
@@ -42,4 +42,7 @@ pub trait Repositories: Send + Sync {
 
     /// Returns the session / nonce repository.
     fn sessions(&self) -> &dyn SessionRepo;
+
+    /// Returns the rating repository.
+    fn ratings(&self) -> &dyn RatingRepo;
 }

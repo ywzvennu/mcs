@@ -7,7 +7,7 @@
 
 use mcs_core::{Color, EndReason, Outcome};
 use mcs_domain::{
-    ColorPreference, EvmAddress, Game, GameLifecycle, Seek, TimeControl, User, UserId,
+    ColorPreference, EvmAddress, Game, GameLifecycle, Rating, Seek, TimeControl, User, UserId,
 };
 use time::OffsetDateTime;
 
@@ -396,6 +396,128 @@ async fn nonce_store_supersedes_previous_expiry() {
         .consume_nonce(&addr, "tok")
         .await
         .unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// RatingRepo — SQLite integration tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rating_get_missing_returns_none() {
+    let storage = storage().await;
+    let result = storage
+        .ratings()
+        .get(UserId::new(), "standard")
+        .await
+        .unwrap();
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn rating_upsert_then_get_round_trip() {
+    let storage = storage().await;
+    let user = UserId::new();
+    let rating = Rating {
+        value: 1750.0,
+        deviation: 220.0,
+        volatility: 0.055,
+    };
+
+    storage
+        .ratings()
+        .upsert(user, "standard", &rating)
+        .await
+        .unwrap();
+    let fetched = storage
+        .ratings()
+        .get(user, "standard")
+        .await
+        .unwrap()
+        .expect("rating must exist after upsert");
+
+    assert_eq!(fetched.value, rating.value);
+    assert_eq!(fetched.deviation, rating.deviation);
+    assert_eq!(fetched.volatility, rating.volatility);
+}
+
+#[tokio::test]
+async fn rating_upsert_overwrites_existing() {
+    let storage = storage().await;
+    let user = UserId::new();
+
+    storage
+        .ratings()
+        .upsert(
+            user,
+            "standard",
+            &Rating {
+                value: 1500.0,
+                deviation: 350.0,
+                volatility: 0.06,
+            },
+        )
+        .await
+        .unwrap();
+
+    let updated = Rating {
+        value: 1650.0,
+        deviation: 150.0,
+        volatility: 0.05,
+    };
+    storage
+        .ratings()
+        .upsert(user, "standard", &updated)
+        .await
+        .unwrap();
+
+    let fetched = storage
+        .ratings()
+        .get(user, "standard")
+        .await
+        .unwrap()
+        .expect("rating must exist");
+    assert_eq!(fetched.value, updated.value);
+    assert_eq!(fetched.deviation, updated.deviation);
+    assert_eq!(fetched.volatility, updated.volatility);
+}
+
+#[tokio::test]
+async fn rating_leaderboard_ordering_and_limit() {
+    let storage = storage().await;
+    let values = [1200.0_f64, 1800.0, 1500.0, 2000.0, 1100.0];
+    for v in &values {
+        let user = UserId::new();
+        storage
+            .ratings()
+            .upsert(
+                user,
+                "standard",
+                &Rating {
+                    value: *v,
+                    deviation: 200.0,
+                    volatility: 0.06,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let board = storage.ratings().leaderboard("standard", 3).await.unwrap();
+    assert_eq!(board.len(), 3);
+    // Must be non-ascending by value.
+    assert!(board.windows(2).all(|w| w[0].1.value >= w[1].1.value));
+    assert_eq!(board[0].1.value, 2000.0);
+}
+
+#[tokio::test]
+async fn rating_leaderboard_empty_variant_returns_empty() {
+    let storage = storage().await;
+    let board = storage
+        .ratings()
+        .leaderboard("nonexistent", 10)
+        .await
+        .unwrap();
+    assert!(board.is_empty());
 }
 
 // ---------------------------------------------------------------------------

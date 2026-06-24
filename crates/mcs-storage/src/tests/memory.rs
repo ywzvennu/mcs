@@ -8,12 +8,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use mcs_domain::{EvmAddress, Game, GameId, Seek, SeekId, User, UserId};
+use mcs_domain::{EvmAddress, Game, GameId, Rating, Seek, SeekId, User, UserId};
 use time::OffsetDateTime;
 
 use crate::{
     error::{StorageError, StorageResult},
     game::GameRepo,
+    rating::RatingRepo,
     repositories::Repositories,
     seek::SeekRepo,
     session::SessionRepo,
@@ -227,6 +228,57 @@ impl SessionRepo for MemorySessionRepo {
 }
 
 // ---------------------------------------------------------------------------
+// MemoryRatingRepo
+// ---------------------------------------------------------------------------
+
+/// In-memory [`RatingRepo`] backed by a `HashMap`.
+///
+/// Key: `(user_id_string, variant_id_string)` → [`Rating`].
+#[derive(Debug, Default)]
+pub(super) struct MemoryRatingRepo {
+    ratings: Mutex<HashMap<(String, String), Rating>>,
+}
+
+#[async_trait]
+impl RatingRepo for MemoryRatingRepo {
+    async fn get(&self, user: UserId, variant_id: &str) -> StorageResult<Option<Rating>> {
+        let map = self.ratings.lock().expect("mutex poisoned");
+        Ok(map.get(&(user.to_string(), variant_id.to_owned())).cloned())
+    }
+
+    async fn upsert(&self, user: UserId, variant_id: &str, rating: &Rating) -> StorageResult<()> {
+        let mut map = self.ratings.lock().expect("mutex poisoned");
+        map.insert((user.to_string(), variant_id.to_owned()), rating.clone());
+        Ok(())
+    }
+
+    async fn leaderboard(
+        &self,
+        variant_id: &str,
+        limit: u32,
+    ) -> StorageResult<Vec<(UserId, Rating)>> {
+        let map = self.ratings.lock().expect("mutex poisoned");
+        let mut entries: Vec<(UserId, Rating)> = map
+            .iter()
+            .filter(|((_, vid), _)| vid == variant_id)
+            .map(|((uid, _), r)| {
+                let user_id: UserId = uid.parse().expect("stored UserId must be valid UUID");
+                (user_id, r.clone())
+            })
+            .collect();
+        // Highest value first; break ties deterministically by user_id string.
+        entries.sort_by(|(a_id, a_r), (b_id, b_r)| {
+            b_r.value
+                .partial_cmp(&a_r.value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a_id.to_string().cmp(&b_id.to_string()))
+        });
+        entries.truncate(limit as usize);
+        Ok(entries)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // InMemoryRepos — aggregate
 // ---------------------------------------------------------------------------
 
@@ -237,6 +289,7 @@ pub(super) struct InMemoryRepos {
     games: MemoryGameRepo,
     seeks: MemorySeekRepo,
     sessions: MemorySessionRepo,
+    ratings: MemoryRatingRepo,
 }
 
 impl Repositories for InMemoryRepos {
@@ -254,5 +307,9 @@ impl Repositories for InMemoryRepos {
 
     fn sessions(&self) -> &dyn SessionRepo {
         &self.sessions
+    }
+
+    fn ratings(&self) -> &dyn RatingRepo {
+        &self.ratings
     }
 }

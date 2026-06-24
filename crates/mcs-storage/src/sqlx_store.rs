@@ -29,7 +29,7 @@
 
 use async_trait::async_trait;
 use mcs_domain::{
-    ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Seek, SeekId, User, UserId,
+    ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Rating, Seek, SeekId, User, UserId,
 };
 use sqlx::Row;
 use time::format_description::well_known::Rfc3339;
@@ -37,7 +37,7 @@ use time::OffsetDateTime;
 
 use crate::{
     error::{StorageError, StorageResult},
-    GameRepo, Repositories, SeekRepo, SessionRepo, UserRepo,
+    GameRepo, RatingRepo, Repositories, SeekRepo, SessionRepo, UserRepo,
 };
 
 // ---------------------------------------------------------------------------
@@ -285,6 +285,10 @@ impl Repositories for SqlxStorage {
     }
 
     fn sessions(&self) -> &dyn SessionRepo {
+        self
+    }
+
+    fn ratings(&self) -> &dyn RatingRepo {
         self
     }
 }
@@ -538,5 +542,79 @@ impl SessionRepo for SqlxStorage {
         .rows_affected();
 
         Ok(affected > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RatingRepo
+// ---------------------------------------------------------------------------
+
+/// Reconstructs a [`Rating`] from a database row.
+fn rating_from_row(row: &DbRow) -> Result<Rating, StorageError> {
+    Ok(Rating {
+        value: row.try_get::<f64, _>("value")?,
+        deviation: row.try_get::<f64, _>("deviation")?,
+        volatility: row.try_get::<f64, _>("volatility")?,
+    })
+}
+
+#[async_trait]
+impl RatingRepo for SqlxStorage {
+    async fn get(&self, user: UserId, variant_id: &str) -> StorageResult<Option<Rating>> {
+        let row = sqlx::query(
+            "SELECT value, deviation, volatility FROM ratings \
+             WHERE user_id = $1 AND variant_id = $2",
+        )
+        .bind(user.to_string())
+        .bind(variant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| rating_from_row(&r)).transpose()
+    }
+
+    async fn upsert(&self, user: UserId, variant_id: &str, rating: &Rating) -> StorageResult<()> {
+        // INSERT OR REPLACE / ON CONFLICT … DO UPDATE are both supported by
+        // SQLite (3.24+) and PostgreSQL with identical syntax.
+        sqlx::query(
+            "INSERT INTO ratings (user_id, variant_id, value, deviation, volatility) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (user_id, variant_id) \
+             DO UPDATE SET value = excluded.value, \
+                           deviation = excluded.deviation, \
+                           volatility = excluded.volatility",
+        )
+        .bind(user.to_string())
+        .bind(variant_id)
+        .bind(rating.value)
+        .bind(rating.deviation)
+        .bind(rating.volatility)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn leaderboard(
+        &self,
+        variant_id: &str,
+        limit: u32,
+    ) -> StorageResult<Vec<(UserId, Rating)>> {
+        let rows = sqlx::query(
+            "SELECT user_id, value, deviation, volatility FROM ratings \
+             WHERE variant_id = $1 \
+             ORDER BY value DESC \
+             LIMIT $2",
+        )
+        .bind(variant_id)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter()
+            .map(|row| {
+                let user_id = decode_id::<UserId>(&row.try_get::<String, _>("user_id")?)?;
+                let rating = rating_from_row(row)?;
+                Ok((user_id, rating))
+            })
+            .collect()
     }
 }
