@@ -13,14 +13,18 @@
 
 use std::sync::Arc;
 
-use mcs_core::{Action, ActionEffect, Color, GameSession, GameStatus, Outcome, PlayerView};
-use mcs_domain::{Game, GameId, GameLifecycle};
+use mcs_core::{
+    Action, ActionEffect, Color, EndReason, GameSession, GameStatus, Outcome, PlayerView,
+};
+use mcs_domain::{Game, GameId, GameLifecycle, TimeControl};
 use mcs_storage::GameRepo;
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::clock::ClockEngine;
 use crate::error::GameSessionError;
 use crate::event::GameEvent;
+use crate::time_source::{SystemTimeSource, TimeSource};
 
 /// How many `GameEvent`s the broadcast channel retains for slow subscribers
 /// before they start observing [`broadcast::error::RecvError::Lagged`].
@@ -253,6 +257,19 @@ pub struct GameActor {
     session: Box<dyn GameSession>,
     repo: Arc<dyn GameRepo>,
     events: broadcast::Sender<GameEvent>,
+    /// The authoritative clock for this game, or `None` for an unlimited game
+    /// (which has no clock to track, never flags, and reports no clock in its
+    /// events). For real-time and correspondence games this engine is the source
+    /// of truth for remaining time and flag detection.
+    clock: Option<ClockEngine>,
+    /// The actor's source of "now" and of flag-deadline sleeps. Injected so
+    /// tests can drive time deterministically.
+    time: Box<dyn TimeSource>,
+    /// Set when the actor itself ended the game on time (a flag), since the
+    /// underlying [`GameSession`] has no notion of timeouts and still reports
+    /// itself ongoing. Holds the timeout [`Outcome`] so later queries and
+    /// rejected actions reflect the finished result.
+    timed_out: Option<Outcome>,
     /// Set once the actor has persisted the finished game, so a second
     /// game-ending action (which the session would already reject) can never
     /// trigger a redundant write.
@@ -282,11 +299,39 @@ impl GameActor {
     /// `game_id` identifies the [`Game`] record this session corresponds to;
     /// the actor loads it, marks it [`GameLifecycle::Finished`] with the
     /// [`Outcome`], and writes it back through `repo` when play concludes.
+    ///
+    /// `time_control` arms the authoritative clock: the actor deducts elapsed
+    /// time on each move, includes a [`Clock`](mcs_domain::Clock) snapshot in
+    /// every broadcast [`GameEvent`], and — for real-time and correspondence
+    /// games — ends the game with a [`EndReason::Timeout`] result if the side
+    /// to move flags, even if that player simply stops moving.
     #[must_use]
     pub fn spawn(
         game_id: GameId,
         session: Box<dyn GameSession>,
         repo: Arc<dyn GameRepo>,
+        time_control: TimeControl,
+    ) -> GameHandle {
+        Self::spawn_with_time_source(
+            game_id,
+            session,
+            repo,
+            time_control,
+            Box::new(SystemTimeSource),
+        )
+    }
+
+    /// Like [`spawn`](GameActor::spawn) but with an injected [`TimeSource`].
+    ///
+    /// Used by tests to drive "now" and flag-deadline sleeps deterministically;
+    /// production code uses [`spawn`](GameActor::spawn), which supplies the real
+    /// wall clock.
+    pub(crate) fn spawn_with_time_source(
+        game_id: GameId,
+        session: Box<dyn GameSession>,
+        repo: Arc<dyn GameRepo>,
+        time_control: TimeControl,
+        time: Box<dyn TimeSource>,
     ) -> GameHandle {
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -297,11 +342,27 @@ impl GameActor {
             events: events_tx.clone(),
         };
 
+        // An unlimited game has genuinely no clock to track or report; every
+        // other time control gets an authoritative engine, started for the side
+        // to move while the game is still ongoing.
+        let clock = if time_control.is_unlimited() {
+            None
+        } else {
+            let mut clock = ClockEngine::new(&time_control);
+            if !session.status().is_finished() {
+                clock.start(session.to_move(), time.now());
+            }
+            Some(clock)
+        };
+
         let actor = GameActor {
             game_id,
             session,
             repo,
             events: events_tx,
+            clock,
+            time,
+            timed_out: None,
             persisted: false,
         };
 
@@ -310,12 +371,106 @@ impl GameActor {
         handle
     }
 
-    /// The actor's event loop: service commands until the channel closes.
+    /// The actor's event loop.
+    ///
+    /// It services commands until the channel closes, and — while a real-time or
+    /// correspondence clock is running — concurrently waits on the current flag
+    /// deadline so a player who stops moving still loses on time. When the
+    /// deadline elapses the actor re-validates the flag against its
+    /// [`TimeSource`] before ending the game, so a spuriously early wake is
+    /// harmless.
     async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
-        while let Some(command) = commands.recv().await {
-            self.handle(command).await;
+        loop {
+            match self.flag_deadline() {
+                Some(deadline) => {
+                    tokio::select! {
+                        // Bias towards commands so a move that refreshes the
+                        // clock is not pre-empted by a stale deadline.
+                        biased;
+                        maybe_command = commands.recv() => match maybe_command {
+                            Some(command) => self.handle(command).await,
+                            None => break,
+                        },
+                        () = self.time.sleep_until(deadline) => {
+                            self.check_flag().await;
+                        }
+                    }
+                }
+                None => match commands.recv().await {
+                    Some(command) => self.handle(command).await,
+                    None => break,
+                },
+            }
         }
         tracing::debug!(game_id = %self.game_id, "game actor stopped: all handles dropped");
+    }
+
+    /// Returns `true` if the game is over for any reason — the session reached a
+    /// terminal position, or the actor ended it on time.
+    fn is_over(&self) -> bool {
+        self.timed_out.is_some() || self.session.status().is_finished()
+    }
+
+    /// The game's effective status, accounting for an actor-declared timeout
+    /// that the underlying session does not know about.
+    fn effective_status(&self) -> GameStatus {
+        match &self.timed_out {
+            Some(outcome) => GameStatus::Finished(outcome.clone()),
+            None => self.session.status(),
+        }
+    }
+
+    /// The game's effective outcome, accounting for a timeout.
+    fn effective_outcome(&self) -> Option<Outcome> {
+        self.timed_out.clone().or_else(|| self.session.outcome())
+    }
+
+    /// The instant at which the side to move flags, if the clock is running and
+    /// the game is still ongoing.
+    fn flag_deadline(&self) -> Option<OffsetDateTime> {
+        if self.is_over() {
+            return None;
+        }
+        self.clock.as_ref().and_then(ClockEngine::flag_deadline)
+    }
+
+    /// Re-checks the clock against the current instant and, if a side has
+    /// flagged, ends the game on time. Called both when the flag timer fires and
+    /// after every accepted action.
+    async fn check_flag(&mut self) {
+        if self.is_over() {
+            return;
+        }
+        let Some(clock) = self.clock.as_ref() else {
+            return;
+        };
+        let now = self.time.now();
+        if let Some(flagged) = clock.flagged(now) {
+            let outcome = Outcome::win(flagged.opposite(), EndReason::Timeout);
+            self.finish_on_time(outcome, now).await;
+        }
+    }
+
+    /// Ends a still-running game with `outcome` at `now`: records the timeout,
+    /// broadcasts a final finished event, and persists the result.
+    async fn finish_on_time(&mut self, outcome: Outcome, now: OffsetDateTime) {
+        self.timed_out = Some(outcome.clone());
+        let status = GameStatus::Finished(outcome.clone());
+        // Freeze the clock snapshot at the flag instant for the final event.
+        let snapshot = self.clock.as_ref().map(|c| c.snapshot(now));
+        let event = match snapshot {
+            Some(clock) => GameEvent::with_clock(Vec::new(), status, clock),
+            None => GameEvent::new(Vec::new(), status),
+        };
+        let _ = self.events.send(event);
+
+        if let Err(error) = self.persist_finished(outcome).await {
+            tracing::error!(
+                game_id = %self.game_id,
+                %error,
+                "failed to persist timeout result",
+            );
+        }
     }
 
     /// Dispatches a single command.
@@ -338,28 +493,70 @@ impl GameActor {
                 let _ = reply.send(self.session.spectator_view());
             }
             Command::LegalActions { player, reply } => {
-                let _ = reply.send(self.session.legal_actions(player));
+                // A flagged game offers no legal actions.
+                self.check_flag().await;
+                let actions = if self.is_over() {
+                    Vec::new()
+                } else {
+                    self.session.legal_actions(player)
+                };
+                let _ = reply.send(actions);
             }
             Command::Status { reply } => {
-                let _ = reply.send(self.session.status());
+                self.check_flag().await;
+                let _ = reply.send(self.effective_status());
             }
             Command::Outcome { reply } => {
-                let _ = reply.send(self.session.outcome());
+                self.check_flag().await;
+                let _ = reply.send(self.effective_outcome());
             }
         }
     }
 
-    /// Applies an action, broadcasts its events, and persists on game end.
+    /// Applies an action, updates the clock, broadcasts the resulting events
+    /// (with a live clock snapshot), and persists on game end.
+    ///
+    /// Before applying, it re-checks the clock: a player who tries to move after
+    /// already flagging loses on time rather than having their late move
+    /// accepted. After a successful, non-finishing move it records the elapsed
+    /// time against the mover and starts the opponent's clock.
     async fn submit_action(
         &mut self,
         player: Color,
         action: &Action,
     ) -> Result<ActionEffect, GameSessionError> {
+        // A move that arrives after the player has already flagged must not be
+        // accepted; end the game on time first.
+        self.check_flag().await;
+        if self.is_over() {
+            return Err(GameSessionError::Game(mcs_core::GameError::Finished));
+        }
+
+        let now = self.time.now();
         let effect = self.session.apply(player, action)?;
+
+        // Advance the clock: the mover spends their elapsed time and gains the
+        // increment, then the opponent's clock starts. Only do this while the
+        // game continues; a finishing move stops the clock entirely.
+        let clock_snapshot = if let Some(clock) = self.clock.as_mut() {
+            if effect.status.is_finished() {
+                Some(clock.snapshot(now))
+            } else {
+                clock.on_move(player, now);
+                Some(clock.snapshot(now))
+            }
+        } else {
+            None
+        };
 
         // Broadcast to live observers. A send error only means there are no
         // subscribers right now, which is not a failure of the action.
-        let event = GameEvent::new(effect.events.clone(), effect.status.clone());
+        let event = match clock_snapshot {
+            Some(snapshot) => {
+                GameEvent::with_clock(effect.events.clone(), effect.status.clone(), snapshot)
+            }
+            None => GameEvent::new(effect.events.clone(), effect.status.clone()),
+        };
         let _ = self.events.send(event);
 
         // When the game has just finished, durably record the result. This is

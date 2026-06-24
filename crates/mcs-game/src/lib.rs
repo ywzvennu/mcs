@@ -23,6 +23,11 @@
 //!   over a [`tokio::sync::broadcast`] channel, and — when the action ends the
 //!   game — records the final result through the injected
 //!   [`GameRepo`](mcs_storage::GameRepo).
+//! - The actor owns an authoritative [`ClockEngine`]: it deducts elapsed time on
+//!   each move, attaches a [`Clock`](mcs_domain::Clock) snapshot to every
+//!   broadcast event, and ends the game with a
+//!   [`Timeout`](mcs_core::EndReason::Timeout) result — persisted like any other
+//!   ending — when a player flags, including one who simply stops moving.
 //!
 //! ## Variant-agnostic by construction
 //!
@@ -36,8 +41,10 @@
 //! ```no_run
 //! use std::sync::Arc;
 //!
+//! use std::time::Duration;
+//!
 //! use mcs_core::{Action, Color, GameSession};
-//! use mcs_domain::GameId;
+//! use mcs_domain::{GameId, TimeControl};
 //! use mcs_game::GameActor;
 //! use mcs_storage::GameRepo;
 //!
@@ -47,7 +54,11 @@
 //! #     game_id: GameId,
 //! #     action: Action,
 //! # ) {
-//! let handle = GameActor::spawn(game_id, session, repo);
+//! let time_control = TimeControl::RealTime {
+//!     initial: Duration::from_secs(300),
+//!     increment: Duration::from_secs(2),
+//! };
+//! let handle = GameActor::spawn(game_id, session, repo, time_control);
 //!
 //! // A connected client subscribes to the live stream...
 //! let mut events = handle.subscribe();
@@ -63,17 +74,22 @@
 //!
 //! ## Scope
 //!
-//! This crate contains the session actor only. The clock engine and matchmaking
-//! live in separate crates and are intentionally not implemented here.
+//! This crate contains the session actor and its authoritative clock engine.
+//! Matchmaking lives in a separate crate and is intentionally not implemented
+//! here.
 #![doc(html_root_url = "https://docs.rs/mcs-game")]
 
 mod actor;
+mod clock;
 mod error;
 mod event;
+mod time_source;
 
 pub use actor::{GameActor, GameHandle};
+pub use clock::ClockEngine;
 pub use error::GameSessionError;
 pub use event::GameEvent;
+pub use time_source::{SystemTimeSource, TimeSource};
 
 #[cfg(test)]
 mod tests;
