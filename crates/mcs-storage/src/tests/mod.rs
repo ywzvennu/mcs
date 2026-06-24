@@ -11,6 +11,8 @@
 //! `std::sync::Mutex` is `Send + Sync` and the critical section is tiny.
 
 mod memory;
+#[cfg(feature = "sqlite")]
+mod sqlx_sqlite;
 
 use mcs_core::{EndReason, Outcome};
 use mcs_domain::{

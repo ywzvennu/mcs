@@ -1,6 +1,6 @@
 [package]
 name = "mcs-storage"
-description = "Persistence-agnostic repository traits for the MCS server."
+description = "Persistence-agnostic repository traits and a sqlx-backed implementation for the MCS server."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,12 +11,36 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The SQLite driver is the default backend: it powers the in-memory integration
+# tests and the single-file deployment story. Exactly one backend feature should
+# be enabled at a time; both compile, but the runtime pool can only speak one.
+default = ["sqlite"]
+# Enable the SQLite sqlx driver and pool.
+sqlite = ["sqlx/sqlite"]
+# Enable the PostgreSQL sqlx driver and pool. Compiles in CI but is exercised
+# only against a real Postgres instance, which CI does not provision.
+postgres = ["sqlx/postgres"]
+
 [dependencies]
 mcs-core.workspace = true
 mcs-domain.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 time.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `default-features = false` keeps us from pulling in driver features the active
+# crate feature did not ask for; the workspace entry already disables defaults,
+# but we restate the runtime/tls/migrate features we always rely on here.
+sqlx = { workspace = true, default-features = false, features = [
+  "runtime-tokio",
+  "tls-rustls",
+  "migrate",
+  "uuid",
+  "time",
+] }
 
 [dev-dependencies]
 tokio = { workspace = true }

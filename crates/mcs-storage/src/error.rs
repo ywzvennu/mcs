@@ -41,3 +41,36 @@ pub enum StorageError {
 ///
 /// All repository methods return this type.
 pub type StorageResult<T> = Result<T, StorageError>;
+
+impl From<sqlx::Error> for StorageError {
+    /// Maps a sqlx driver error into the driver-agnostic [`StorageError`].
+    ///
+    /// The mapping follows the contract documented on the repository traits:
+    ///
+    /// * [`sqlx::Error::RowNotFound`] becomes [`StorageError::NotFound`] — this
+    ///   is what `fetch_one` returns when a `get` matches no row.
+    /// * A unique-/primary-key constraint violation becomes
+    ///   [`StorageError::Conflict`], carrying the constraint name when the
+    ///   driver exposes it.
+    /// * Everything else (connection failures, timeouts, protocol errors)
+    ///   becomes [`StorageError::Backend`].
+    fn from(err: sqlx::Error) -> Self {
+        if matches!(err, sqlx::Error::RowNotFound) {
+            return StorageError::NotFound;
+        }
+
+        if let sqlx::Error::Database(db_err) = &err {
+            if db_err.is_unique_violation() {
+                // `constraint()` is populated by Postgres; SQLite leaves it
+                // `None`, so fall back to the driver message.
+                let detail = db_err
+                    .constraint()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| db_err.message().to_owned());
+                return StorageError::Conflict(detail);
+            }
+        }
+
+        StorageError::Backend(err.to_string())
+    }
+}
