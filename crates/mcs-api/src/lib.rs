@@ -28,11 +28,13 @@
 //! | `GET /ws/game/{id}`  | upgrade to the live-game WebSocket ([`ws`]) |
 //! | `POST /seeks`        | post a seek; queue it or pair it into a game ([`rest`]) |
 //! | `DELETE /seeks/{id}` | cancel one of the caller's own seeks ([`rest`]) |
-//! | `GET /games/{id}`    | fetch a single game by id ([`rest`]) |
-//! | `GET /games`         | list recent games ([`rest`]) |
-//! | `GET /leaderboard`   | top-rated players for a variant ([`rest`]) |
-//! | `GET /users/{id}`    | a user's public profile ([`rest`]) |
-//! | `GET /profile`       | the authenticated caller's profile ([`rest`]) |
+//! | `GET /games/{id}`         | fetch a single game by id ([`rest`]) |
+//! | `GET /games`              | list recent games ([`rest`]) |
+//! | `GET /games/{id}/moves`   | full action log for a game, ordered by ply ([`history`]) |
+//! | `GET /games/{id}/pgn`     | PGN export for board-style variants ([`history`]) |
+//! | `GET /leaderboard`        | top-rated players for a variant ([`rest`]) |
+//! | `GET /users/{id}`         | a user's public profile ([`rest`]) |
+//! | `GET /profile`            | the authenticated caller's profile ([`rest`]) |
 //!
 //! The WebSocket layer (#15, [`ws`]) streams a live game over a single socket,
 //! authenticating with the session JWT passed as a `?token=` query parameter and
@@ -61,6 +63,7 @@
 pub mod auth;
 pub mod error;
 pub mod extract;
+pub mod history;
 pub mod hub;
 pub mod rating;
 pub mod rest;
@@ -75,6 +78,7 @@ use mcs_payments::RequirePaymentLayer;
 
 pub use error::{ApiError, ApiResult};
 pub use extract::AuthUser;
+pub use history::{MoveEntry, MovesResponse};
 pub use hub::GameHub;
 pub use rating::RatingUpdateHook;
 pub use rest::{
@@ -123,5 +127,6 @@ pub fn router(state: AppState) -> Router {
         .merge(create_seeks)
         .merge(rest::cancel_seek_router())
         .merge(rest::read_router())
+        .merge(history::history_router())
         .with_state(state)
 }
