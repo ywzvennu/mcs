@@ -11,6 +11,12 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# A production [`FacilitatorVerifier`] that calls a real x402 facilitator's
+# `/verify` + `/settle` HTTP endpoints. Off by default so the core crate builds
+# with no HTTP client; the server enables it (see `mcs-server`).
+facilitator = ["dep:reqwest"]
+
 [dependencies]
 axum.workspace = true
 serde.workspace = true
@@ -23,5 +29,11 @@ tower.workspace = true
 # base64 encoding/decoding for the X-PAYMENT header value.
 base64 = "0.22"
 
+# HTTP client for the optional facilitator-backed verifier. Pulled in only under
+# the `facilitator` feature; rustls (no system OpenSSL) keeps the build portable.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+
 [dev-dependencies]
 tokio.workspace = true
+# Stand up an in-process mock facilitator to exercise the verify/settle flow.
+wiremock = "0.6"

@@ -26,6 +26,7 @@ async fn empty_state() -> mcs_api::AppState {
             .expect("connect in-memory sqlite"),
     );
     mcs_server::build_state(&cfg, storage, b"test-secret-bytes-not-for-prod".to_vec())
+        .expect("build state")
 }
 
 #[tokio::test]

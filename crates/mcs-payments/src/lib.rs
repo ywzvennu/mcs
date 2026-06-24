@@ -15,6 +15,13 @@
 //!    - inserts a [`Settlement`] into the axum request extensions, and
 //!    - adds an [`X_PAYMENT_RESPONSE`] header to the response.
 //!
+//! ## Verifiers
+//!
+//! - [`MockVerifier`] — development only; performs no on-chain checks.
+//! - [`FacilitatorVerifier`](facilitator::FacilitatorVerifier) — calls a real
+//!   x402 facilitator's `/verify` + `/settle` endpoints. Available under the
+//!   `facilitator` cargo feature (which pulls in [`reqwest`]).
+//!
 //! ## Usage
 //!
 //! ```rust,ignore
@@ -41,11 +48,15 @@
 //! ```
 
 pub mod error;
+#[cfg(feature = "facilitator")]
+pub mod facilitator;
 pub mod middleware;
 pub mod types;
 pub mod verifier;
 
 pub use error::PaymentError;
+#[cfg(feature = "facilitator")]
+pub use facilitator::FacilitatorVerifier;
 pub use middleware::{RequirePaymentLayer, X_PAYMENT, X_PAYMENT_RESPONSE};
 pub use types::{
     PaymentPayload, PaymentRequiredResponse, PaymentRequirements, Settlement, SettlementResponse,
