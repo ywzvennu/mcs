@@ -117,6 +117,52 @@ jobs:
           --no-default-features --features postgres
 
   # ---------------------------------------------------------------------------
+  # Postgres integration tests — runs the same `mcs-storage` integration suite
+  # that the default `ci` job runs on SQLite, but against a real Postgres 16
+  # service container. Each test provisions a private, uniquely-named schema and
+  # pins its pool's `search_path` to it (see `tests/harness.rs`), so the shared
+  # database stays isolated test-to-test. This proves the portable DDL and the
+  # runtime sqlx queries behave identically on both backends.
+  # ---------------------------------------------------------------------------
+  postgres-tests:
+    name: postgres integration tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mcs_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d mcs_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    env:
+      # The harness reads this to target Postgres; unset, the suite runs on
+      # in-memory SQLite (as in the `ci` job).
+      MCS_TEST_DATABASE_URL: "postgres://postgres:postgres@localhost:5432/mcs_test"
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: postgres-tests
+
+      - name: Run mcs-storage integration suite (postgres)
+        run: >
+          cargo test -p mcs-storage
+          --no-default-features --features postgres
+          -- --test-threads=1
+
+  # ---------------------------------------------------------------------------
   # MSRV check — builds the workspace with the minimum supported Rust version
   # declared in Cargo.toml (`rust-version = "1.82"`).
   # ---------------------------------------------------------------------------

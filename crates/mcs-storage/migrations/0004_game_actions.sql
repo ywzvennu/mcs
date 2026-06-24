@@ -8,7 +8,10 @@
 --
 -- Portability note: as with the earlier migrations, this DDL must run unchanged
 -- on both SQLite and PostgreSQL, so it sticks to the lowest common denominator —
--- TEXT/INTEGER columns and a composite PRIMARY KEY. The `(game_id, ply)` primary
+-- TEXT/BIGINT columns and a composite PRIMARY KEY. The integer columns are
+-- BIGINT (not INTEGER) because the application binds and reads them as 8-byte
+-- `i64`, which matches Postgres `BIGINT`; SQLite stores both with INTEGER
+-- affinity regardless. The `(game_id, ply)` primary
 -- key both enforces "one action per ply per game" (a duplicate append surfaces
 -- as a uniqueness conflict) and provides the index that backs `game_id`-scoped
 -- ordered reads, so no extra index is needed.
@@ -17,7 +20,7 @@ CREATE TABLE game_actions (
     -- The owning game's id, as a canonical UUID string (matches `games.id`).
     game_id         TEXT    NOT NULL,
     -- Zero-based half-move index within the game; unique per game.
-    ply             INTEGER NOT NULL,
+    ply             BIGINT  NOT NULL,
     -- Who played, as the lowercase `mcs_core::Color` discriminant
     -- ("white"/"black").
     player          TEXT    NOT NULL,
@@ -25,8 +28,8 @@ CREATE TABLE game_actions (
     action          TEXT    NOT NULL,
     -- Remaining clocks in milliseconds at the moment the action was recorded;
     -- NULL for untimed games.
-    clock_white_ms  INTEGER,
-    clock_black_ms  INTEGER,
+    clock_white_ms  BIGINT,
+    clock_black_ms  BIGINT,
     -- When the action was recorded, as an RFC 3339 UTC timestamp.
     created_at      TEXT    NOT NULL,
     PRIMARY KEY (game_id, ply)

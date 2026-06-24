@@ -11,8 +11,14 @@
 //! `std::sync::Mutex` is `Send + Sync` and the critical section is tiny.
 
 mod memory;
-#[cfg(feature = "sqlite")]
-mod sqlx_sqlite;
+// The sqlx integration suite is backend-parameterised: the same test bodies run
+// against SQLite (default) or a real Postgres service in CI, selected at runtime
+// through `MCS_TEST_DATABASE_URL`. It is compiled whenever either backend
+// feature is active.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod harness;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod sqlx_backend;
 
 use mcs_core::{Action, Color, EndReason, Outcome, VariantOptions};
 use mcs_domain::{
