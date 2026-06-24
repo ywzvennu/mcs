@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use mcs_domain::{EvmAddress, Game, GameId, Rating, Seek, SeekId, User, UserId};
+use mcs_domain::{EvmAddress, Game, GameId, GameLifecycle, Rating, Seek, SeekId, User, UserId};
 use time::OffsetDateTime;
 
 use crate::{
@@ -128,6 +128,18 @@ impl GameRepo for MemoryGameRepo {
             .collect();
         games.sort_by_key(|g| std::cmp::Reverse(g.created_at));
         games.truncate(limit as usize);
+        Ok(games)
+    }
+
+    async fn list_unfinished(&self) -> StorageResult<Vec<Game>> {
+        let map = self.games.lock().expect("mutex poisoned");
+        let mut games: Vec<Game> = map
+            .values()
+            .filter(|g| g.lifecycle != GameLifecycle::Finished)
+            .cloned()
+            .collect();
+        // Oldest first, matching the sqlx implementation.
+        games.sort_by_key(|g| g.created_at);
         Ok(games)
     }
 }

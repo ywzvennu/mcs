@@ -99,6 +99,7 @@ async fn spawn_game(app: &TestApp, white: &User, black: &User) -> mcs_domain::Ga
     };
     let game = Game::new(
         STANDARD_VARIANT_ID.to_owned(),
+        VariantOptions::default(),
         white.id,
         black.id,
         time_control.clone(),

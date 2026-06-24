@@ -84,6 +84,10 @@ impl GameRepo for MockGameRepo {
     async fn list_for_user(&self, _user: UserId, _limit: u32) -> StorageResult<Vec<Game>> {
         unreachable!("the actor never lists games")
     }
+
+    async fn list_unfinished(&self) -> StorageResult<Vec<Game>> {
+        unreachable!("the actor never lists games")
+    }
 }
 
 /// A [`GameRepo`] whose `update` always fails, to exercise the persistence
@@ -118,6 +122,10 @@ impl GameRepo for FailingUpdateRepo {
     async fn list_for_user(&self, _user: UserId, _limit: u32) -> StorageResult<Vec<Game>> {
         unreachable!()
     }
+
+    async fn list_unfinished(&self) -> StorageResult<Vec<Game>> {
+        unreachable!()
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -138,6 +146,7 @@ fn standard_session() -> Box<dyn GameSession> {
 fn active_game(id: GameId) -> Game {
     let mut game = Game::new(
         "standard".to_owned(),
+        VariantOptions::default(),
         UserId::new(),
         UserId::new(),
         TimeControl::RealTime {
@@ -479,6 +488,7 @@ impl crate::TimeSource for SharedTimeSource {
 fn real_time_game(id: GameId, initial_secs: u64, increment_secs: u64) -> Game {
     let mut game = Game::new(
         "standard".to_owned(),
+        VariantOptions::default(),
         UserId::new(),
         UserId::new(),
         TimeControl::RealTime {

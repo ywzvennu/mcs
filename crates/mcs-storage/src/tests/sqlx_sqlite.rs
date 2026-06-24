@@ -5,7 +5,7 @@
 //! In-memory SQLite needs no filesystem and is torn down when the pool drops,
 //! so the tests are hermetic and fast.
 
-use mcs_core::{Color, EndReason, Outcome};
+use mcs_core::{Color, EndReason, Outcome, VariantOptions};
 use mcs_domain::{
     ColorPreference, EvmAddress, Game, GameLifecycle, Rating, Seek, TimeControl, User, UserId,
 };
@@ -51,6 +51,7 @@ fn sample_user() -> User {
 fn sample_game(white: UserId, black: UserId) -> Game {
     Game::new(
         "standard".to_owned(),
+        VariantOptions::default(),
         white,
         black,
         TimeControl::Unlimited,
@@ -263,6 +264,100 @@ async fn game_list_for_user_matches_both_colours() {
             .len(),
         2
     );
+}
+
+#[tokio::test]
+async fn game_variant_options_round_trip() {
+    let storage = storage().await;
+    let mut game = sample_game(UserId::new(), UserId::new());
+    game.variant_options = VariantOptions::new(serde_json::json!({
+        "starting_fen": "8/8/8/8/8/8/8/8 w - - 0 1",
+        "increment_ms": 2000,
+    }));
+
+    storage.games().create(&game).await.unwrap();
+    let fetched = storage.games().get(game.id).await.unwrap();
+    assert_eq!(fetched.variant_options, game.variant_options);
+    assert_eq!(fetched, game);
+}
+
+#[tokio::test]
+async fn game_snapshot_round_trip() {
+    let storage = storage().await;
+    let mut game = sample_game(UserId::new(), UserId::new());
+    game.lifecycle = GameLifecycle::Active;
+    game.update_snapshot(
+        15,
+        Some(178_500),
+        Some(201_250),
+        Some(Color::Black),
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(120),
+    );
+
+    storage.games().create(&game).await.unwrap();
+    let fetched = storage.games().get(game.id).await.unwrap();
+    assert_eq!(fetched.ply, 15);
+    assert_eq!(fetched.clock_white_ms, Some(178_500));
+    assert_eq!(fetched.clock_black_ms, Some(201_250));
+    assert_eq!(fetched.side_to_move, Some(Color::Black));
+    assert_eq!(fetched, game);
+}
+
+#[tokio::test]
+async fn game_snapshot_survives_update() {
+    let storage = storage().await;
+    let mut game = sample_game(UserId::new(), UserId::new());
+    game.lifecycle = GameLifecycle::Active;
+    storage.games().create(&game).await.unwrap();
+
+    // Advance the live snapshot and persist via `update`.
+    game.update_snapshot(
+        3,
+        None,
+        None,
+        Some(Color::White),
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(5),
+    );
+    storage.games().update(&game).await.unwrap();
+
+    let fetched = storage.games().get(game.id).await.unwrap();
+    assert_eq!(fetched.ply, 3);
+    assert!(fetched.clock_white_ms.is_none());
+    assert_eq!(fetched.side_to_move, Some(Color::White));
+}
+
+#[tokio::test]
+async fn game_list_unfinished_excludes_finished_includes_others() {
+    let storage = storage().await;
+    let white = UserId::new();
+    let black = UserId::new();
+
+    // Created (oldest), then active, then finished (newest).
+    let mut created = sample_game(white, black);
+    created.created_at = OffsetDateTime::UNIX_EPOCH;
+    storage.games().create(&created).await.unwrap();
+
+    let mut active = sample_game(white, black);
+    active.lifecycle = GameLifecycle::Active;
+    active.created_at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1);
+    storage.games().create(&active).await.unwrap();
+
+    let mut finished = sample_game(white, black);
+    finished.created_at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(2);
+    finished.finish(
+        Outcome::win(Color::White, EndReason::Checkmate),
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(3),
+    );
+    storage.games().create(&finished).await.unwrap();
+
+    let unfinished = storage.games().list_unfinished().await.unwrap();
+    assert_eq!(unfinished.len(), 2);
+    // Oldest first.
+    assert_eq!(unfinished[0].id, created.id);
+    assert_eq!(unfinished[1].id, active.id);
+    assert!(unfinished
+        .iter()
+        .all(|g| g.lifecycle != GameLifecycle::Finished));
 }
 
 // ---------------------------------------------------------------------------

@@ -66,4 +66,19 @@ pub trait GameRepo: Send + Sync {
     ///
     /// - [`StorageError::Backend`] on driver-level failures.
     async fn list_for_user(&self, user: UserId, limit: u32) -> StorageResult<Vec<Game>>;
+
+    /// Returns all games whose lifecycle is not
+    /// [`GameLifecycle::Finished`][mcs_domain::GameLifecycle::Finished] —
+    /// i.e. games still `Created` or `Active` — ordered by `created_at`
+    /// (oldest first).
+    ///
+    /// This is the recovery hook: after a restart the server lists the games
+    /// that were still in progress and rebuilds their live sessions from each
+    /// record's variant and snapshot. The result is unbounded because every
+    /// in-progress game must be recovered.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::Backend`] on driver-level failures.
+    async fn list_unfinished(&self) -> StorageResult<Vec<Game>>;
 }
