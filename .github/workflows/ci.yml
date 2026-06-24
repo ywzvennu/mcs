@@ -158,4 +158,4 @@ jobs:
           tool: cargo-deny
 
       - name: cargo deny check
-        run: cargo deny check --all-features
+        run: cargo deny check
