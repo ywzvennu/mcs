@@ -27,6 +27,18 @@ async fn main() -> anyhow::Result<()> {
     })
     .context("installing the tracing subscriber")?;
 
+    tracing::info!(mode = %cfg.env, "run mode");
+
+    // Validate configuration before binding the socket so a misconfigured
+    // production server exits with a clear, actionable error message rather
+    // than silently using insecure defaults (e.g. an ephemeral session secret).
+    if let Err(e) = cfg.validate() {
+        // Use `tracing::error!` so the message lands in the structured log even
+        // if the operator is reading journald or a log aggregator, then bail.
+        tracing::error!("{e}");
+        anyhow::bail!("{e}");
+    }
+
     let session_secret = resolve_session_secret(&cfg);
 
     // `cluster` is `Some` only when cluster mode is enabled; single-node it is
@@ -68,10 +80,11 @@ async fn main() -> anyhow::Result<()> {
 
 /// Resolves the session-signing secret from configuration.
 ///
-/// If `session.secret` is set, its bytes are used. Otherwise a random 256-bit
-/// secret is generated for this process only, and a prominent warning is logged:
-/// every restart invalidates all previously issued sessions, so a configured
-/// secret is required for production.
+/// If `session.secret` is set, its bytes are used directly. Otherwise a random
+/// 256-bit secret is generated for this process only and a prominent warning is
+/// logged: sessions signed with an ephemeral secret are invalidated on every
+/// restart. This fallback is allowed only in development mode — production mode
+/// rejects a missing/weak secret earlier via [`Config::validate`].
 fn resolve_session_secret(cfg: &Config) -> Vec<u8> {
     match &cfg.session.secret {
         Some(secret) => secret.clone().into_bytes(),
@@ -79,9 +92,10 @@ fn resolve_session_secret(cfg: &Config) -> Vec<u8> {
             let mut secret = vec![0u8; EPHEMERAL_SECRET_LEN];
             rand::thread_rng().fill_bytes(&mut secret);
             tracing::warn!(
-                "no session.secret configured (MCS_SESSION__SECRET / config.toml); \
-                 generated an ephemeral secret. ALL SESSIONS WILL BE INVALIDATED ON RESTART. \
-                 Set a stable secret for production."
+                "no session.secret configured (MCS_SESSION__SECRET / config.toml \
+                 [session] secret = \"…\"); \
+                 generated an ephemeral secret — ALL SESSIONS WILL BE INVALIDATED ON RESTART. \
+                 Set a stable secret for production (MCS_ENV=production enforces this)."
             );
             secret
         }

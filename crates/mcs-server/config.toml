@@ -11,6 +11,32 @@
 #   3. environment variables prefixed `MCS_` (nested keys use `__`,
 #      e.g. `MCS_SIWE__DOMAIN=chess.example`)
 
+# Run mode: "development" (default) or "production".
+#
+# Controls which validation rules are enforced at startup:
+#
+#   development  Permissive defaults: the server boots with no config at all.
+#                An ephemeral session secret is generated and a warning is
+#                logged (sessions are invalidated on restart). Dev-only features
+#                such as cors.allow_any_origin and payments.verifier = "mock"
+#                are allowed without restriction.
+#
+#   production   Strict pre-flight validation. The server refuses to start if:
+#                  - session.secret is absent, shorter than 32 bytes, or
+#                    contains an obvious placeholder ("change-me", "secret", …).
+#                  - payments.enabled = true with verifier = "mock" (the mock
+#                    verifier performs no on-chain checks).
+#                  - payments.enabled = true with verifier = "facilitator" but
+#                    no facilitator_url is provided.
+#                  - cors.allow_any_origin = true (wildcard CORS is dev-only).
+#                Basic well-formedness checks (ttl_secs > 0, etc.) are enforced
+#                in both modes.
+#
+# Set via MCS_ENV environment variable or this key. For deployments, prefer:
+#   MCS_ENV=production
+#
+# env = "development"
+
 # The address the HTTP server binds to.
 bind = "127.0.0.1:8080"
 
@@ -28,11 +54,24 @@ format = "pretty"
 level = "info"
 
 [session]
-# HMAC-SHA256 signing secret for session JWTs. REQUIRED in production: keep it
-# secret and high-entropy (>= 32 bytes). If omitted, the server generates a
-# random ephemeral secret at startup and logs a warning — every restart then
-# invalidates all existing sessions. Uncomment and set a stable value:
-# secret = "change-me-to-a-long-random-string"
+# HMAC-SHA256 signing secret for session JWTs.
+#
+# REQUIRED in production (env = "production"): the server refuses to start if
+# this key is absent, shorter than 32 bytes, or contains a placeholder string
+# such as "change-me" or "secret". Generate a strong value with:
+#   openssl rand -hex 32
+# and set it via MCS_SESSION__SECRET or this key.
+#
+# If omitted in development mode, the server generates a random ephemeral
+# secret at startup and logs a warning — every restart then invalidates all
+# existing sessions, so a stable value is strongly recommended even for dev.
+#
+# Secret rotation (zero-downtime):
+#   1. Deploy the new secret to all nodes (rolling restart or coordinated push).
+#   2. Existing tokens will expire naturally at ttl_secs; no forced logout.
+#   3. For immediate invalidation, restart all nodes simultaneously.
+#
+# secret = "replace-with-output-of-openssl-rand-hex-32"
 # Token lifetime in seconds (default: 86400 = 24 hours).
 ttl_secs = 86400
 # The `iss` (issuer) claim written into and required on session tokens.
