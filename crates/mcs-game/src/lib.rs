@@ -104,7 +104,7 @@ pub mod matchmaking;
 mod recovery;
 mod time_source;
 
-pub use actor::{ClockRemaining, GameActor, GameHandle};
+pub use actor::{ClockRemaining, GameActor, GameHandle, GameSnapshot};
 pub use clock::ClockEngine;
 pub use completion::{GameCompletionHook, NoopHook};
 pub use error::GameSessionError;
