@@ -624,7 +624,13 @@ async fn game_socket(
     //    a `RematchAccept` can create the swapped follow-up game.
     let table = state.table_hub().get_or_create(game_id);
 
-    // 8. Upgrade. From here the connection task owns the socket and the handle.
+    // 8. Apply the configured per-message size limit (#99) so the axum runtime
+    //    rejects frames above the threshold before they reach the application,
+    //    protecting memory against rogue large-frame attacks.
+    let max_msg = state.ws_max_message_bytes();
+    let upgrade = upgrade.max_message_size(max_msg);
+
+    // 9. Upgrade. From here the connection task owns the socket and the handle.
     Ok(upgrade.on_upgrade(move |socket| {
         run_connection(RunConnection {
             socket,

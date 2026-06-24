@@ -248,6 +248,14 @@ pub struct AppState {
     /// so two concurrent connects to the same absent game rebuild its actor only
     /// once. See [`RecoveryLocks`]. Shared across clones via the inner [`Arc`].
     recovery_locks: RecoveryLocks,
+    /// Maximum WebSocket message size, in bytes (#99).
+    ///
+    /// Set on each [`WebSocketUpgrade`](axum::extract::ws::WebSocketUpgrade)
+    /// before the socket is upgraded so the axum runtime rejects oversized
+    /// frames before they reach the application logic.
+    ///
+    /// Default: 1 MiB — matches the `[http].max_ws_message_bytes` default.
+    ws_max_message_bytes: usize,
 }
 
 /// This node's membership view: how the WebSocket router decides game ownership.
@@ -386,6 +394,8 @@ impl AppState {
                 registry: Arc::new(LocalRegistry::new(NodeInfo::new(LOCAL_NODE_ID, ""))),
             },
             recovery_locks: Arc::new(Mutex::new(HashMap::new())),
+            // 1 MiB default; matches `[http].max_ws_message_bytes` default.
+            ws_max_message_bytes: 1024 * 1024,
         }
     }
 
@@ -463,6 +473,28 @@ impl AppState {
     #[must_use]
     pub fn online_ttl(&self) -> Duration {
         self.online_ttl
+    }
+
+    /// Overrides the WebSocket message-size limit, returning the modified state
+    /// (builder style).
+    ///
+    /// The WS handler calls [`ws_max_message_bytes`](Self::ws_max_message_bytes)
+    /// and applies the result to each [`WebSocketUpgrade`](axum::extract::ws::WebSocketUpgrade)
+    /// before upgrading. The default (1 MiB) matches the `[http].max_ws_message_bytes`
+    /// config default; `mcs-server`'s `build_state` sets this from config.
+    #[must_use]
+    pub fn with_ws_max_message_bytes(mut self, max_bytes: usize) -> Self {
+        self.ws_max_message_bytes = max_bytes;
+        self
+    }
+
+    /// Returns the maximum allowed WebSocket message size, in bytes.
+    ///
+    /// Applied to each upgraded WebSocket connection by the handler in
+    /// [`crate::ws`] via `.max_message_size(state.ws_max_message_bytes())`.
+    #[must_use]
+    pub fn ws_max_message_bytes(&self) -> usize {
+        self.ws_max_message_bytes
     }
 
     /// Enables the x402 payment gate on game creation, returning the modified
@@ -805,6 +837,7 @@ impl std::fmt::Debug for AppState {
             .field("cluster", &self.cluster)
             .field("presence", &"<dyn PresenceTracker>")
             .field("online_ttl", &self.online_ttl)
+            .field("ws_max_message_bytes", &self.ws_max_message_bytes)
             .finish_non_exhaustive()
     }
 }

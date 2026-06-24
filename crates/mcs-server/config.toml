@@ -90,3 +90,37 @@ verifier = "mock"
 # facilitator_url = "https://facilitator.example.com"
 # Optional bearer token sent to the facilitator as `Authorization: Bearer ...`.
 # facilitator_api_key = "your-facilitator-api-key"
+
+[http]
+# HTTP hardening: request timeout, body-size limit, WebSocket message limit,
+# and security headers. All values shown here are the built-in defaults.
+
+# How long a handler may run (in seconds) before the server aborts it and
+# returns a timeout error to the client. Protects against slow-loris style
+# attacks and runaway handlers.
+request_timeout_secs = 30
+
+# Maximum accepted HTTP request body size, in bytes. Any body larger than
+# this is rejected with 413 Payload Too Large before the handler is called.
+# The default (65536 = 64 KiB) is generous for JSON API payloads and tight
+# enough to protect against memory-exhaustion attacks.
+max_body_bytes = 65536
+
+# Maximum WebSocket message size, in bytes. A single frame or reassembled
+# fragmented message that exceeds this limit causes the socket to be closed.
+# The default (1048576 = 1 MiB) is ample for game-state JSON.
+max_ws_message_bytes = 1048576
+
+# Security headers are always applied:
+#   X-Content-Type-Options: nosniff
+#   X-Frame-Options: DENY
+#   Content-Security-Policy: default-src 'none'; frame-ancestors 'none'
+#   Referrer-Policy: no-referrer
+#
+# Strict-Transport-Security is DISABLED by default because it must only be
+# sent over TLS. Enable it ONLY after placing a TLS terminator (nginx, Caddy,
+# a cloud load balancer, etc.) in front of this server. Never enable it while
+# the server itself handles plain HTTP — browsers will refuse to connect over
+# plain HTTP for `hsts_max_age_secs` seconds, which is very hard to undo.
+# hsts = false
+# hsts_max_age_secs = 31536000  # 1 year (recommended production value)
