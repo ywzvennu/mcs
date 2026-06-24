@@ -12,6 +12,7 @@ use mcs_domain::{EvmAddress, Game, GameId, GameLifecycle, Rating, Seek, SeekId, 
 use time::OffsetDateTime;
 
 use crate::{
+    action_log::{ActionLogRepo, RecordedAction},
     error::{StorageError, StorageResult},
     game::GameRepo,
     rating::RatingRepo,
@@ -141,6 +142,47 @@ impl GameRepo for MemoryGameRepo {
         // Oldest first, matching the sqlx implementation.
         games.sort_by_key(|g| g.created_at);
         Ok(games)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MemoryActionLogRepo
+// ---------------------------------------------------------------------------
+
+/// In-memory [`ActionLogRepo`] backed by a per-game `HashMap` keyed on `ply`.
+#[derive(Debug, Default)]
+pub(super) struct MemoryActionLogRepo {
+    actions: Mutex<HashMap<GameId, HashMap<u32, RecordedAction>>>,
+}
+
+#[async_trait]
+impl ActionLogRepo for MemoryActionLogRepo {
+    async fn append(&self, game_id: GameId, action: &RecordedAction) -> StorageResult<()> {
+        let mut map = self.actions.lock().expect("mutex poisoned");
+        let log = map.entry(game_id).or_default();
+        if log.contains_key(&action.ply) {
+            return Err(StorageError::Conflict(format!(
+                "action for game {game_id} ply {} already exists",
+                action.ply
+            )));
+        }
+        log.insert(action.ply, action.clone());
+        Ok(())
+    }
+
+    async fn list(&self, game_id: GameId) -> StorageResult<Vec<RecordedAction>> {
+        let map = self.actions.lock().expect("mutex poisoned");
+        let Some(log) = map.get(&game_id) else {
+            return Ok(Vec::new());
+        };
+        let mut out: Vec<RecordedAction> = log.values().cloned().collect();
+        out.sort_by_key(|a| a.ply);
+        Ok(out)
+    }
+
+    async fn last_ply(&self, game_id: GameId) -> StorageResult<Option<u32>> {
+        let map = self.actions.lock().expect("mutex poisoned");
+        Ok(map.get(&game_id).and_then(|log| log.keys().copied().max()))
     }
 }
 
@@ -299,6 +341,7 @@ impl RatingRepo for MemoryRatingRepo {
 pub(super) struct InMemoryRepos {
     users: MemoryUserRepo,
     games: MemoryGameRepo,
+    actions: MemoryActionLogRepo,
     seeks: MemorySeekRepo,
     sessions: MemorySessionRepo,
     ratings: MemoryRatingRepo,
@@ -311,6 +354,10 @@ impl Repositories for InMemoryRepos {
 
     fn games(&self) -> &dyn GameRepo {
         &self.games
+    }
+
+    fn actions(&self) -> &dyn ActionLogRepo {
+        &self.actions
     }
 
     fn seeks(&self) -> &dyn SeekRepo {

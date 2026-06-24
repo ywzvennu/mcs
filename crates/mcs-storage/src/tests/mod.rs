@@ -14,19 +14,22 @@ mod memory;
 #[cfg(feature = "sqlite")]
 mod sqlx_sqlite;
 
-use mcs_core::{EndReason, Outcome, VariantOptions};
+use mcs_core::{Action, Color, EndReason, Outcome, VariantOptions};
 use mcs_domain::{
     ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Seek, TimeControl, User, UserId,
 };
 use memory::{
-    InMemoryRepos, MemoryGameRepo, MemoryRatingRepo, MemorySeekRepo, MemorySessionRepo,
-    MemoryUserRepo,
+    InMemoryRepos, MemoryActionLogRepo, MemoryGameRepo, MemoryRatingRepo, MemorySeekRepo,
+    MemorySessionRepo, MemoryUserRepo,
 };
 use time::OffsetDateTime;
 
 use mcs_domain::Rating;
 
-use crate::{GameRepo, RatingRepo, Repositories, SeekRepo, SessionRepo, StorageError, UserRepo};
+use crate::{
+    ActionLogRepo, GameRepo, RatingRepo, RecordedAction, Repositories, SeekRepo, SessionRepo,
+    StorageError, UserRepo,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -65,6 +68,19 @@ fn sample_seek(creator: UserId) -> Seek {
         ColorPreference::Random,
         OffsetDateTime::UNIX_EPOCH,
     )
+}
+
+/// Builds a [`RecordedAction`] at `ply` whose payload is a distinct JSON object,
+/// so listed actions can be checked to preserve their exact `Action` content.
+fn sample_action(ply: u32, player: Color) -> RecordedAction {
+    RecordedAction {
+        ply,
+        player,
+        action: Action::new(serde_json::json!({ "move": format!("e{ply}") })),
+        clock_white_ms: Some(180_000 - u64::from(ply)),
+        clock_black_ms: Some(170_000 - u64::from(ply)),
+        created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(i64::from(ply)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +258,85 @@ async fn game_repo_list_unfinished_excludes_finished() {
     assert!(ids.contains(&created.id));
     assert!(ids.contains(&active.id));
     assert!(!ids.contains(&finished.id));
+}
+
+// ---------------------------------------------------------------------------
+// ActionLogRepo tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn action_log_append_then_list_in_ply_order() {
+    let repo = MemoryActionLogRepo::default();
+    let game = GameId::new();
+
+    // Append out of order; `list` must still return ascending by ply.
+    repo.append(game, &sample_action(2, Color::White))
+        .await
+        .unwrap();
+    repo.append(game, &sample_action(0, Color::White))
+        .await
+        .unwrap();
+    repo.append(game, &sample_action(1, Color::Black))
+        .await
+        .unwrap();
+
+    let listed = repo.list(game).await.unwrap();
+    let plies: Vec<u32> = listed.iter().map(|a| a.ply).collect();
+    assert_eq!(plies, vec![0, 1, 2]);
+    assert_eq!(listed[0], sample_action(0, Color::White));
+}
+
+#[tokio::test]
+async fn action_log_duplicate_ply_is_conflict() {
+    let repo = MemoryActionLogRepo::default();
+    let game = GameId::new();
+    repo.append(game, &sample_action(0, Color::White))
+        .await
+        .unwrap();
+    let err = repo
+        .append(game, &sample_action(0, Color::Black))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::Conflict(_)));
+}
+
+#[tokio::test]
+async fn action_log_last_ply_tracks_max() {
+    let repo = MemoryActionLogRepo::default();
+    let game = GameId::new();
+    assert_eq!(repo.last_ply(game).await.unwrap(), None);
+
+    repo.append(game, &sample_action(0, Color::White))
+        .await
+        .unwrap();
+    repo.append(game, &sample_action(1, Color::Black))
+        .await
+        .unwrap();
+    assert_eq!(repo.last_ply(game).await.unwrap(), Some(1));
+}
+
+#[tokio::test]
+async fn action_log_empty_game_is_empty() {
+    let repo = MemoryActionLogRepo::default();
+    let game = GameId::new();
+    assert!(repo.list(game).await.unwrap().is_empty());
+    assert_eq!(repo.last_ply(game).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn action_log_is_scoped_per_game() {
+    let repo = MemoryActionLogRepo::default();
+    let a = GameId::new();
+    let b = GameId::new();
+    repo.append(a, &sample_action(0, Color::White))
+        .await
+        .unwrap();
+    // The same ply in a different game is not a conflict.
+    repo.append(b, &sample_action(0, Color::White))
+        .await
+        .unwrap();
+    assert_eq!(repo.list(a).await.unwrap().len(), 1);
+    assert_eq!(repo.list(b).await.unwrap().len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +570,14 @@ async fn repositories_aggregate_is_object_safe() {
     repos.seeks().create(&seek).await.unwrap();
     let open = repos.seeks().list_open().await.unwrap();
     assert_eq!(open.len(), 1);
+
+    let game = GameId::new();
+    repos
+        .actions()
+        .append(game, &sample_action(0, Color::White))
+        .await
+        .unwrap();
+    assert_eq!(repos.actions().last_ply(game).await.unwrap(), Some(0));
 
     let addr = sample_address();
     let expires = OffsetDateTime::now_utc() + time::Duration::minutes(5);

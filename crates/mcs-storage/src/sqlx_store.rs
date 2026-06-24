@@ -28,7 +28,7 @@
 //! behave identically on SQLite and Postgres.
 
 use async_trait::async_trait;
-use mcs_core::Color;
+use mcs_core::{Action, Color};
 use mcs_domain::{
     ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Rating, Seek, SeekId, User, UserId,
 };
@@ -37,6 +37,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::{
+    action_log::{ActionLogRepo, RecordedAction},
     error::{StorageError, StorageResult},
     GameRepo, RatingRepo, Repositories, SeekRepo, SessionRepo, UserRepo,
 };
@@ -339,6 +340,10 @@ impl Repositories for SqlxStorage {
         self
     }
 
+    fn actions(&self) -> &dyn ActionLogRepo {
+        self
+    }
+
     fn seeks(&self) -> &dyn SeekRepo {
         self
     }
@@ -514,6 +519,73 @@ impl GameRepo for SqlxStorage {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(game_from_row).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ActionLogRepo
+// ---------------------------------------------------------------------------
+
+/// The column list used by every `game_actions` read, kept beside
+/// [`recorded_action_from_row`] so the query and the row-mapping stay aligned.
+const ACTION_SELECT: &str = "SELECT ply, player, action, clock_white_ms, clock_black_ms, \
+     created_at FROM game_actions";
+
+/// Reconstructs a [`RecordedAction`] from a `game_actions` row.
+fn recorded_action_from_row(row: &DbRow) -> Result<RecordedAction, StorageError> {
+    Ok(RecordedAction {
+        ply: decode_u32(row.try_get::<i64, _>("ply")?, "ply")?,
+        player: decode_color(&row.try_get::<String, _>("player")?)?,
+        // The action is stored as its JSON string; `Action` is `#[serde(transparent)]`
+        // over a `serde_json::Value`, so decoding the column reproduces it exactly.
+        action: decode_json::<Action>(&row.try_get::<String, _>("action")?)?,
+        clock_white_ms: decode_clock(row.try_get::<Option<i64>, _>("clock_white_ms")?)?,
+        clock_black_ms: decode_clock(row.try_get::<Option<i64>, _>("clock_black_ms")?)?,
+        created_at: decode_time(&row.try_get::<String, _>("created_at")?)?,
+    })
+}
+
+#[async_trait]
+impl ActionLogRepo for SqlxStorage {
+    async fn append(&self, game_id: GameId, action: &RecordedAction) -> StorageResult<()> {
+        // A duplicate `(game_id, ply)` violates the primary key; the sqlx error
+        // mapping turns that uniqueness violation into `StorageError::Conflict`,
+        // so a double-append is reported rather than silently swallowed.
+        sqlx::query(
+            "INSERT INTO game_actions \
+             (game_id, ply, player, action, clock_white_ms, clock_black_ms, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(game_id.to_string())
+        .bind(i64::from(action.ply))
+        .bind(encode_color(action.player))
+        .bind(encode_json(&action.action)?)
+        .bind(encode_clock(action.clock_white_ms))
+        .bind(encode_clock(action.clock_black_ms))
+        .bind(encode_time(action.created_at)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list(&self, game_id: GameId) -> StorageResult<Vec<RecordedAction>> {
+        let rows = sqlx::query(&format!("{ACTION_SELECT} WHERE game_id = $1 ORDER BY ply"))
+            .bind(game_id.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(recorded_action_from_row).collect()
+    }
+
+    async fn last_ply(&self, game_id: GameId) -> StorageResult<Option<u32>> {
+        // `MAX(ply)` yields one row whose value is NULL when the log is empty,
+        // which maps cleanly onto `Option<i64>` → `Option<u32>`.
+        let row = sqlx::query("SELECT MAX(ply) AS max_ply FROM game_actions WHERE game_id = $1")
+            .bind(game_id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
+        row.try_get::<Option<i64>, _>("max_ply")?
+            .map(|v| decode_u32(v, "ply"))
+            .transpose()
     }
 }
 
