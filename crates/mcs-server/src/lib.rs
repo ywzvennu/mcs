@@ -154,7 +154,25 @@ pub fn build_state(
 ///
 /// The Prometheus recorder is installed (once per process) by
 /// [`metrics::handle`] the first time this function runs.
+///
+/// # CORS layer (#98)
+///
+/// When a [`CorsSettings`](config::CorsSettings) is supplied via `cors_layer`,
+/// it is applied as the outermost layer on the router so browsers receive the
+/// correct preflight and simple-request CORS headers. Pass
+/// [`None`] to disable CORS (the safe default for servers without a configured
+/// browser client). The config-driven path in [`build_app`] always supplies the
+/// layer built from `[cors]` config; integration tests can pass a custom layer.
 pub fn router(state: AppState) -> Router {
+    router_with_cors(state, None)
+}
+
+/// Like [`router`], but with an explicit CORS layer (used by [`build_app`] and
+/// integration tests).
+pub fn router_with_cors(
+    state: AppState,
+    cors_layer: Option<tower_http::cors::CorsLayer>,
+) -> Router {
     let (set_request_id, propagate_request_id) = mcs_observability::request_id_layers();
 
     let middleware = ServiceBuilder::new()
@@ -166,10 +184,18 @@ pub fn router(state: AppState) -> Router {
     // API router's middleware records into this recorder; `/metrics` renders it.
     let metrics_handle = metrics::handle();
 
-    mcs_api::router(state)
+    let base = mcs_api::router(state)
         .route("/health", get(health))
         .merge(metrics::metrics_router(metrics_handle))
-        .layer(middleware)
+        .layer(middleware);
+
+    // The CORS layer is applied after all other layers so it can inspect and
+    // annotate responses before they leave the server.
+    if let Some(cors) = cors_layer {
+        base.layer(cors)
+    } else {
+        base
+    }
 }
 
 /// Rebuilds the live actors for every game that was still in progress, inserting
@@ -263,5 +289,9 @@ pub async fn build_app(
     // Wire cluster membership when enabled (no-op otherwise; the state keeps its
     // single-node local registry and no Redis connection is opened).
     let (state, cluster) = cluster::setup(cfg, state).await?;
-    Ok((router(state), cluster))
+    // Build the CORS layer from config and apply it to the assembled router so
+    // browser clients receive the correct CORS headers. With the default (empty)
+    // allowed_origins the layer is effectively a no-op for cross-origin requests.
+    let cors_layer = cfg.cors.build_cors_layer();
+    Ok((router_with_cors(state, Some(cors_layer)), cluster))
 }

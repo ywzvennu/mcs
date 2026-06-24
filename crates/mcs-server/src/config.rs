@@ -40,6 +40,33 @@
 //! | `payments.verifier` | `MCS_PAYMENTS__VERIFIER` | `mock`                    |
 //! | `payments.facilitator_url` | `MCS_PAYMENTS__FACILITATOR_URL` | *(none)*       |
 //! | `payments.facilitator_api_key` | `MCS_PAYMENTS__FACILITATOR_API_KEY` | *(none)* |
+//! | `cors.allowed_origins` | `MCS_CORS__ALLOWED_ORIGINS` | `[]` (no cross-origin) |
+//! | `cors.allow_credentials` | `MCS_CORS__ALLOW_CREDENTIALS` | `false`          |
+//! | `cors.max_age_secs` | `MCS_CORS__MAX_AGE_SECS` | `3600` (1h)               |
+//! | `cors.allow_any_origin` | `MCS_CORS__ALLOW_ANY_ORIGIN` | `false`            |
+//!
+//! # CORS (#98)
+//!
+//! Cross-Origin Resource Sharing headers are **off by default**: with an empty
+//! `allowed_origins` list the server sends no `Access-Control-Allow-Origin`
+//! header and all cross-origin requests are blocked at the browser level, which
+//! is the safe default for a server that has no configured browser client.
+//!
+//! To allow browser clients to reach the API, list each origin explicitly in
+//! `[cors].allowed_origins`. For example, the `mcf` browser client must have its
+//! origin (e.g. `https://mcf.example.com`) listed here:
+//!
+//! ```toml
+//! [cors]
+//! allowed_origins = ["https://mcf.example.com"]
+//! allow_credentials = true   # set to true when sending Authorization headers
+//! max_age_secs = 3600        # preflight cache lifetime
+//! ```
+//!
+//! `allow_any_origin = true` is a **development-only escape hatch** that sets
+//! `Access-Control-Allow-Origin: *`. It **cannot be combined with
+//! `allow_credentials = true`** — the CORS spec forbids it and the browser will
+//! reject such responses. Never enable `allow_any_origin` in production.
 //!
 //! # Payments (x402, #45)
 //!
@@ -80,7 +107,9 @@
 //! `mcs_ws_connections_active`. See [`mcs_api::metrics`] for the full catalogue.
 
 use std::net::SocketAddr;
+use std::time::Duration as StdDuration;
 
+use axum::http::HeaderValue;
 use figment::{
     providers::{Env, Format, Serialized, Toml},
     Figment,
@@ -88,6 +117,7 @@ use figment::{
 use mcs_observability::LogFormat;
 use serde::{Deserialize, Serialize};
 use time::Duration;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 /// The environment-variable prefix for configuration overrides.
 const ENV_PREFIX: &str = "MCS_";
@@ -125,6 +155,8 @@ pub struct Config {
     pub payments: PaymentSettings,
     /// Cluster / horizontal-scaling configuration (off by default, #68).
     pub cluster: ClusterSettings,
+    /// Cross-Origin Resource Sharing configuration for browser clients (#98).
+    pub cors: CorsSettings,
 }
 
 /// Logging configuration.
@@ -296,6 +328,73 @@ pub struct ClusterSettings {
     pub heartbeat_interval_secs: u64,
 }
 
+/// Cross-Origin Resource Sharing (CORS) configuration for browser clients (#98).
+///
+/// Controls which origins can make cross-origin HTTP requests to the API. By
+/// default **no cross-origin requests are allowed**: [`allowed_origins`] is
+/// empty and the server sends no `Access-Control-Allow-Origin` header.
+///
+/// # `config.toml` sample
+///
+/// ```toml
+/// [cors]
+/// # List every browser origin that should be allowed to call this server.
+/// # The mcf browser client's origin must be listed here.
+/// allowed_origins = ["https://mcf.example.com", "https://staging.mcf.example.com"]
+///
+/// # Set to true when the browser sends credentials (e.g. Authorization headers).
+/// # Cannot be combined with allow_any_origin = true.
+/// allow_credentials = true
+///
+/// # How long (in seconds) the browser may cache a preflight response.
+/// max_age_secs = 3600
+///
+/// # DEV ONLY: accept requests from every origin.
+/// # Never use in production; incompatible with allow_credentials = true.
+/// # allow_any_origin = false
+/// ```
+///
+/// [`allowed_origins`]: CorsSettings::allowed_origins
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CorsSettings {
+    /// Exact origins permitted to make cross-origin requests, e.g.
+    /// `["https://mcf.example.com"]`. Each entry must be a valid HTTP origin
+    /// string (`scheme://host[:port]` — no path, no trailing slash).
+    ///
+    /// **Default: empty** — no cross-origin requests are permitted, which is
+    /// the safe default for a server without a configured browser client.
+    pub allowed_origins: Vec<String>,
+
+    /// Whether to allow browsers to send credentials (cookies and
+    /// `Authorization` headers) with cross-origin requests.
+    ///
+    /// **Cannot be combined with [`allow_any_origin`](Self::allow_any_origin).**
+    /// The CORS specification forbids `Access-Control-Allow-Origin: *` together
+    /// with `Access-Control-Allow-Credentials: true`; browsers will reject such
+    /// responses.
+    ///
+    /// Default: `false`.
+    pub allow_credentials: bool,
+
+    /// How long (in seconds) a browser may cache a preflight
+    /// (`OPTIONS`) response. Default: `3600` (1 hour).
+    pub max_age_secs: u64,
+
+    /// **Development-only escape hatch.** When `true`, the server responds
+    /// with `Access-Control-Allow-Origin: *`, permitting requests from any
+    /// origin without listing them individually.
+    ///
+    /// **Never enable in production.** Incompatible with
+    /// [`allow_credentials = true`](Self::allow_credentials) — the CORS spec
+    /// forbids combining a wildcard origin with credentials, and browsers will
+    /// block such responses. When both are set to `true` the server logs a
+    /// warning and ignores `allow_credentials`.
+    ///
+    /// Default: `false`.
+    pub allow_any_origin: bool,
+}
+
 impl Default for ClusterSettings {
     fn default() -> Self {
         Self {
@@ -310,6 +409,19 @@ impl Default for ClusterSettings {
     }
 }
 
+impl Default for CorsSettings {
+    fn default() -> Self {
+        Self {
+            // Empty by default: no cross-origin requests are allowed until an
+            // operator explicitly lists origins. This is the safe default.
+            allowed_origins: Vec::new(),
+            allow_credentials: false,
+            max_age_secs: 3600,
+            allow_any_origin: false,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -320,6 +432,7 @@ impl Default for Config {
             siwe: SiweSettings::default(),
             payments: PaymentSettings::default(),
             cluster: ClusterSettings::default(),
+            cors: CorsSettings::default(),
         }
     }
 }
@@ -373,6 +486,87 @@ impl Default for SiweSettings {
             statement: "Sign in to MCS.".to_owned(),
             nonce_ttl_secs: 10 * 60,
         }
+    }
+}
+
+impl CorsSettings {
+    /// Builds a [`CorsLayer`] from this configuration.
+    ///
+    /// Allowed methods: `GET`, `POST`, `DELETE`, `OPTIONS`.
+    /// Allowed request headers: `authorization`, `content-type`.
+    /// No sensitive response headers are exposed.
+    /// Preflight TTL: [`max_age_secs`](Self::max_age_secs).
+    ///
+    /// Origin handling:
+    ///
+    /// - When [`allow_any_origin`](Self::allow_any_origin) is `true`, the layer
+    ///   echoes `Access-Control-Allow-Origin: *`. **Development only** — never
+    ///   use in production. Incompatible with credentials (the CORS spec forbids
+    ///   the combination; browsers will reject such responses).
+    /// - Otherwise, the layer checks each inbound `Origin` against
+    ///   [`allowed_origins`](Self::allowed_origins). Only listed origins receive
+    ///   an `Access-Control-Allow-Origin` header in the response.
+    /// - When [`allowed_origins`](Self::allowed_origins) is empty **and**
+    ///   [`allow_any_origin`](Self::allow_any_origin) is `false`, no
+    ///   `Access-Control-Allow-Origin` header is ever sent.
+    ///
+    /// Origins that cannot be parsed as valid [`HeaderValue`]s are silently
+    /// skipped (and a warning is logged) so a single bad entry does not prevent
+    /// the server from starting.
+    pub fn build_cors_layer(&self) -> CorsLayer {
+        use axum::http::{header, Method};
+        use tower_http::cors::AllowHeaders;
+
+        if self.allow_any_origin && self.allow_credentials {
+            tracing::warn!(
+                "cors.allow_any_origin = true is incompatible with \
+                 cors.allow_credentials = true (the CORS spec forbids \
+                 Access-Control-Allow-Origin: * with credentials); \
+                 ignoring allow_credentials"
+            );
+        }
+
+        let allow_origin: AllowOrigin = if self.allow_any_origin {
+            AllowOrigin::any()
+        } else if self.allowed_origins.is_empty() {
+            // No configured origins → no cross-origin requests allowed.
+            AllowOrigin::list(std::iter::empty::<HeaderValue>())
+        } else {
+            let values: Vec<HeaderValue> = self
+                .allowed_origins
+                .iter()
+                .filter_map(|origin| {
+                    origin
+                        .parse::<HeaderValue>()
+                        .map_err(|err| {
+                            tracing::warn!(
+                                %origin,
+                                %err,
+                                "cors.allowed_origins: skipping invalid origin"
+                            );
+                        })
+                        .ok()
+                })
+                .collect();
+            AllowOrigin::list(values)
+        };
+
+        let mut layer = CorsLayer::new()
+            .allow_origin(allow_origin)
+            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+            .allow_headers(AllowHeaders::list([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+            ]))
+            .max_age(StdDuration::from_secs(self.max_age_secs));
+
+        // Only set credentials header when not in wildcard mode (the CORS spec
+        // forbids the combination, and tower-http will panic if both are set).
+        if self.allow_credentials && !self.allow_any_origin {
+            layer = layer.allow_credentials(true);
+        }
+
+        layer
     }
 }
 
