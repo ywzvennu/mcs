@@ -38,6 +38,8 @@
 //! | `payments.description` | `MCS_PAYMENTS__DESCRIPTION` | `Create an MCS game.`  |
 //! | `payments.max_timeout_seconds` | `MCS_PAYMENTS__MAX_TIMEOUT_SECONDS` | `300` |
 //! | `payments.verifier` | `MCS_PAYMENTS__VERIFIER` | `mock`                    |
+//! | `payments.facilitator_url` | `MCS_PAYMENTS__FACILITATOR_URL` | *(none)*       |
+//! | `payments.facilitator_api_key` | `MCS_PAYMENTS__FACILITATOR_API_KEY` | *(none)* |
 //!
 //! # Payments (x402, #45)
 //!
@@ -51,8 +53,11 @@
 //!
 //! The default [`verifier`](PaymentSettings::verifier) is the development
 //! [`MockVerifier`](mcs_payments::MockVerifier), which performs **no on-chain
-//! checks** and must never be used in production. A real deployment supplies a
-//! facilitator-backed verifier; see [`mcs_payments::PaymentVerifier`].
+//! checks** and must never be used in production. A real deployment sets
+//! `verifier = "facilitator"` and points
+//! [`facilitator_url`](PaymentSettings::facilitator_url) at a standards-compliant
+//! x402 facilitator (see [`mcs_payments::FacilitatorVerifier`]); the verifier
+//! delegates `/verify` + `/settle` to it.
 
 use std::net::SocketAddr;
 
@@ -202,6 +207,16 @@ pub struct PaymentSettings {
     /// Which [`PaymentVerifier`](mcs_payments::PaymentVerifier) implementation to
     /// build. Defaults to the development [`Mock`](VerifierChoice::Mock).
     pub verifier: VerifierChoice,
+    /// Base URL of the x402 facilitator, e.g.
+    /// `https://facilitator.example.com`. **Required** when
+    /// [`verifier`](Self::verifier) is [`VerifierChoice::Facilitator`];
+    /// [`build_verifier`](Self::build_verifier) errors if it is missing. Ignored
+    /// for the mock verifier.
+    pub facilitator_url: Option<String>,
+    /// Optional bearer token sent to the facilitator as
+    /// `Authorization: Bearer {token}`. Only consulted when
+    /// [`verifier`](Self::verifier) is [`VerifierChoice::Facilitator`].
+    pub facilitator_api_key: Option<String>,
 }
 
 /// Selects which payment verifier the server constructs when payments are
@@ -215,6 +230,11 @@ pub enum VerifierChoice {
     /// the default so a misconfiguration cannot silently enable real charging.
     #[default]
     Mock,
+    /// The production [`FacilitatorVerifier`](mcs_payments::FacilitatorVerifier):
+    /// delegates `/verify` + `/settle` to the x402 facilitator at
+    /// [`facilitator_url`](PaymentSettings::facilitator_url). The URL is required;
+    /// [`build_verifier`](PaymentSettings::build_verifier) errors without it.
+    Facilitator,
 }
 
 /// Cluster / horizontal-scaling configuration (#68).
@@ -299,6 +319,8 @@ impl Default for PaymentSettings {
             description: "Create an MCS game.".to_owned(),
             max_timeout_seconds: 300,
             verifier: VerifierChoice::default(),
+            facilitator_url: None,
+            facilitator_api_key: None,
         }
     }
 }
@@ -405,14 +427,45 @@ impl PaymentSettings {
     /// Constructs the shared [`PaymentVerifier`](mcs_payments::PaymentVerifier)
     /// selected by [`verifier`](PaymentSettings::verifier).
     ///
-    /// The default [`VerifierChoice::Mock`] returns a
-    /// [`MockVerifier`](mcs_payments::MockVerifier) — development/test only. A
-    /// production deployment would extend [`VerifierChoice`] with a
-    /// facilitator-client variant and return it here.
-    #[must_use]
-    pub fn build_verifier(&self) -> std::sync::Arc<dyn mcs_payments::PaymentVerifier> {
+    /// - [`VerifierChoice::Mock`] returns a
+    ///   [`MockVerifier`](mcs_payments::MockVerifier) — development/test only,
+    ///   performing no on-chain checks.
+    /// - [`VerifierChoice::Facilitator`] returns a
+    ///   [`FacilitatorVerifier`](mcs_payments::FacilitatorVerifier) targeting
+    ///   [`facilitator_url`](Self::facilitator_url), authenticated with
+    ///   [`facilitator_api_key`](Self::facilitator_api_key) when present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`verifier`](Self::verifier) is
+    /// [`VerifierChoice::Facilitator`] but
+    /// [`facilitator_url`](Self::facilitator_url) is unset or blank — a clear
+    /// signal to the operator rather than a silently mock-backed gate.
+    pub fn build_verifier(
+        &self,
+    ) -> anyhow::Result<std::sync::Arc<dyn mcs_payments::PaymentVerifier>> {
         match self.verifier {
-            VerifierChoice::Mock => std::sync::Arc::new(mcs_payments::MockVerifier),
+            VerifierChoice::Mock => Ok(std::sync::Arc::new(mcs_payments::MockVerifier)),
+            VerifierChoice::Facilitator => {
+                let url = self
+                    .facilitator_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|u| !u.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "payments.verifier is \"facilitator\" but \
+                             payments.facilitator_url is not set"
+                        )
+                    })?;
+                let verifier = match self.facilitator_api_key.as_deref() {
+                    Some(key) if !key.is_empty() => {
+                        mcs_payments::FacilitatorVerifier::with_api_key(url, key)
+                    }
+                    _ => mcs_payments::FacilitatorVerifier::new(url),
+                };
+                Ok(std::sync::Arc::new(verifier))
+            }
         }
     }
 }
@@ -479,6 +532,92 @@ mod tests {
         assert_eq!(reqs.asset, cfg.payments.asset);
         assert_eq!(reqs.resource, "/seeks");
         assert_eq!(reqs.mime_type, "application/json");
+    }
+
+    #[test]
+    fn mock_verifier_builds_without_a_url() {
+        let cfg = Config::default();
+        assert!(
+            cfg.payments.build_verifier().is_ok(),
+            "the default mock verifier needs no facilitator url"
+        );
+    }
+
+    #[test]
+    fn facilitator_verifier_builds_with_a_url() {
+        let mut cfg = Config::default();
+        cfg.payments.verifier = VerifierChoice::Facilitator;
+        cfg.payments.facilitator_url = Some("https://facilitator.example.com".to_owned());
+        assert!(
+            cfg.payments.build_verifier().is_ok(),
+            "a facilitator verifier with a url must build"
+        );
+    }
+
+    #[test]
+    fn facilitator_verifier_builds_with_url_and_api_key() {
+        let mut cfg = Config::default();
+        cfg.payments.verifier = VerifierChoice::Facilitator;
+        cfg.payments.facilitator_url = Some("https://facilitator.example.com".to_owned());
+        cfg.payments.facilitator_api_key = Some("secret-token".to_owned());
+        assert!(cfg.payments.build_verifier().is_ok());
+    }
+
+    #[test]
+    fn facilitator_verifier_errors_without_a_url() {
+        let mut cfg = Config::default();
+        cfg.payments.verifier = VerifierChoice::Facilitator;
+        cfg.payments.facilitator_url = None;
+        let err = match cfg.payments.build_verifier() {
+            Err(err) => err,
+            Ok(_) => panic!("missing facilitator_url must be an error"),
+        };
+        assert!(
+            err.to_string().contains("facilitator_url"),
+            "the error should name the missing key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn facilitator_verifier_errors_on_a_blank_url() {
+        let mut cfg = Config::default();
+        cfg.payments.verifier = VerifierChoice::Facilitator;
+        cfg.payments.facilitator_url = Some("   ".to_owned());
+        assert!(
+            cfg.payments.build_verifier().is_err(),
+            "a blank facilitator_url must be rejected like a missing one"
+        );
+    }
+
+    /// The `[payments]` section parses the facilitator keys from TOML.
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn payments_facilitator_keys_parse_from_toml() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                r#"
+                    [payments]
+                    enabled = true
+                    verifier = "facilitator"
+                    facilitator_url = "https://facilitator.example.com"
+                    facilitator_api_key = "secret-token"
+                "#,
+            )?;
+            let cfg = Config::load().expect("load config with facilitator [payments]");
+            assert!(cfg.payments.enabled);
+            assert_eq!(cfg.payments.verifier, VerifierChoice::Facilitator);
+            assert_eq!(
+                cfg.payments.facilitator_url.as_deref(),
+                Some("https://facilitator.example.com")
+            );
+            assert_eq!(
+                cfg.payments.facilitator_api_key.as_deref(),
+                Some("secret-token")
+            );
+            assert!(cfg.payments.build_verifier().is_ok());
+            Ok(())
+        });
     }
 
     #[test]

@@ -78,7 +78,15 @@ max_amount_required = "10000"
 description = "Create an MCS game."
 # Maximum seconds a signed authorization may stay pending before it expires.
 max_timeout_seconds = 300
-# Which verifier to build. "mock" is the DEV-ONLY MockVerifier: it performs no
-# cryptographic or on-chain checks and must NEVER be used in production. The
-# production path is a facilitator-backed verifier (see mcs_payments docs).
+# Which verifier to build:
+#   "mock"        -> DEV-ONLY MockVerifier. Performs no cryptographic or on-chain
+#                    checks; NEVER use in production.
+#   "facilitator" -> Production FacilitatorVerifier. Delegates /verify + /settle
+#                    to the x402 facilitator at `facilitator_url` (required).
 verifier = "mock"
+# Base URL of the x402 facilitator. REQUIRED when `verifier = "facilitator"`;
+# the server refuses to start without it. Point it at any standards-compliant
+# facilitator that exposes POST /verify and POST /settle.
+# facilitator_url = "https://facilitator.example.com"
+# Optional bearer token sent to the facilitator as `Authorization: Bearer ...`.
+# facilitator_api_key = "your-facilitator-api-key"

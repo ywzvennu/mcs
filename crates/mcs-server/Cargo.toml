@@ -35,8 +35,10 @@ mcs-variant-shakmaty = { path = "../mcs-variant-shakmaty" }
 mcs-observability = { path = "../mcs-observability" }
 # x402 payment middleware. Referenced by path: not in `[workspace.dependencies]`,
 # and member path deps are allowed (only the root manifest is off-limits). Used
-# to build the optional game-creation payment gate from `[payments]` config.
-mcs-payments = { path = "../mcs-payments" }
+# to build the optional game-creation payment gate from `[payments]` config. The
+# `facilitator` feature is enabled so the composition root can construct a real
+# facilitator-backed verifier (#87) when `[payments].verifier = "facilitator"`.
+mcs-payments = { path = "../mcs-payments", features = ["facilitator"] }
 # Clustering primitives for multi-node support (#68). The server is the single
 # place the Redis-backed registry is constructed, so it enables the `redis`
 # feature here. Cluster mode is off by default; with it disabled no Redis

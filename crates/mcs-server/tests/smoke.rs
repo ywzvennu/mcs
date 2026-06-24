@@ -27,7 +27,8 @@ async fn test_app() -> axum::Router {
             .await
             .expect("connect in-memory sqlite"),
     );
-    let state = mcs_server::build_state(&cfg, storage, b"test-secret-bytes-not-for-prod".to_vec());
+    let state = mcs_server::build_state(&cfg, storage, b"test-secret-bytes-not-for-prod".to_vec())
+        .expect("build state");
     router(state)
 }
 

@@ -73,9 +73,18 @@ async fn health() -> Json<Health> {
 /// configured secret and a generated ephemeral one — and log accordingly —
 /// before handing the resolved bytes here.
 ///
+/// # Errors
+///
+/// Returns an error only when payments are enabled with an invalid verifier
+/// configuration — e.g. `verifier = "facilitator"` with no `facilitator_url`
+/// (see [`PaymentSettings::build_verifier`](config::PaymentSettings::build_verifier)).
+///
 /// [`main`]: ../mcs_server/fn.main.html
-#[must_use]
-pub fn build_state(cfg: &Config, storage: Arc<SqlxStorage>, session_secret: Vec<u8>) -> AppState {
+pub fn build_state(
+    cfg: &Config,
+    storage: Arc<SqlxStorage>,
+    session_secret: Vec<u8>,
+) -> anyhow::Result<AppState> {
     let mut variants = VariantRegistry::new();
     mcs_variant_standard::register(&mut variants);
     mcs_variant_rbc::register(&mut variants);
@@ -105,16 +114,17 @@ pub fn build_state(cfg: &Config, storage: Arc<SqlxStorage>, session_secret: Vec<
     // the hook where, per the roadmap, RBC game creation would be charged.
     if cfg.payments.enabled {
         let requirements = cfg.payments.requirements("/seeks");
-        let verifier = cfg.payments.build_verifier();
+        let verifier = cfg.payments.build_verifier()?;
         tracing::info!(
             scheme = %cfg.payments.scheme,
             network = %cfg.payments.network,
             pay_to = %cfg.payments.pay_to,
+            verifier = ?cfg.payments.verifier,
             "x402 payment gate enabled on game creation"
         );
-        state.with_payment(requirements, verifier)
+        Ok(state.with_payment(requirements, verifier))
     } else {
-        state
+        Ok(state)
     }
 }
 
@@ -226,7 +236,7 @@ pub async fn build_app(
     session_secret: Vec<u8>,
 ) -> anyhow::Result<(Router, Option<ClusterRuntime>)> {
     let storage = Arc::new(SqlxStorage::connect(&cfg.database_url).await?);
-    let state = build_state(cfg, storage, session_secret);
+    let state = build_state(cfg, storage, session_secret)?;
     recover_games(&state).await?;
     // Wire cluster membership when enabled (no-op otherwise; the state keeps its
     // single-node local registry and no Redis connection is opened).
