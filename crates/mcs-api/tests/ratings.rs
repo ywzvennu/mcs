@@ -94,14 +94,26 @@ fn standard_session() -> Box<dyn GameSession> {
 
 /// Persists an `Active` standard game between `white` and `black`, spawns its
 /// actor with the state's rating-update hook, registers it in the hub, and
-/// returns the live handle.
+/// returns the live handle. The game is **rated**.
 async fn start_game(state: &AppState, white: UserId, black: UserId) -> (GameId, GameHandle) {
+    start_game_rated(state, white, black, true).await
+}
+
+/// As [`start_game`], but with an explicit `rated` flag so tests can drive a
+/// casual game (whose finish must leave both ratings untouched).
+async fn start_game_rated(
+    state: &AppState,
+    white: UserId,
+    black: UserId,
+    rated: bool,
+) -> (GameId, GameHandle) {
     let mut game = Game::new(
         STANDARD_VARIANT_ID.to_owned(),
         VariantOptions::default(),
         white,
         black,
         TimeControl::Unlimited,
+        rated,
         OffsetDateTime::now_utc(),
     );
     game.lifecycle = GameLifecycle::Active;
@@ -249,6 +261,41 @@ async fn decisive_game_moves_both_ratings_and_populates_leaderboard() {
     assert_eq!(
         entries[0]["address"].as_str().unwrap(),
         "0x2222222222222222222222222222222222222222"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Casual game: a decisive result leaves both ratings untouched.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn casual_game_leaves_ratings_unchanged_and_leaderboard_empty() {
+    let state = test_app().await;
+    let white = create_user(&state, "0x7777777777777777777777777777777777777777").await;
+    let black = create_user(&state, "0x8888888888888888888888888888888888888888").await;
+
+    // A casual game, played to a decisive result exactly like the rated case.
+    let (game_id, handle) = start_game_rated(&state, white.id, black.id, false).await;
+    handle.submit_action(Color::White, resign()).await.unwrap();
+    assert!(handle.status().await.unwrap().is_finished());
+
+    // The game is reported as casual...
+    let game = get_game_json(&state, game_id).await;
+    assert_eq!(game["rated"].as_bool(), Some(false));
+
+    // ...and the rating-update hook never ran: both players remain unrated, so
+    // `GET /games/{id}` reports them at the Glicko-2 seed with the full
+    // unrated deviation.
+    assert_eq!(game["white_rating"]["value"].as_f64().unwrap(), SEED_RATING);
+    assert_eq!(game["black_rating"]["value"].as_f64().unwrap(), SEED_RATING);
+    assert_eq!(game["white_rating"]["deviation"].as_f64().unwrap(), 350.0);
+    assert_eq!(game["black_rating"]["deviation"].as_f64().unwrap(), 350.0);
+
+    // No rating row was written, so the variant's leaderboard stays empty.
+    let board = get_leaderboard(&state, STANDARD_VARIANT_ID, 10).await;
+    assert!(
+        board["entries"].as_array().unwrap().is_empty(),
+        "a casual game must not populate the leaderboard: {board}"
     );
 }
 

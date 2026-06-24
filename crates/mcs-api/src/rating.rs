@@ -23,7 +23,11 @@ use mcs_storage::RatingRepo;
 /// A [`GameCompletionHook`] that applies a Glicko-2 rating update to both
 /// players when a game finishes.
 ///
-/// On a decisive or drawn result it:
+/// A **casual** game ([`Game::rated`]` == false`) is exempt: the hook returns
+/// immediately without reading or writing any rating, leaving both players'
+/// ratings — and the leaderboard — untouched.
+///
+/// On a decisive or drawn result for a **rated** game it:
 ///
 /// 1. Reads each player's current [`Rating`] for the game's `variant_id`,
 ///    seeding an unrated player with [`Rating::default`].
@@ -99,6 +103,15 @@ fn scores_for(outcome: &Outcome) -> (Score, Score) {
 #[async_trait]
 impl GameCompletionHook for RatingUpdateHook {
     async fn on_finished(&self, game: &Game, outcome: &Outcome) {
+        // A casual game never affects ratings: skip all rating reads and writes.
+        if !game.rated {
+            tracing::debug!(
+                game_id = %game.id,
+                "casual game finished; skipping rating update",
+            );
+            return;
+        }
+
         let variant_id = game.variant_id.as_str();
         let (white_score, black_score) = scores_for(outcome);
 

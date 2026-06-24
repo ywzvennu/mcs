@@ -72,6 +72,19 @@ pub struct CreateSeekRequest {
     pub time_control: TimeControl,
     /// Which side the caller would prefer.
     pub color_preference: ColorPreference,
+    /// Whether the caller wants a **rated** game (the default) or a casual one.
+    ///
+    /// Defaults to `true` when omitted, so existing clients keep posting rated
+    /// seeks. The matchmaker only pairs seeks that agree on this flag, so a
+    /// rated seek never matches a casual one.
+    #[serde(default = "default_rated")]
+    pub rated: bool,
+}
+
+/// The serde default for [`CreateSeekRequest::rated`]: an absent `rated` field
+/// means the caller wants a rated game.
+fn default_rated() -> bool {
+    true
 }
 
 /// The two outcomes of `POST /seeks`, tagged on `"status"`.
@@ -152,6 +165,8 @@ pub struct GameDto {
     pub lifecycle: GameLifecycle,
     /// The time control in force.
     pub time_control: TimeControl,
+    /// Whether the game is rated (counts towards ratings) or casual (exempt).
+    pub rated: bool,
     /// When the game record was created (RFC 3339, UTC).
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -171,6 +186,7 @@ impl From<Game> for GameDto {
             black_rating: None,
             lifecycle: game.lifecycle,
             time_control: game.time_control,
+            rated: game.rated,
             created_at: game.created_at,
         }
     }
@@ -329,6 +345,7 @@ async fn create_seek(
         body.variant_id,
         body.time_control,
         body.color_preference,
+        body.rated,
         OffsetDateTime::now_utc(),
     );
 
@@ -368,6 +385,7 @@ async fn create_paired_game(state: &AppState, pairing: Pairing) -> ApiResult<Gam
         pairing.white,
         pairing.black,
         pairing.time_control.clone(),
+        pairing.rated,
         OffsetDateTime::now_utc(),
     );
     game.lifecycle = GameLifecycle::Active;

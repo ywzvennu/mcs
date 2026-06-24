@@ -244,6 +244,7 @@ fn active_game(id: GameId) -> Game {
             initial: Duration::from_secs(300),
             increment: Duration::from_secs(0),
         },
+        true,
         OffsetDateTime::UNIX_EPOCH,
     );
     game.id = id;
@@ -658,6 +659,7 @@ fn real_time_game(id: GameId, initial_secs: u64, increment_secs: u64) -> Game {
             initial: Duration::from_secs(initial_secs),
             increment: Duration::from_secs(increment_secs),
         },
+        true,
         OffsetDateTime::UNIX_EPOCH,
     );
     game.id = id;

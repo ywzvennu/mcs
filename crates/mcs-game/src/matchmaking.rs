@@ -14,6 +14,8 @@
 //!    - Same `variant_id`.
 //!    - Equal `time_control` (exact match; flexible matching is a future
 //!      concern).
+//!    - Same `rated` flag — a rated seek never pairs with a casual seek, so both
+//!      players always agree on whether the game counts towards their ratings.
 //!    - Different `creator` (a player cannot match themselves).
 //!    - Non-conflicting `color_preference` (see § Colour resolution below).
 //! 3. If a match is found, both seeks are removed from the pool and a
@@ -72,6 +74,12 @@ pub struct Pairing {
     pub variant_id: String,
     /// The time control both players agreed on.
     pub time_control: TimeControl,
+    /// Whether the resulting game is rated.
+    ///
+    /// Both seeks agreed on this — a rated seek only pairs with another rated
+    /// seek and a casual seek only with another casual seek — so this is simply
+    /// the shared value of the two matched seeks.
+    pub rated: bool,
 }
 
 /// The outcome of a [`Matchmaker::submit`] call.
@@ -233,6 +241,12 @@ fn try_pair(incoming: &Seek, existing: &Seek) -> Option<Pairing> {
         return None;
     }
 
+    // Both seeks must agree on rated vs. casual: a rated seek never pairs with a
+    // casual one. The agreed value then carries onto the resulting `Pairing`.
+    if incoming.rated != existing.rated {
+        return None;
+    }
+
     // Resolve colours; returns None when preferences conflict.
     let (white, black) = resolve_colors(
         incoming.creator,
@@ -246,6 +260,7 @@ fn try_pair(incoming: &Seek, existing: &Seek) -> Option<Pairing> {
         black,
         variant_id: incoming.variant_id.clone(),
         time_control: incoming.time_control.clone(),
+        rated: incoming.rated,
     })
 }
 
@@ -366,12 +381,26 @@ mod tests {
         }
     }
 
+    /// Builds a **rated** seek. Tests that exercise the rated/casual rule use
+    /// [`make_seek_rated`] to set the flag explicitly.
     fn make_seek(creator: UserId, variant: &str, tc: TimeControl, pref: ColorPreference) -> Seek {
+        make_seek_rated(creator, variant, tc, pref, true)
+    }
+
+    /// Builds a seek with an explicit `rated` flag.
+    fn make_seek_rated(
+        creator: UserId,
+        variant: &str,
+        tc: TimeControl,
+        pref: ColorPreference,
+        rated: bool,
+    ) -> Seek {
         Seek::new(
             creator,
             variant.to_owned(),
             tc,
             pref,
+            rated,
             OffsetDateTime::UNIX_EPOCH,
         )
     }
@@ -610,6 +639,101 @@ mod tests {
         let out_b = mm.submit(seek_b).await.unwrap();
 
         assert!(matches!(out_b, SubmitOutcome::Queued(_)));
+        assert_eq!(mm.open_seeks().await.unwrap().len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Rated vs. casual: only seeks that agree on `rated` may pair
+    // -----------------------------------------------------------------------
+
+    /// Two rated seeks with otherwise-compatible criteria pair, and the
+    /// resulting `Pairing` is rated.
+    #[tokio::test]
+    async fn two_rated_seeks_pair_rated() {
+        let mm = new_matchmaker();
+
+        let seek_a = make_seek_rated(
+            UserId::new(),
+            "standard",
+            blitz(),
+            ColorPreference::White,
+            true,
+        );
+        let seek_b = make_seek_rated(
+            UserId::new(),
+            "standard",
+            blitz(),
+            ColorPreference::Black,
+            true,
+        );
+
+        mm.submit(seek_a).await.unwrap();
+        let pairing = match mm.submit(seek_b).await.unwrap() {
+            SubmitOutcome::Paired(p) => p,
+            SubmitOutcome::Queued(_) => panic!("expected Paired"),
+        };
+        assert!(pairing.rated, "two rated seeks must produce a rated game");
+    }
+
+    /// Two casual seeks pair, and the resulting `Pairing` is casual.
+    #[tokio::test]
+    async fn two_casual_seeks_pair_casual() {
+        let mm = new_matchmaker();
+
+        let seek_a = make_seek_rated(
+            UserId::new(),
+            "standard",
+            blitz(),
+            ColorPreference::White,
+            false,
+        );
+        let seek_b = make_seek_rated(
+            UserId::new(),
+            "standard",
+            blitz(),
+            ColorPreference::Black,
+            false,
+        );
+
+        mm.submit(seek_a).await.unwrap();
+        let pairing = match mm.submit(seek_b).await.unwrap() {
+            SubmitOutcome::Paired(p) => p,
+            SubmitOutcome::Queued(_) => panic!("expected Paired"),
+        };
+        assert!(
+            !pairing.rated,
+            "two casual seeks must produce a casual game"
+        );
+    }
+
+    /// A rated seek and a casual seek must never pair, even when every other
+    /// criterion is compatible.
+    #[tokio::test]
+    async fn rated_and_casual_seeks_do_not_pair() {
+        let mm = new_matchmaker();
+
+        let rated = make_seek_rated(
+            UserId::new(),
+            "standard",
+            blitz(),
+            ColorPreference::White,
+            true,
+        );
+        let casual = make_seek_rated(
+            UserId::new(),
+            "standard",
+            blitz(),
+            ColorPreference::Black,
+            false,
+        );
+
+        mm.submit(rated).await.unwrap();
+        let out = mm.submit(casual).await.unwrap();
+
+        assert!(
+            matches!(out, SubmitOutcome::Queued(_)),
+            "a rated seek must not pair with a casual seek"
+        );
         assert_eq!(mm.open_seeks().await.unwrap().len(), 2);
     }
 
