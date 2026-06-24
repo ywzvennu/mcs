@@ -4,6 +4,7 @@ use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
+use uuid::Uuid;
 
 use mcs_domain::UserId;
 
@@ -58,44 +59,79 @@ impl std::fmt::Debug for SessionConfig {
 /// [RFC 7519]: https://www.rfc-editor.org/rfc/rfc7519
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claims {
+    /// JWT ID (`jti`): a unique, unpredictable identifier for this specific
+    /// token. It is the key under which a token is recorded in the server's
+    /// revocation denylist on logout (#101); the [`verify_session`] caller
+    /// checks the denylist for this id on every authenticated request.
+    pub jti: String,
     /// Subject: the authenticated user's identifier.
     pub sub: UserId,
     /// Issued-at time (Unix seconds).
     pub iat: i64,
     /// Expiry time (Unix seconds). The token is invalid at or after this
-    /// instant.
+    /// instant. A revoked token only needs to be denylisted until this instant,
+    /// after which [`verify_session`] rejects it anyway.
     pub exp: i64,
     /// Issuer: the service that minted the token.
     pub iss: String,
+}
+
+/// The result of [`issue_session`]: the encoded token plus the metadata a
+/// caller needs to track it in a revocation denylist.
+///
+/// The `jti` and `expires_at` are surfaced here so the caller can persist a
+/// revocation entry (keyed by `jti`, trimmed at `expires_at`) without having to
+/// re-decode the token it just minted.
+#[derive(Debug, Clone)]
+pub struct IssuedSession {
+    /// The encoded HS256 JWT, to be presented as `Authorization: Bearer <token>`.
+    pub token: String,
+    /// The token's unique id (`jti` claim), used as its revocation-denylist key.
+    pub jti: String,
+    /// The token's expiry. A denylist entry for this token need not outlive it.
+    pub expires_at: OffsetDateTime,
 }
 
 /// Issues a signed HS256 session token for `user_id`.
 ///
 /// The token's `iat` is the current UTC time and its `exp` is `iat + ttl`,
 /// using the [`SessionConfig::ttl`]. The `iss` claim is set to
-/// [`SessionConfig::issuer`].
+/// [`SessionConfig::issuer`]. A fresh, unpredictable `jti` (a random UUID v4)
+/// is generated so the token can be individually revoked later.
+///
+/// The returned [`IssuedSession`] carries the encoded token alongside its `jti`
+/// and `expires_at`, so the caller can record a revocation entry on logout
+/// without re-decoding the token.
 ///
 /// # Errors
 ///
 /// Returns [`AuthError::Other`] if the current time cannot be represented or
 /// token encoding fails (both unexpected in practice).
-pub fn issue_session(cfg: &SessionConfig, user_id: UserId) -> Result<String, AuthError> {
+pub fn issue_session(cfg: &SessionConfig, user_id: UserId) -> Result<IssuedSession, AuthError> {
     let now = OffsetDateTime::now_utc();
     let exp = now + cfg.ttl;
+    let jti = Uuid::new_v4().to_string();
 
     let claims = Claims {
+        jti: jti.clone(),
         sub: user_id,
         iat: now.unix_timestamp(),
         exp: exp.unix_timestamp(),
         iss: cfg.issuer.clone(),
     };
 
-    encode(
+    let token = encode(
         &Header::new(Algorithm::HS256),
         &claims,
         &EncodingKey::from_secret(&cfg.secret),
     )
-    .map_err(|e| AuthError::Other(format!("failed to encode session token: {e}")))
+    .map_err(|e| AuthError::Other(format!("failed to encode session token: {e}")))?;
+
+    Ok(IssuedSession {
+        token,
+        jti,
+        expires_at: exp,
+    })
 }
 
 /// Verifies a session token and returns its claims.
@@ -142,49 +178,62 @@ mod tests {
         let cfg = config(Duration::hours(1));
         let user = UserId::new();
 
-        let token = issue_session(&cfg, user).unwrap();
-        let claims = verify_session(&cfg, &token).unwrap();
+        let issued = issue_session(&cfg, user).unwrap();
+        let claims = verify_session(&cfg, &issued.token).unwrap();
 
         assert_eq!(claims.sub, user);
         assert_eq!(claims.iss, "mcs");
         assert!(claims.exp > claims.iat);
+        // The verified `jti` matches the one surfaced at issuance.
+        assert_eq!(claims.jti, issued.jti);
+        assert!(!claims.jti.is_empty());
+        assert_eq!(claims.exp, issued.expires_at.unix_timestamp());
+    }
+
+    #[test]
+    fn each_issued_token_has_a_distinct_jti() {
+        let cfg = config(Duration::hours(1));
+        let user = UserId::new();
+        let a = issue_session(&cfg, user).unwrap();
+        let b = issue_session(&cfg, user).unwrap();
+        assert_ne!(a.jti, b.jti, "jti must be unique per issued token");
     }
 
     #[test]
     fn expired_token_is_rejected() {
         // Negative TTL => token already expired at issuance.
         let cfg = config(Duration::hours(-1));
-        let token = issue_session(&cfg, UserId::new()).unwrap();
+        let issued = issue_session(&cfg, UserId::new()).unwrap();
 
-        let err = verify_session(&cfg, &token).unwrap_err();
+        let err = verify_session(&cfg, &issued.token).unwrap_err();
         assert_eq!(err, AuthError::Expired);
     }
 
     #[test]
     fn token_signed_with_different_secret_is_rejected() {
         let issuing = config(Duration::hours(1));
-        let token = issue_session(&issuing, UserId::new()).unwrap();
+        let issued = issue_session(&issuing, UserId::new()).unwrap();
 
         let verifying = SessionConfig::new(
             b"a-completely-different-secret-key-value!!".to_vec(),
             Duration::hours(1),
             "mcs".to_owned(),
         );
-        let err = verify_session(&verifying, &token).unwrap_err();
+        let err = verify_session(&verifying, &issued.token).unwrap_err();
         assert_eq!(err, AuthError::InvalidToken);
     }
 
     #[test]
     fn token_with_wrong_issuer_is_rejected() {
         let issuing = config(Duration::hours(1));
-        let token = issue_session(&issuing, UserId::new()).unwrap();
+        let issued = issue_session(&issuing, UserId::new()).unwrap();
 
         let verifying = SessionConfig::new(
             issuing.secret.clone(),
             Duration::hours(1),
             "other-service".to_owned(),
         );
-        let err = verify_session(&verifying, &token).unwrap_err();
+        let err = verify_session(&verifying, &issued.token).unwrap_err();
         assert_eq!(err, AuthError::InvalidToken);
     }
 

@@ -68,18 +68,22 @@ fn sign_hex(sk: &SigningKey, message: &str) -> String {
 // Test app wiring
 // ---------------------------------------------------------------------------
 
-async fn test_state() -> AppState {
-    let storage = SqlxStorage::connect("sqlite::memory:")
-        .await
-        .expect("connect + migrate in-memory sqlite");
-    let storage = Arc::new(storage);
+/// The fixed JWT signing secret used by the test states. Shared by every
+/// `AppState` in this file so a token minted by one is accepted by another
+/// pointed at the same store — the property the "restart" test relies on.
+const TEST_SECRET: &[u8] = b"test-secret-key-that-is-definitely-32-bytes!!";
 
+/// Builds an [`AppState`] over the given storage handle, with the fixed test
+/// session secret and issuer. Two states built over the *same* storage (e.g.
+/// before and after a simulated restart) therefore validate each other's tokens
+/// and share one revocation denylist.
+fn state_over(storage: Arc<SqlxStorage>) -> AppState {
     let mut registry = VariantRegistry::new();
     register(&mut registry);
     let variants = Arc::new(registry);
 
     let session = SessionConfig::new(
-        b"test-secret-key-that-is-definitely-32-bytes!!".to_vec(),
+        TEST_SECRET.to_vec(),
         Duration::hours(1),
         "mcs-test".to_owned(),
     );
@@ -91,6 +95,13 @@ async fn test_state() -> AppState {
         Duration::minutes(10),
     );
     AppState::new(storage, variants, session, siwe)
+}
+
+async fn test_state() -> AppState {
+    let storage = SqlxStorage::connect("sqlite::memory:")
+        .await
+        .expect("connect + migrate in-memory sqlite");
+    state_over(Arc::new(storage))
 }
 
 /// A trivial protected handler: requiring [`AuthUser`] gates it behind a valid
@@ -353,6 +364,157 @@ async fn wrong_scheme_authorization_is_unauthorized() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+// ---------------------------------------------------------------------------
+// Logout / token revocation (#101).
+// ---------------------------------------------------------------------------
+
+/// Runs nonce -> sign -> verify against an already-built `app`, returning the
+/// minted session token. Used by the revocation tests, which need several
+/// tokens issued against one shared state.
+async fn token_on(app: &Router) -> String {
+    let req = Request::builder()
+        .uri(format!("/auth/nonce?address={TEST_ADDRESS}"))
+        .body(Body::empty())
+        .unwrap();
+    let message = body_json(app.clone().oneshot(req).await.unwrap().into_body()).await["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let signature = sign_hex(&signing_key(), &message);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/auth/verify")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "message": message, "signature": signature }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp.into_body()).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// Calls `GET /me` with the given bearer token and returns the status.
+async fn me_status(app: &Router, token: &str) -> StatusCode {
+    let req = Request::builder()
+        .uri("/me")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+/// Calls `POST /auth/logout` with the given bearer token and returns the status.
+async fn logout_status(app: &Router, token: &str) -> StatusCode {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/auth/logout")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn logout_revokes_the_current_token() {
+    let app = test_router(test_state().await);
+    let token = token_on(&app).await;
+
+    // The token works before logout.
+    assert_eq!(me_status(&app, &token).await, StatusCode::OK);
+
+    // Logout returns 204 and revokes this token.
+    assert_eq!(logout_status(&app, &token).await, StatusCode::NO_CONTENT);
+
+    // The same token is now rejected on an authenticated request.
+    assert_eq!(me_status(&app, &token).await, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn logout_only_revokes_the_token_used() {
+    let app = test_router(test_state().await);
+    // Two distinct tokens for the same account.
+    let token_a = token_on(&app).await;
+    let token_b = token_on(&app).await;
+    assert_ne!(token_a, token_b, "each login mints a distinct token");
+
+    // Log out token A only.
+    assert_eq!(logout_status(&app, &token_a).await, StatusCode::NO_CONTENT);
+
+    // A is rejected; B — never revoked — still works.
+    assert_eq!(me_status(&app, &token_a).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(me_status(&app, &token_b).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn logout_without_bearer_is_unauthorized() {
+    let app = test_router(test_state().await);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/auth/logout")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn second_logout_with_revoked_token_is_unauthorized() {
+    let app = test_router(test_state().await);
+    let token = token_on(&app).await;
+
+    // The first logout succeeds and revokes the token.
+    assert_eq!(logout_status(&app, &token).await, StatusCode::NO_CONTENT);
+    // A second logout cannot even authenticate: the `AuthUser` extractor rejects
+    // the now-revoked token with 401 before the handler runs. (The underlying
+    // `revoke` is itself idempotent — see the storage-layer tests — but logout
+    // requires a still-valid session, so it is unreachable a second time.)
+    assert_eq!(logout_status(&app, &token).await, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn revocation_survives_a_restart() {
+    // A file-backed SQLite DB so the denylist persists across two independent
+    // `SqlxStorage` connections (a simulated process restart). The first state
+    // mints and revokes a token; a fresh state over the same file must still
+    // reject it.
+    let path = std::env::temp_dir().join(format!("mcs-logout-{}.db", std::process::id()));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    // Clean up any leftover from a previous run.
+    let _ = std::fs::remove_file(&path);
+
+    let token = {
+        let storage = Arc::new(
+            SqlxStorage::connect(&url)
+                .await
+                .expect("connect + migrate file sqlite"),
+        );
+        let app = test_router(state_over(storage));
+        let token = token_on(&app).await;
+        assert_eq!(logout_status(&app, &token).await, StatusCode::NO_CONTENT);
+        // Confirmed revoked on the original state.
+        assert_eq!(me_status(&app, &token).await, StatusCode::UNAUTHORIZED);
+        token
+    };
+
+    // "Restart": a brand-new state/store over the same database file.
+    let storage = Arc::new(
+        SqlxStorage::connect(&url)
+            .await
+            .expect("reconnect file sqlite"),
+    );
+    let app = test_router(state_over(storage));
+
+    // The revocation persisted: the token is still rejected after restart.
+    assert_eq!(me_status(&app, &token).await, StatusCode::UNAUTHORIZED);
+
+    let _ = std::fs::remove_file(&path);
+}
+
 #[tokio::test]
 async fn token_with_wrong_secret_is_unauthorized() {
     // A token minted by a different server (different secret) must be rejected.
@@ -363,7 +525,9 @@ async fn token_with_wrong_secret_is_unauthorized() {
         Duration::hours(1),
         "mcs-test".to_owned(),
     );
-    let token = mcs_auth::issue_session(&foreign, mcs_domain::UserId::new()).unwrap();
+    let token = mcs_auth::issue_session(&foreign, mcs_domain::UserId::new())
+        .unwrap()
+        .token;
 
     let req = Request::builder()
         .uri("/me")

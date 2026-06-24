@@ -40,8 +40,8 @@ use time::OffsetDateTime;
 use crate::{
     action_log::{ActionLogRepo, RecordedAction},
     error::{StorageError, StorageResult},
-    ChallengeRepo, ClaimOutcome, GameRepo, RatingRepo, Repositories, SeekRepo, SessionRepo,
-    UserRepo,
+    ChallengeRepo, ClaimOutcome, GameRepo, RatingRepo, Repositories, RevokedTokenRepo, SeekRepo,
+    SessionRepo, UserRepo,
 };
 
 // ---------------------------------------------------------------------------
@@ -431,6 +431,10 @@ impl Repositories for SqlxStorage {
     }
 
     fn sessions(&self) -> &dyn SessionRepo {
+        self
+    }
+
+    fn revoked_tokens(&self) -> &dyn RevokedTokenRepo {
         self
     }
 
@@ -870,6 +874,52 @@ impl SessionRepo for SqlxStorage {
         .rows_affected();
 
         Ok(affected > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RevokedTokenRepo
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl RevokedTokenRepo for SqlxStorage {
+    async fn revoke(&self, jti: &str, expires_at: OffsetDateTime) -> StorageResult<()> {
+        // Idempotent: revoking the same `jti` twice keeps the (identical) entry.
+        // The ON CONFLICT clause is supported identically by SQLite (3.24+) and
+        // Postgres, keeping the statement portable.
+        sqlx::query(
+            "INSERT INTO revoked_tokens (jti, expires_at) VALUES ($1, $2) \
+             ON CONFLICT (jti) DO UPDATE SET expires_at = excluded.expires_at",
+        )
+        .bind(jti)
+        .bind(encode_time(expires_at)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn is_revoked(&self, jti: &str) -> StorageResult<bool> {
+        // A single indexed point lookup on the primary key. We do not filter on
+        // expiry here: an expired-but-still-listed token is independently
+        // rejected on its `exp`, and `purge_expired` keeps such rows from piling
+        // up — so presence alone answers "is this token revoked?".
+        let row = sqlx::query("SELECT 1 AS present FROM revoked_tokens WHERE jti = $1")
+            .bind(jti)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
+    async fn purge_expired(&self, now: OffsetDateTime) -> StorageResult<u64> {
+        // Drop entries whose token has already expired (and is thus rejected on
+        // expiry anyway). The comparison is a lexicographic string comparison,
+        // which is sound because both sides are RFC 3339 UTC timestamps.
+        let affected = sqlx::query("DELETE FROM revoked_tokens WHERE expires_at <= $1")
+            .bind(encode_time(now)?)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(affected)
     }
 }
 

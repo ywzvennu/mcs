@@ -817,6 +817,65 @@ async fn nonce_store_supersedes_previous_expiry() {
 }
 
 // ---------------------------------------------------------------------------
+// RevokedTokenRepo — logout denylist integration tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn revoked_token_revoke_then_is_revoked() {
+    let storage = storage().await;
+    let expires = OffsetDateTime::now_utc() + time::Duration::hours(1);
+
+    assert!(!storage.revoked_tokens().is_revoked("jti-a").await.unwrap());
+    storage
+        .revoked_tokens()
+        .revoke("jti-a", expires)
+        .await
+        .unwrap();
+    assert!(storage.revoked_tokens().is_revoked("jti-a").await.unwrap());
+    // A different, non-revoked token stays valid.
+    assert!(!storage.revoked_tokens().is_revoked("jti-b").await.unwrap());
+}
+
+#[tokio::test]
+async fn revoked_token_revoke_is_idempotent() {
+    let storage = storage().await;
+    let expires = OffsetDateTime::now_utc() + time::Duration::hours(1);
+    storage
+        .revoked_tokens()
+        .revoke("jti", expires)
+        .await
+        .unwrap();
+    // Re-revoking the same jti must not raise a conflict.
+    storage
+        .revoked_tokens()
+        .revoke("jti", expires)
+        .await
+        .unwrap();
+    assert!(storage.revoked_tokens().is_revoked("jti").await.unwrap());
+}
+
+#[tokio::test]
+async fn revoked_token_purge_expired_drops_only_elapsed() {
+    let storage = storage().await;
+    let now = OffsetDateTime::now_utc();
+    storage
+        .revoked_tokens()
+        .revoke("old", now - time::Duration::hours(1))
+        .await
+        .unwrap();
+    storage
+        .revoked_tokens()
+        .revoke("fresh", now + time::Duration::hours(1))
+        .await
+        .unwrap();
+
+    let removed = storage.revoked_tokens().purge_expired(now).await.unwrap();
+    assert_eq!(removed, 1);
+    assert!(!storage.revoked_tokens().is_revoked("old").await.unwrap());
+    assert!(storage.revoked_tokens().is_revoked("fresh").await.unwrap());
+}
+
+// ---------------------------------------------------------------------------
 // RatingRepo — SQLite integration tests
 // ---------------------------------------------------------------------------
 

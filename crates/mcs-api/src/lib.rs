@@ -25,6 +25,7 @@
 //! | `GET /variants`      | list every registered variant ([`variants`]) |
 //! | `GET /auth/nonce`    | issue a single-use SIWE challenge |
 //! | `POST /auth/verify`  | verify the signed challenge, mint a session JWT |
+//! | `POST /auth/logout`  | revoke the caller's current session token |
 //! | `GET /ws/game/{id}`  | upgrade to the live-game WebSocket ([`ws`]) |
 //! | `POST /seeks`        | post a seek; queue it or pair it into a game ([`rest`]) |
 //! | `DELETE /seeks/{id}` | cancel one of the caller's own seeks ([`rest`]) |
@@ -174,6 +175,9 @@ pub fn router(state: AppState) -> Router {
         .merge(variants::variants_router())
         .merge(nonce)
         .merge(verify)
+        // Logout (#101) requires auth and revokes the caller's own token, so it
+        // is not behind the per-IP login rate limiter; merge it directly.
+        .merge(auth::logout_router())
         .merge(ws::ws_router())
         .merge(create_seeks)
         .merge(create_challenges)

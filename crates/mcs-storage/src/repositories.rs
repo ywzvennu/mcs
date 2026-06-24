@@ -1,6 +1,9 @@
 //! Aggregate repository handle.
 
-use crate::{ActionLogRepo, ChallengeRepo, GameRepo, RatingRepo, SeekRepo, SessionRepo, UserRepo};
+use crate::{
+    ActionLogRepo, ChallengeRepo, GameRepo, RatingRepo, RevokedTokenRepo, SeekRepo, SessionRepo,
+    UserRepo,
+};
 
 /// A single handle that exposes all repository traits.
 ///
@@ -48,6 +51,9 @@ pub trait Repositories: Send + Sync {
 
     /// Returns the session / nonce repository.
     fn sessions(&self) -> &dyn SessionRepo;
+
+    /// Returns the revoked-token (logout denylist) repository.
+    fn revoked_tokens(&self) -> &dyn RevokedTokenRepo;
 
     /// Returns the rating repository.
     fn ratings(&self) -> &dyn RatingRepo;

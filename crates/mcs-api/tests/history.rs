@@ -86,7 +86,9 @@ async fn create_user(app: &TestApp, address: &str) -> User {
 
 /// Mints a session token for `user`.
 fn token_for(app: &TestApp, user: &User) -> String {
-    issue_session(app.state.session_config(), user.id).expect("mint token")
+    issue_session(app.state.session_config(), user.id)
+        .expect("mint token")
+        .token
 }
 
 /// Creates a game for the given variant, persists the record, spawns the

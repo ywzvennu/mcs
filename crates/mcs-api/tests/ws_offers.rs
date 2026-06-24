@@ -193,8 +193,12 @@ async fn draw_offer_reaches_both_players_and_accept_draws_the_game() {
     let black = create_user(&app, "0x2222222222222222222222222222222222222222").await;
     let game_id = spawn_game(&app, &white, &black).await;
 
-    let white_token = issue_session(app.state.session_config(), white.id).expect("white token");
-    let black_token = issue_session(app.state.session_config(), black.id).expect("black token");
+    let white_token = issue_session(app.state.session_config(), white.id)
+        .expect("white token")
+        .token;
+    let black_token = issue_session(app.state.session_config(), black.id)
+        .expect("black token")
+        .token;
     let addr = serve(app.state).await;
 
     let mut white_socket = connect(addr, game_id, &white_token).await;
@@ -265,8 +269,12 @@ async fn rematch_offer_accept_creates_swapped_game_for_both() {
     let black = create_user(&app, "0x2222222222222222222222222222222222222222").await;
     let game_id = spawn_game(&app, &white, &black).await;
 
-    let white_token = issue_session(app.state.session_config(), white.id).expect("white token");
-    let black_token = issue_session(app.state.session_config(), black.id).expect("black token");
+    let white_token = issue_session(app.state.session_config(), white.id)
+        .expect("white token")
+        .token;
+    let black_token = issue_session(app.state.session_config(), black.id)
+        .expect("black token")
+        .token;
     let state = app.state.clone();
     let addr = serve(app.state).await;
 
@@ -334,9 +342,15 @@ async fn spectator_rematch_offer_is_rejected() {
     let bob = create_user(&app, "0x3333333333333333333333333333333333333333").await;
     let game_id = spawn_game(&app, &white, &black).await;
 
-    let white_token = issue_session(app.state.session_config(), white.id).expect("white token");
-    let black_token = issue_session(app.state.session_config(), black.id).expect("black token");
-    let bob_token = issue_session(app.state.session_config(), bob.id).expect("bob token");
+    let white_token = issue_session(app.state.session_config(), white.id)
+        .expect("white token")
+        .token;
+    let black_token = issue_session(app.state.session_config(), black.id)
+        .expect("black token")
+        .token;
+    let bob_token = issue_session(app.state.session_config(), bob.id)
+        .expect("bob token")
+        .token;
     let addr = serve(app.state).await;
 
     let mut white_socket = connect(addr, game_id, &white_token).await;
@@ -366,7 +380,9 @@ async fn rematch_offer_on_unfinished_game_is_rejected() {
     let black = create_user(&app, "0x2222222222222222222222222222222222222222").await;
     let game_id = spawn_game(&app, &white, &black).await;
 
-    let white_token = issue_session(app.state.session_config(), white.id).expect("white token");
+    let white_token = issue_session(app.state.session_config(), white.id)
+        .expect("white token")
+        .token;
     let addr = serve(app.state).await;
 
     let mut white_socket = connect(addr, game_id, &white_token).await;
@@ -390,8 +406,12 @@ async fn offerer_cannot_accept_their_own_rematch_offer() {
     let black = create_user(&app, "0x2222222222222222222222222222222222222222").await;
     let game_id = spawn_game(&app, &white, &black).await;
 
-    let white_token = issue_session(app.state.session_config(), white.id).expect("white token");
-    let black_token = issue_session(app.state.session_config(), black.id).expect("black token");
+    let white_token = issue_session(app.state.session_config(), white.id)
+        .expect("white token")
+        .token;
+    let black_token = issue_session(app.state.session_config(), black.id)
+        .expect("black token")
+        .token;
     let addr = serve(app.state).await;
 
     let mut white_socket = connect(addr, game_id, &white_token).await;
@@ -428,8 +448,12 @@ async fn rematch_decline_clears_the_offer_for_both() {
     let black = create_user(&app, "0x2222222222222222222222222222222222222222").await;
     let game_id = spawn_game(&app, &white, &black).await;
 
-    let white_token = issue_session(app.state.session_config(), white.id).expect("white token");
-    let black_token = issue_session(app.state.session_config(), black.id).expect("black token");
+    let white_token = issue_session(app.state.session_config(), white.id)
+        .expect("white token")
+        .token;
+    let black_token = issue_session(app.state.session_config(), black.id)
+        .expect("black token")
+        .token;
     let addr = serve(app.state).await;
 
     let mut white_socket = connect(addr, game_id, &white_token).await;

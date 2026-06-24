@@ -21,6 +21,7 @@
 //! | [`seek`]         | [`SeekRepo`] trait |
 //! | [`challenge`]    | [`ChallengeRepo`] trait |
 //! | [`session`]      | [`SessionRepo`] trait |
+//! | [`revoked_token`]| [`RevokedTokenRepo`] trait |
 //! | [`rating`]       | [`RatingRepo`] trait |
 //! | [`repositories`] | [`Repositories`] aggregate trait |
 //! | [`sqlx_store`]   | [`SqlxStorage`] sqlx-backed implementation |
@@ -52,6 +53,7 @@ pub mod error;
 pub mod game;
 pub mod rating;
 pub mod repositories;
+pub mod revoked_token;
 pub mod seek;
 pub mod session;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -64,6 +66,7 @@ pub use error::{StorageError, StorageResult};
 pub use game::GameRepo;
 pub use rating::RatingRepo;
 pub use repositories::Repositories;
+pub use revoked_token::RevokedTokenRepo;
 pub use seek::{ClaimOutcome, SeekRepo};
 pub use session::SessionRepo;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]

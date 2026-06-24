@@ -201,7 +201,9 @@ async fn snapshot_then_move_advances_the_board() {
     let black = create_user(&app, "0x2222222222222222222222222222222222222222").await;
     let game_id = spawn_game(&app, &white, &black).await;
 
-    let token = issue_session(app.state.session_config(), white.id).expect("mint token");
+    let token = issue_session(app.state.session_config(), white.id)
+        .expect("mint token")
+        .token;
     let addr = serve(app.state).await;
 
     let url = format!("ws://{addr}/ws/game/{game_id}?token={token}");
@@ -266,7 +268,9 @@ async fn spectator_submit_is_rejected_without_closing() {
     let bob = create_user(&app, "0x3333333333333333333333333333333333333333").await;
     let game_id = spawn_game(&app, &white, &black).await;
 
-    let token = issue_session(app.state.session_config(), bob.id).expect("mint token");
+    let token = issue_session(app.state.session_config(), bob.id)
+        .expect("mint token")
+        .token;
     let addr = serve(app.state).await;
 
     let url = format!("ws://{addr}/ws/game/{game_id}?token={token}");
@@ -343,8 +347,12 @@ async fn reconnect_snapshot_reflects_moves_made_while_away() {
     let black = create_user(&app, "0x2222222222222222222222222222222222222222").await;
     let game_id = spawn_game(&app, &white, &black).await;
 
-    let white_token = issue_session(app.state.session_config(), white.id).expect("mint white");
-    let black_token = issue_session(app.state.session_config(), black.id).expect("mint black");
+    let white_token = issue_session(app.state.session_config(), white.id)
+        .expect("mint white")
+        .token;
+    let black_token = issue_session(app.state.session_config(), black.id)
+        .expect("mint black")
+        .token;
     let addr = serve(app.state).await;
 
     // White connects, plays 1. e4, then drops the socket.
@@ -401,8 +409,12 @@ async fn since_ply_replays_only_the_missed_actions() {
     let black = create_user(&app, "0x2222222222222222222222222222222222222222").await;
     let game_id = spawn_game(&app, &white, &black).await;
 
-    let white_token = issue_session(app.state.session_config(), white.id).expect("mint white");
-    let black_token = issue_session(app.state.session_config(), black.id).expect("mint black");
+    let white_token = issue_session(app.state.session_config(), white.id)
+        .expect("mint white")
+        .token;
+    let black_token = issue_session(app.state.session_config(), black.id)
+        .expect("mint black")
+        .token;
     let addr = serve(app.state).await;
 
     // Play three half-moves: 1. e4 c5 2. Nf3 (plies 0, 1, 2).
@@ -456,8 +468,12 @@ async fn since_ply_at_head_replays_nothing() {
     let black = create_user(&app, "0x2222222222222222222222222222222222222222").await;
     let game_id = spawn_game(&app, &white, &black).await;
 
-    let white_token = issue_session(app.state.session_config(), white.id).expect("mint white");
-    let black_token = issue_session(app.state.session_config(), black.id).expect("mint black");
+    let white_token = issue_session(app.state.session_config(), white.id)
+        .expect("mint white")
+        .token;
+    let black_token = issue_session(app.state.session_config(), black.id)
+        .expect("mint black")
+        .token;
     let addr = serve(app.state).await;
 
     // Play 1. e4 (ply 0), then reconnect with since_ply=0: nothing newer exists.

@@ -19,6 +19,7 @@ serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
 rand.workspace = true
+uuid.workspace = true
 
 # Sign-In with Ethereum (EIP-4361) parser + EIP-191 signature recovery.
 # Not part of the workspace dependency set, so it is pinned explicitly here.

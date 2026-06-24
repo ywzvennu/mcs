@@ -21,6 +21,7 @@ use crate::{
     game::GameRepo,
     rating::RatingRepo,
     repositories::Repositories,
+    revoked_token::RevokedTokenRepo,
     seek::SeekRepo,
     session::SessionRepo,
     user::UserRepo,
@@ -355,6 +356,41 @@ impl SessionRepo for MemorySessionRepo {
 }
 
 // ---------------------------------------------------------------------------
+// MemoryRevokedTokenRepo
+// ---------------------------------------------------------------------------
+
+/// In-memory [`RevokedTokenRepo`] backed by a `HashMap`.
+///
+/// Key: `jti` string → the token's `expires_at`.
+#[derive(Debug, Default)]
+pub(super) struct MemoryRevokedTokenRepo {
+    revoked: Mutex<HashMap<String, OffsetDateTime>>,
+}
+
+#[async_trait]
+impl RevokedTokenRepo for MemoryRevokedTokenRepo {
+    async fn revoke(&self, jti: &str, expires_at: OffsetDateTime) -> StorageResult<()> {
+        let mut map = self.revoked.lock().expect("mutex poisoned");
+        // Idempotent insert/overwrite: the same token always carries the same
+        // expiry, so re-revoking is a no-op in effect.
+        map.insert(jti.to_owned(), expires_at);
+        Ok(())
+    }
+
+    async fn is_revoked(&self, jti: &str) -> StorageResult<bool> {
+        let map = self.revoked.lock().expect("mutex poisoned");
+        Ok(map.contains_key(jti))
+    }
+
+    async fn purge_expired(&self, now: OffsetDateTime) -> StorageResult<u64> {
+        let mut map = self.revoked.lock().expect("mutex poisoned");
+        let before = map.len();
+        map.retain(|_, expires_at| *expires_at > now);
+        Ok((before - map.len()) as u64)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MemoryRatingRepo
 // ---------------------------------------------------------------------------
 
@@ -418,6 +454,7 @@ pub(super) struct InMemoryRepos {
     seeks: MemorySeekRepo,
     challenges: MemoryChallengeRepo,
     sessions: MemorySessionRepo,
+    revoked_tokens: MemoryRevokedTokenRepo,
     ratings: MemoryRatingRepo,
 }
 
@@ -444,6 +481,10 @@ impl Repositories for InMemoryRepos {
 
     fn sessions(&self) -> &dyn SessionRepo {
         &self.sessions
+    }
+
+    fn revoked_tokens(&self) -> &dyn RevokedTokenRepo {
+        &self.revoked_tokens
     }
 
     fn ratings(&self) -> &dyn RatingRepo {
