@@ -42,6 +42,8 @@ sha3 = "0.10"
 siwe = { version = "0.6.1", default-features = false }
 # The standard-chess variant, used to spawn a real game session in WS tests.
 mcs-variant-standard = { workspace = true }
+# The RBC variant, used in the variants-endpoint integration tests.
+mcs-variant-rbc = { path = "../mcs-variant-rbc" }
 # A real WebSocket client to exercise the live-game socket end to end.
 tokio-tungstenite = "0.24"
 # `SinkExt`/`StreamExt` for driving the tungstenite client stream in tests.

@@ -9,8 +9,9 @@
 //!   `MCS_`-prefixed environment variables;
 //! - connects [`SqlxStorage`](mcs_storage::SqlxStorage) (which builds the pool
 //!   and runs migrations);
-//! - builds a [`VariantRegistry`](mcs_core::VariantRegistry) and **registers the
-//!   standard-chess variant** here, keeping `mcs-api` variant-agnostic;
+//! - builds a [`VariantRegistry`](mcs_core::VariantRegistry) and **registers
+//!   all supported variants** (standard, RBC, and the shakmaty family) here,
+//!   keeping `mcs-api` variant-agnostic;
 //! - constructs the [`AppState`](mcs_api::AppState) and the top-level router via
 //!   [`mcs_api::router`], adds a `GET /health` endpoint, and wraps everything in
 //!   the request-id and HTTP-trace Tower layers from `mcs-observability`.
@@ -54,10 +55,16 @@ async fn health() -> Json<Health> {
 
 /// Builds the [`AppState`] from configuration and a connected storage handle.
 ///
-/// Registers the standard-chess variant into a fresh
-/// [`VariantRegistry`](mcs_core::VariantRegistry) and translates the
-/// configuration's session and SIWE settings into the concrete
-/// [`SessionConfig`] and [`SiweConfig`] the API layer expects.
+/// Registers all supported game variants into a fresh
+/// [`VariantRegistry`](mcs_core::VariantRegistry):
+///
+/// - **standard** — ordinary FIDE chess (`mcs-variant-standard`);
+/// - **rbc** — Reconnaissance Blind Chess (`mcs-variant-rbc`);
+/// - **atomic, antichess, crazyhouse, kingofthehill, threecheck, racingkings,
+///   horde, chess960** — the shakmaty family (`mcs-variant-shakmaty`).
+///
+/// After registration the count of registered variants is logged at `INFO`
+/// level so operators can confirm all variants loaded.
 ///
 /// The `secret` used to key session tokens is provided by the caller (rather
 /// than read from `cfg` directly) so that [`main`](crate) can decide between a
@@ -69,6 +76,9 @@ async fn health() -> Json<Health> {
 pub fn build_state(cfg: &Config, storage: Arc<SqlxStorage>, session_secret: Vec<u8>) -> AppState {
     let mut variants = VariantRegistry::new();
     mcs_variant_standard::register(&mut variants);
+    mcs_variant_rbc::register(&mut variants);
+    mcs_variant_shakmaty::register_all(&mut variants);
+    tracing::info!(count = variants.ids().len(), "variant registry built");
 
     let session_config = SessionConfig::new(
         session_secret,
