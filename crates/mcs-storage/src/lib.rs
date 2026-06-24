@@ -3,11 +3,12 @@
 //! Persistence-agnostic repository traits for the Modular Chess Server.
 //!
 //! This crate defines the **storage boundary**: the set of async traits that
-//! the game, auth, and API layers depend on to read and write domain state.
-//! No concrete database driver is used or referenced here — that lives in a
-//! separate crate (e.g. `mcs-storage-sqlite`). Keeping this crate free of
-//! driver code means the upper layers can be tested against lightweight
-//! in-memory implementations without a real database.
+//! the game, auth, and API layers depend on to read and write domain state, and
+//! it ships a concrete [`sqlx`]-backed implementation ([`SqlxStorage`]) that
+//! speaks either SQLite or PostgreSQL depending on the active crate feature.
+//!
+//! The trait layer carries no driver knowledge, so upper layers can be tested
+//! against lightweight in-memory implementations without a real database.
 //!
 //! ## Crate contents
 //!
@@ -19,6 +20,14 @@
 //! | [`seek`]         | [`SeekRepo`] trait |
 //! | [`session`]      | [`SessionRepo`] trait |
 //! | [`repositories`] | [`Repositories`] aggregate trait |
+//! | [`sqlx_store`]   | [`SqlxStorage`] sqlx-backed implementation |
+//!
+//! ## Backends
+//!
+//! Exactly one driver feature should be active: `sqlite` (the default) or
+//! `postgres`. Both compile; the SQL is portable across them. See
+//! [`sqlx_store`] for the encoding conventions and the "no compile-time query
+//! macro" decision (CI builds offline, with no database).
 //!
 //! ## Usage pattern
 //!
@@ -39,6 +48,8 @@ pub mod game;
 pub mod repositories;
 pub mod seek;
 pub mod session;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub mod sqlx_store;
 pub mod user;
 
 pub use error::{StorageError, StorageResult};
@@ -46,6 +57,8 @@ pub use game::GameRepo;
 pub use repositories::Repositories;
 pub use seek::SeekRepo;
 pub use session::SessionRepo;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub use sqlx_store::SqlxStorage;
 pub use user::UserRepo;
 
 #[cfg(test)]
