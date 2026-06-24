@@ -234,10 +234,13 @@ async fn game_socket(
     let claims = verify_session(state.session_config(), &query.token)?;
     let user_id = claims.sub;
 
-    // 3. The game must be live (its actor registered in the hub).
+    // 3. Resolve the live actor, reviving it from the durable log if this node
+    //    has no in-memory handle for it (a cold node, or a game evicted after a
+    //    restart). An unknown or already-finished game has no live actor and is
+    //    a 404 just as before.
     let handle = state
-        .game_hub()
-        .get(game_id)
+        .get_or_recover(game_id)
+        .await?
         .ok_or_else(|| ApiError::NotFound(format!("no live game: {game_id}")))?;
 
     // 4. Resolve the caller's role from the persisted game record. A user who is
