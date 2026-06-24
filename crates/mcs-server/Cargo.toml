@@ -49,6 +49,10 @@ axum.workspace = true
 tokio.workspace = true
 # Compose the observability Tower layers (request-id + HTTP trace) into a stack.
 tower.workspace = true
+# CORS middleware for browser clients (#98). `tower-http` is a workspace dep with
+# the `cors` feature already enabled; referenced here so the composition root can
+# build and apply `CorsLayer` from `[cors]` config.
+tower-http.workspace = true
 figment.workspace = true
 serde.workspace = true
 tracing.workspace = true
@@ -67,6 +71,7 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 [dev-dependencies]
 # Drive the assembled router in-process without binding a socket.
 tower = { workspace = true }
+tower-http.workspace = true
 # Parse the JSON body of `/variants` in smoke tests.
 serde_json.workspace = true
 # `figment::Jail` for isolated config-loading tests (the `test` feature gates it).
