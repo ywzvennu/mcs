@@ -8,17 +8,45 @@
 //! from the connecting player's own [`PlayerView`] so partial-information
 //! variants never leak the opponent's hidden state.
 //!
-//! # Authentication
+//! # Authentication and WebSocket subprotocol handshake
 //!
-//! Browsers cannot set an `Authorization` header on a `WebSocket` handshake, so
-//! the session JWT is supplied as the `token` query parameter:
-//! `GET /ws/game/{id}?token=<jwt>`. It is validated with
-//! [`verify_session`](mcs_auth::verify_session) — the same check the
-//! [`AuthUser`](crate::AuthUser) extractor performs for REST routes — *before*
-//! the socket is upgraded, so an unauthenticated or invalid request is rejected
-//! with **401 Unauthorized** and never reaches the streaming task. The verified
-//! [`UserId`](mcs_domain::UserId) is then matched against the game's players to
-//! resolve the connection's [`Role`]: White, Black, or a read-only Spectator.
+//! Browsers cannot set an `Authorization` header on a `WebSocket` handshake.
+//! The preferred browser-compatible mechanism is the `Sec-WebSocket-Protocol`
+//! header, which the browser `WebSocket` API exposes as the second constructor
+//! argument. The **handshake contract** is:
+//!
+//! - The client offers **two** subprotocols in decreasing preference order:
+//!   1. `mcs.v1` — the application protocol identifier.
+//!   2. `mcs.token.<jwt>` — the session JWT embedded in the protocol name.
+//!
+//!   Example request header:
+//!   ```text
+//!   Sec-WebSocket-Protocol: mcs.v1, mcs.token.<jwt>
+//!   ```
+//!
+//! - The server extracts the JWT from the `mcs.token.<…>` entry, validates it
+//!   with [`verify_session`](mcs_auth::verify_session), and on success **echoes
+//!   back only `mcs.v1`** in the upgrade response — the secret token is never
+//!   echoed, satisfying the RFC 6455 requirement that the server select one
+//!   of the offered protocols without leaking credentials.
+//!
+//!   Example response header:
+//!   ```text
+//!   Sec-WebSocket-Protocol: mcs.v1
+//!   ```
+//!
+//! **Token resolution precedence:**
+//! 1. `Sec-WebSocket-Protocol` (preferred, browser-compatible).
+//! 2. `?token=<jwt>` query parameter (**deprecated** — it leaks into server
+//!    logs; keep it only for backward compatibility with non-browser clients).
+//!
+//! An unauthenticated or invalid request — with neither a valid subprotocol
+//! token nor a valid query-param token — is rejected with **401 Unauthorized**
+//! before the socket is upgraded, so it never reaches the streaming task.
+//!
+//! The verified [`UserId`](mcs_domain::UserId) is matched against the game's
+//! players to resolve the connection's [`Role`]: White, Black, or a read-only
+//! Spectator.
 //!
 //! # Protocol
 //!
@@ -433,13 +461,19 @@ impl From<TableEvent> for ServerMessage {
 // ---------------------------------------------------------------------------
 
 /// The query string of the WebSocket handshake:
-/// `?token=<jwt>[&since_ply=<n>]`.
+/// `[?token=<jwt>][&since_ply=<n>]`.
 #[derive(Debug, Deserialize)]
 pub struct ConnectQuery {
-    /// The session JWT, validated exactly like the `Authorization: Bearer`
-    /// token of a REST request. Supplied in the query because browsers cannot
-    /// set request headers on a WebSocket handshake.
-    token: String,
+    /// The session JWT supplied as a query parameter.
+    ///
+    /// **Deprecated.** Prefer passing the JWT via the `Sec-WebSocket-Protocol`
+    /// header as `mcs.token.<jwt>` (see the module-level authentication
+    /// documentation). The query-parameter path leaks the token into server
+    /// access logs and is retained only for backward compatibility with
+    /// non-browser clients. It is ignored when a valid subprotocol token is
+    /// also present.
+    #[serde(default)]
+    token: Option<String>,
     /// An optional catch-up cursor: the last ply the reconnecting client had
     /// already rendered. When present, the server replays the actions recorded
     /// *after* this ply (perfect-information variants only) right after the
@@ -535,6 +569,33 @@ pub fn ws_router() -> axum::Router<AppState> {
     axum::Router::new().route("/ws/game/{id}", get(game_socket))
 }
 
+/// The WebSocket application-protocol identifier echoed in the upgrade response.
+///
+/// The browser `WebSocket` API requires that the server select one of the
+/// protocols the client offered; browsers reject a response that selects a
+/// protocol the client did not offer. We therefore echo `mcs.v1` — and
+/// never echo `mcs.token.<jwt>`, which would leak the credential.
+const MCS_PROTOCOL: &str = "mcs.v1";
+
+/// The prefix that marks a bearer-token subprotocol entry.
+///
+/// The client places the JWT immediately after this prefix:
+/// `mcs.token.<jwt>`. Any offered subprotocol whose value starts with this
+/// string is treated as a token carrier; only the first match is used.
+const TOKEN_PROTOCOL_PREFIX: &str = "mcs.token.";
+
+/// Extracts a JWT from the `Sec-WebSocket-Protocol` offered-protocols list.
+///
+/// Searches the offered protocols for the first entry whose value starts with
+/// [`TOKEN_PROTOCOL_PREFIX`] (`"mcs.token."`), and strips that prefix to
+/// return the embedded JWT. Returns `None` when no such entry is present.
+fn extract_subprotocol_token(upgrade: &WebSocketUpgrade) -> Option<String> {
+    upgrade.requested_protocols().find_map(|hv| {
+        let s = hv.to_str().ok()?;
+        s.strip_prefix(TOKEN_PROTOCOL_PREFIX).map(str::to_owned)
+    })
+}
+
 /// The `GET /ws/game/{id}` handler: authenticate, route, resolve the role, then
 /// upgrade.
 ///
@@ -544,8 +605,12 @@ pub fn ws_router() -> axum::Router<AppState> {
 /// valid player or spectator of an existing, live game **that this node owns** is
 /// the connection handed to [`run_connection`].
 ///
+/// Token resolution order:
+/// 1. `Sec-WebSocket-Protocol: mcs.v1, mcs.token.<jwt>` (preferred).
+/// 2. `?token=<jwt>` query parameter (deprecated fallback).
+///
 /// The raw query string is taken alongside the parsed [`ConnectQuery`] so that,
-/// on a cluster redirect, the token and any `since_ply` can be preserved verbatim
+/// on a cluster redirect, the `since_ply` parameter can be preserved verbatim
 /// in the reconnect URL.
 async fn game_socket(
     State(state): State<AppState>,
@@ -559,9 +624,21 @@ async fn game_socket(
         .parse()
         .map_err(|_| ApiError::UnprocessableEntity(format!("invalid game id: {id}")))?;
 
-    // 2. Verify the session token from the query string. Any failure is a 401
-    //    with a single generic message, matching the `AuthUser` extractor.
-    let claims = verify_session(state.session_config(), &query.token)?;
+    // 2. Resolve the session token.
+    //
+    //    Precedence:
+    //    a) `Sec-WebSocket-Protocol` token (`mcs.token.<jwt>`) — preferred,
+    //       because browsers can only pass auth via the subprotocol list.
+    //    b) `?token=<jwt>` query parameter — deprecated fallback for non-browser
+    //       clients; kept for backward compatibility but leaks into access logs.
+    //
+    //    Either path validates the JWT with `verify_session`; the first
+    //    successful parse wins. An absent or invalid token in both places is
+    //    a 401, matching the `AuthUser` extractor behaviour.
+    let token: String = extract_subprotocol_token(&upgrade)
+        .or(query.token)
+        .ok_or_else(|| ApiError::Unauthorized("authentication failed".to_owned()))?;
+    let claims = verify_session(state.session_config(), &token)?;
     let user_id = claims.sub;
 
     // Mark the connecting user as active so presence tracks WebSocket sessions
@@ -640,7 +717,17 @@ async fn game_socket(
     let max_msg = state.ws_max_message_bytes();
     let upgrade = upgrade.max_message_size(max_msg);
 
-    // 10. Upgrade. From here the connection task owns the socket and the handle.
+    // 10. Echo the non-secret application-protocol identifier in the response.
+    //
+    //     `protocols(["mcs.v1"])` tells axum: if the client offered `mcs.v1`,
+    //     select it; otherwise select nothing. We never echo `mcs.token.<jwt>`
+    //     back — that would leak the credential in the upgrade response and in
+    //     any logs that capture HTTP headers. Browsers require the server to
+    //     select one of the offered subprotocols, so echoing `mcs.v1` satisfies
+    //     both RFC 6455 and the browser's enforcement of the negotiation.
+    let upgrade = upgrade.protocols([MCS_PROTOCOL]);
+
+    // 11. Upgrade. From here the connection task owns the socket and the handle.
     Ok(upgrade.on_upgrade(move |socket| {
         run_connection(RunConnection {
             socket,
