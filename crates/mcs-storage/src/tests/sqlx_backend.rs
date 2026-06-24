@@ -1,9 +1,17 @@
-//! Integration tests for [`SqlxStorage`] against an in-memory SQLite pool.
+//! Backend-parameterised integration tests for [`SqlxStorage`].
 //!
-//! Each test connects to a fresh `"sqlite::memory:"` database, which runs the
-//! embedded migrations on connect, then exercises one repository's contract.
-//! In-memory SQLite needs no filesystem and is torn down when the pool drops,
-//! so the tests are hermetic and fast.
+//! The same test bodies run against two backends, selected at runtime by the
+//! `MCS_TEST_DATABASE_URL` environment variable (see [`super::harness`]):
+//!
+//! * **SQLite** (default) — each test gets a private in-memory database, torn
+//!   down with the pool.
+//! * **Postgres** (CI service) — each test gets a private, uniquely-named schema
+//!   on the shared server, dropped on teardown.
+//!
+//! Either way every test is hermetic: it connects through
+//! [`connect_test_storage`], which runs the embedded migrations against a fresh,
+//! isolated backend, then exercises one repository's contract. The assertions
+//! are identical across backends, so a green run proves the SQL is portable.
 
 use mcs_core::{Action, Color, EndReason, Outcome, VariantOptions};
 use mcs_domain::{
@@ -12,20 +20,20 @@ use mcs_domain::{
 };
 use time::OffsetDateTime;
 
+use super::harness::{connect_test_storage, TestStorage};
 // The repository methods are invoked through `&dyn Trait` handles returned by
 // the `Repositories` accessors, so the individual repo traits need not be in
 // scope here.
-use crate::{RecordedAction, Repositories, SqlxStorage, StorageError};
+use crate::{RecordedAction, Repositories, StorageError};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Connects to a private in-memory SQLite database with migrations applied.
-async fn storage() -> SqlxStorage {
-    SqlxStorage::connect("sqlite::memory:")
-        .await
-        .expect("connect + migrate in-memory sqlite")
+/// Connects to a fresh, isolated backend (SQLite or Postgres) with migrations
+/// applied. See [`super::harness`] for how isolation is achieved per backend.
+async fn storage() -> TestStorage {
+    connect_test_storage().await
 }
 
 fn address(seed: &str) -> EvmAddress {
@@ -1004,7 +1012,9 @@ async fn rating_leaderboard_empty_variant_returns_empty() {
 #[tokio::test]
 async fn repositories_aggregate_is_object_safe() {
     let storage = storage().await;
-    let repos: &dyn Repositories = &storage;
+    // Borrow through the `Deref` to `SqlxStorage` to prove the aggregate is
+    // usable behind a `&dyn Repositories` vtable.
+    let repos: &dyn Repositories = &*storage;
 
     let user = sample_user();
     repos.users().create(&user).await.unwrap();
