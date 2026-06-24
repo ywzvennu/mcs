@@ -132,6 +132,7 @@ pub fn router(state: AppState) -> Router {
         .merge(auth::auth_router())
         .merge(ws::ws_router())
         .merge(create_seeks)
+        .merge(rest::accept_seek_router())
         .merge(rest::cancel_seek_router())
         .merge(challenges::challenges_router())
         .merge(rest::read_router())
