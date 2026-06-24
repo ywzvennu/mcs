@@ -25,4 +25,4 @@ time.workspace = true
 
 [dev-dependencies]
 mcs-variant-standard.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }

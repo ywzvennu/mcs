@@ -1,6 +1,7 @@
 //! The broadcast message published to everyone watching a live game.
 
 use mcs_core::{Event, GameStatus};
+use mcs_domain::Clock;
 use serde::{Deserialize, Serialize};
 
 /// A live update broadcast to every subscriber of a game.
@@ -29,13 +30,42 @@ pub struct GameEvent {
     /// [`Outcome`](mcs_core::Outcome) is the final result and no further events
     /// will be broadcast for this game.
     pub status: GameStatus,
+
+    /// A snapshot of both players' remaining time after the action, when the
+    /// game is played under a real-time [`TimeControl`](mcs_domain::TimeControl).
+    ///
+    /// It is `None` for unlimited and correspondence games, and for any update
+    /// that carries no clock information. The field is skipped during
+    /// serialization when absent, so older consumers that do not know about
+    /// clocks continue to deserialize unchanged — the addition is
+    /// backward-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock: Option<Clock>,
 }
 
 impl GameEvent {
-    /// Builds a `GameEvent` from an action's `events` and resulting `status`.
+    /// Builds a clock-less `GameEvent` from an action's `events` and resulting
+    /// `status`.
+    ///
+    /// Use [`GameEvent::with_clock`] to attach a real-time clock snapshot.
     #[must_use]
     pub fn new(events: Vec<Event>, status: GameStatus) -> Self {
-        Self { events, status }
+        Self {
+            events,
+            status,
+            clock: None,
+        }
+    }
+
+    /// Builds a `GameEvent` carrying a [`Clock`] snapshot alongside the action's
+    /// `events` and resulting `status`.
+    #[must_use]
+    pub fn with_clock(events: Vec<Event>, status: GameStatus, clock: Clock) -> Self {
+        Self {
+            events,
+            status,
+            clock: Some(clock),
+        }
     }
 
     /// Returns `true` if this update marks the game as finished.

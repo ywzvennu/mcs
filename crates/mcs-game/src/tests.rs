@@ -188,7 +188,12 @@ async fn play_fools_mate(handle: &crate::GameHandle) -> mcs_core::ActionEffect {
 async fn fools_mate_finishes_and_persists_with_correct_outcome() {
     let game_id = GameId::new();
     let repo = MockGameRepo::with_game(active_game(game_id));
-    let handle = GameActor::spawn(game_id, standard_session(), repo.clone());
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo.clone(),
+        TimeControl::Unlimited,
+    );
 
     let effect = play_fools_mate(&handle).await;
     assert!(effect.status.is_finished());
@@ -220,7 +225,7 @@ async fn fools_mate_finishes_and_persists_with_correct_outcome() {
 async fn events_are_broadcast_to_subscribers() {
     let game_id = GameId::new();
     let repo = MockGameRepo::with_game(active_game(game_id));
-    let handle = GameActor::spawn(game_id, standard_session(), repo);
+    let handle = GameActor::spawn(game_id, standard_session(), repo, TimeControl::Unlimited);
 
     let mut events = handle.subscribe();
 
@@ -265,7 +270,12 @@ async fn events_are_broadcast_to_subscribers() {
 async fn out_of_turn_action_is_rejected() {
     let game_id = GameId::new();
     let repo = MockGameRepo::with_game(active_game(game_id));
-    let handle = GameActor::spawn(game_id, standard_session(), repo.clone());
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo.clone(),
+        TimeControl::Unlimited,
+    );
 
     // Black tries to move first.
     let err = handle
@@ -286,7 +296,12 @@ async fn out_of_turn_action_is_rejected() {
 async fn illegal_action_is_rejected() {
     let game_id = GameId::new();
     let repo = MockGameRepo::with_game(active_game(game_id));
-    let handle = GameActor::spawn(game_id, standard_session(), repo.clone());
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo.clone(),
+        TimeControl::Unlimited,
+    );
 
     // A pawn cannot jump three squares.
     let err = handle
@@ -304,7 +319,12 @@ async fn illegal_action_is_rejected() {
 async fn acting_after_finish_is_rejected_and_persists_only_once() {
     let game_id = GameId::new();
     let repo = MockGameRepo::with_game(active_game(game_id));
-    let handle = GameActor::spawn(game_id, standard_session(), repo.clone());
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo.clone(),
+        TimeControl::Unlimited,
+    );
 
     play_fools_mate(&handle).await;
 
@@ -323,7 +343,7 @@ async fn acting_after_finish_is_rejected_and_persists_only_once() {
 async fn views_and_legal_actions_are_served_through_the_handle() {
     let game_id = GameId::new();
     let repo = MockGameRepo::with_game(active_game(game_id));
-    let handle = GameActor::spawn(game_id, standard_session(), repo);
+    let handle = GameActor::spawn(game_id, standard_session(), repo, TimeControl::Unlimited);
 
     // White has the 20 opening moves plus Resign and OfferDraw.
     let actions = handle.legal_actions(Color::White).await.unwrap();
@@ -349,7 +369,7 @@ async fn persistence_failure_on_game_end_surfaces_as_storage_error() {
     let repo = Arc::new(FailingUpdateRepo {
         game: active_game(game_id),
     });
-    let handle = GameActor::spawn(game_id, standard_session(), repo);
+    let handle = GameActor::spawn(game_id, standard_session(), repo, TimeControl::Unlimited);
 
     handle
         .submit_action(Color::White, mv("f2f3"))
@@ -383,7 +403,7 @@ async fn persistence_failure_on_game_end_surfaces_as_storage_error() {
 async fn handle_is_cloneable_and_clones_share_one_session() {
     let game_id = GameId::new();
     let repo = MockGameRepo::with_game(active_game(game_id));
-    let handle = GameActor::spawn(game_id, standard_session(), repo);
+    let handle = GameActor::spawn(game_id, standard_session(), repo, TimeControl::Unlimited);
     let other = handle.clone();
 
     assert_eq!(handle.game_id(), other.game_id());
@@ -398,11 +418,205 @@ async fn handle_is_cloneable_and_clones_share_one_session() {
     assert!(!legal.is_empty());
 }
 
+// --------------------------------------------------------------------------
+// Clock integration tests.
+//
+// These use the crate-private `spawn_with_time_source` to inject a controllable
+// virtual clock, so timing assertions never depend on the wall clock. Tests
+// that arm the auto-flag timer run on a paused Tokio runtime and advance both
+// the virtual UTC clock and Tokio's timer in lockstep through
+// `ManualTimeSource::advance`.
+// --------------------------------------------------------------------------
+
+use crate::time_source::testing::ManualTimeSource;
+
+/// A [`TimeSource`](crate::TimeSource) that shares one [`ManualTimeSource`]
+/// behind an `Arc`, letting a test drive the same virtual clock the spawned
+/// actor reads.
+#[derive(Debug)]
+struct SharedTimeSource(Arc<ManualTimeSource>);
+
+#[async_trait]
+impl crate::TimeSource for SharedTimeSource {
+    fn now(&self) -> OffsetDateTime {
+        self.0.now()
+    }
+
+    async fn sleep_until(&self, deadline: OffsetDateTime) {
+        self.0.sleep_until(deadline).await;
+    }
+}
+
+/// A real-time `active_game` record with the given budget and increment.
+fn real_time_game(id: GameId, initial_secs: u64, increment_secs: u64) -> Game {
+    let mut game = Game::new(
+        "standard".to_owned(),
+        UserId::new(),
+        UserId::new(),
+        TimeControl::RealTime {
+            initial: Duration::from_secs(initial_secs),
+            increment: Duration::from_secs(increment_secs),
+        },
+        OffsetDateTime::UNIX_EPOCH,
+    );
+    game.id = id;
+    game.lifecycle = GameLifecycle::Active;
+    game
+}
+
+#[tokio::test(start_paused = true)]
+async fn move_events_carry_live_clock_snapshots() {
+    let game_id = GameId::new();
+    let repo = MockGameRepo::with_game(real_time_game(game_id, 300, 2));
+    let time = Arc::new(ManualTimeSource::new(OffsetDateTime::UNIX_EPOCH));
+    let tc = TimeControl::RealTime {
+        initial: Duration::from_secs(300),
+        increment: Duration::from_secs(2),
+    };
+    let handle = GameActor::spawn_with_time_source(
+        game_id,
+        standard_session(),
+        repo,
+        tc,
+        Box::new(SharedTimeSource(time.clone())),
+    );
+
+    let mut events = handle.subscribe();
+
+    // White spends 10 seconds, then moves: 300 - 10 + 2 = 292 remaining.
+    time.advance(Duration::from_secs(10)).await;
+    handle
+        .submit_action(Color::White, mv("e2e4"))
+        .await
+        .unwrap();
+    let update = events.recv().await.unwrap();
+    let clock = update.clock.expect("real-time events carry a clock");
+    assert_eq!(clock.white_remaining(), Duration::from_secs(292));
+    assert_eq!(clock.black_remaining(), Duration::from_secs(300));
+
+    // Black spends 5 seconds, then moves: 300 - 5 + 2 = 297 remaining.
+    time.advance(Duration::from_secs(5)).await;
+    handle
+        .submit_action(Color::Black, mv("e7e5"))
+        .await
+        .unwrap();
+    let update = events.recv().await.unwrap();
+    let clock = update.clock.unwrap();
+    assert_eq!(clock.white_remaining(), Duration::from_secs(292));
+    assert_eq!(clock.black_remaining(), Duration::from_secs(297));
+}
+
+#[tokio::test(start_paused = true)]
+async fn player_who_stops_moving_loses_on_time() {
+    let game_id = GameId::new();
+    let repo = MockGameRepo::with_game(real_time_game(game_id, 3, 0));
+    let time = Arc::new(ManualTimeSource::new(OffsetDateTime::UNIX_EPOCH));
+    let tc = TimeControl::RealTime {
+        initial: Duration::from_secs(3),
+        increment: Duration::from_secs(0),
+    };
+    let handle = GameActor::spawn_with_time_source(
+        game_id,
+        standard_session(),
+        repo.clone(),
+        tc,
+        Box::new(SharedTimeSource(time.clone())),
+    );
+
+    let mut events = handle.subscribe();
+
+    // White never moves. Advancing past their 3-second budget fires the armed
+    // flag timer and the actor ends the game on time.
+    time.advance(Duration::from_secs(4)).await;
+
+    let update = events.recv().await.expect("a timeout event is broadcast");
+    assert!(update.is_finished());
+    assert_eq!(
+        update.status,
+        mcs_core::GameStatus::Finished(Outcome::win(Color::Black, EndReason::Timeout))
+    );
+
+    // The outcome is queryable and persisted exactly once as a timeout.
+    assert_eq!(
+        handle.outcome().await.unwrap(),
+        Some(Outcome::win(Color::Black, EndReason::Timeout))
+    );
+    let updated = repo.updated_games();
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].lifecycle, GameLifecycle::Finished);
+    assert_eq!(
+        updated[0].outcome,
+        Some(Outcome::win(Color::Black, EndReason::Timeout))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn moving_after_flagging_is_rejected() {
+    let game_id = GameId::new();
+    let repo = MockGameRepo::with_game(real_time_game(game_id, 2, 0));
+    let time = Arc::new(ManualTimeSource::new(OffsetDateTime::UNIX_EPOCH));
+    let tc = TimeControl::RealTime {
+        initial: Duration::from_secs(2),
+        increment: Duration::from_secs(0),
+    };
+    let handle = GameActor::spawn_with_time_source(
+        game_id,
+        standard_session(),
+        repo.clone(),
+        tc,
+        Box::new(SharedTimeSource(time.clone())),
+    );
+
+    // White overruns the budget, then tries to move anyway: rejected as finished.
+    time.advance(Duration::from_secs(5)).await;
+    let err = handle
+        .submit_action(Color::White, mv("e2e4"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GameSessionError::Game(GameError::Finished)));
+
+    assert_eq!(
+        handle.outcome().await.unwrap(),
+        Some(Outcome::win(Color::Black, EndReason::Timeout))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn unlimited_game_never_flags_and_omits_clock() {
+    let game_id = GameId::new();
+    let repo = MockGameRepo::with_game(active_game(game_id));
+    let time = Arc::new(ManualTimeSource::new(OffsetDateTime::UNIX_EPOCH));
+    let handle = GameActor::spawn_with_time_source(
+        game_id,
+        standard_session(),
+        repo.clone(),
+        TimeControl::Unlimited,
+        Box::new(SharedTimeSource(time.clone())),
+    );
+
+    // A ten-day idle with no clock pressure leaves the game ongoing.
+    time.advance(Duration::from_secs(10 * 24 * 60 * 60)).await;
+    assert_eq!(
+        handle.status().await.unwrap(),
+        mcs_core::GameStatus::Ongoing
+    );
+    assert!(repo.updated_games().is_empty());
+
+    // An unlimited game's events carry no clock snapshot.
+    let mut events = handle.subscribe();
+    handle
+        .submit_action(Color::White, mv("e2e4"))
+        .await
+        .unwrap();
+    let update = events.recv().await.unwrap();
+    assert!(update.clock.is_none());
+}
+
 #[tokio::test]
 async fn dropping_all_handles_stops_the_actor() {
     let game_id = GameId::new();
     let repo = MockGameRepo::with_game(active_game(game_id));
-    let handle = GameActor::spawn(game_id, standard_session(), repo);
+    let handle = GameActor::spawn(game_id, standard_session(), repo, TimeControl::Unlimited);
 
     // A subscriber held across the drop observes the broadcast channel close
     // once the actor task ends.
