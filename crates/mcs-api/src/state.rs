@@ -11,6 +11,8 @@ use mcs_auth::SessionConfig;
 use mcs_storage::Repositories;
 use time::Duration;
 
+use crate::hub::GameHub;
+
 /// Configuration for the Sign-In with Ethereum (EIP-4361) challenge that the
 /// server hands to wallets at `GET /auth/nonce`.
 ///
@@ -69,19 +71,21 @@ impl SiweConfig {
 /// while tests inject an in-memory or SQLite implementation. The trait is
 /// object-safe by design (see [`mcs_storage::Repositories`]).
 ///
-/// # Extending for live games (#14 / #15)
+/// # Live-game hub (#14 / #15)
 ///
-/// The REST game endpoints (#14) and the WebSocket layer (#15) will need a
-/// shared in-memory "live-game hub" (the running [`mcs_game`] actors and their
-/// broadcast channels). When those land, add the hub as another `Arc`-wrapped
-/// field here and extend [`AppState::new`] accordingly — existing handlers and
-/// the [`AuthUser`](crate::AuthUser) extractor continue to work unchanged
-/// because they only read the fields they need.
+/// The [`game_hub`](AppState::game_hub) is the shared, in-memory registry of
+/// running games (the [`mcs_game`] actors and their broadcast channels). The
+/// REST creation endpoints (#14) spawn a game's actor and insert its handle
+/// here; the WebSocket endpoint (#15, see [`crate::ws`]) looks the handle up by
+/// id so a connecting client can stream and submit moves. The hub is itself
+/// cloneable (it shares an [`Arc`] internally), so adding it keeps `AppState`
+/// cheap to clone and the [`AuthUser`](crate::AuthUser) extractor unaffected.
 #[derive(Clone)]
 pub struct AppState {
     storage: Arc<dyn Repositories>,
     session_config: SessionConfig,
     siwe_config: SiweConfig,
+    game_hub: GameHub,
 }
 
 impl AppState {
@@ -92,6 +96,9 @@ impl AppState {
     ///   `/auth/verify` handler (issuance) and the [`AuthUser`](crate::AuthUser)
     ///   extractor (verification).
     /// * `siwe_config` — the SIWE challenge parameters for `/auth/nonce`.
+    ///
+    /// The [`game_hub`](AppState::game_hub) starts empty; games are inserted as
+    /// they are created.
     #[must_use]
     pub fn new(
         storage: Arc<dyn Repositories>,
@@ -102,6 +109,7 @@ impl AppState {
             storage,
             session_config,
             siwe_config,
+            game_hub: GameHub::new(),
         }
     }
 
@@ -122,6 +130,17 @@ impl AppState {
     pub fn siwe_config(&self) -> &SiweConfig {
         &self.siwe_config
     }
+
+    /// Returns the live-game hub: the registry of running game actors.
+    ///
+    /// The REST creation endpoints (#14) insert newly created games here; the
+    /// WebSocket endpoint (#15) resolves a game's [`GameHandle`](mcs_game::GameHandle)
+    /// from it. The returned reference borrows a cheaply cloneable handle to the
+    /// shared registry.
+    #[must_use]
+    pub fn game_hub(&self) -> &GameHub {
+        &self.game_hub
+    }
 }
 
 // `SessionConfig` deliberately has no `Debug` derive that exposes the secret
@@ -134,6 +153,7 @@ impl std::fmt::Debug for AppState {
             .field("storage", &"<dyn Repositories>")
             .field("session_config", &self.session_config)
             .field("siwe_config", &self.siwe_config)
+            .field("game_hub", &self.game_hub)
             .finish()
     }
 }
