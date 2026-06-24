@@ -12,17 +12,19 @@
 //!
 //! | Module            | Contents |
 //! |-------------------|----------|
-//! | [`ids`]           | Strongly-typed [`UserId`], [`GameId`], [`SeekId`] newtypes |
+//! | [`ids`]           | Strongly-typed [`UserId`], [`GameId`], [`SeekId`], [`ChallengeId`] newtypes |
 //! | [`evm_address`]   | Validated [`EvmAddress`] value object |
 //! | [`user`]          | [`User`] aggregate |
 //! | [`time_control`]  | [`TimeControl`] enum (real-time, correspondence, unlimited) |
 //! | [`clock`]         | [`Clock`] per-player time snapshot |
 //! | [`rating`]        | Glicko-2 [`Rating`] placeholder |
 //! | [`seek`]          | [`Seek`] matchmaking aggregate and [`ColorPreference`] |
+//! | [`challenge`]     | [`Challenge`] direct-challenge aggregate and [`ChallengeStatus`] |
 //! | [`game`]          | [`Game`] aggregate and [`GameLifecycle`] |
 //! | [`error`]         | [`DomainError`] validation error type |
 #![doc(html_root_url = "https://docs.rs/mcs-domain")]
 
+pub mod challenge;
 pub mod clock;
 pub mod error;
 pub mod evm_address;
@@ -33,11 +35,12 @@ pub mod seek;
 pub mod time_control;
 pub mod user;
 
+pub use challenge::{Challenge, ChallengeStatus};
 pub use clock::Clock;
 pub use error::DomainError;
 pub use evm_address::EvmAddress;
 pub use game::{Game, GameLifecycle};
-pub use ids::{GameId, SeekId, UserId};
+pub use ids::{ChallengeId, GameId, SeekId, UserId};
 pub use rating::Rating;
 pub use seek::{ColorPreference, Seek};
 pub use time_control::TimeControl;

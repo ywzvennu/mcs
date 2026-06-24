@@ -19,6 +19,7 @@
 //! | [`game`]         | [`GameRepo`] trait |
 //! | [`action_log`]   | [`ActionLogRepo`] trait and [`RecordedAction`] |
 //! | [`seek`]         | [`SeekRepo`] trait |
+//! | [`challenge`]    | [`ChallengeRepo`] trait |
 //! | [`session`]      | [`SessionRepo`] trait |
 //! | [`rating`]       | [`RatingRepo`] trait |
 //! | [`repositories`] | [`Repositories`] aggregate trait |
@@ -46,6 +47,7 @@
 #![doc(html_root_url = "https://docs.rs/mcs-storage")]
 
 pub mod action_log;
+pub mod challenge;
 pub mod error;
 pub mod game;
 pub mod rating;
@@ -57,6 +59,7 @@ pub mod sqlx_store;
 pub mod user;
 
 pub use action_log::{ActionLogRepo, RecordedAction};
+pub use challenge::ChallengeRepo;
 pub use error::{StorageError, StorageResult};
 pub use game::GameRepo;
 pub use rating::RatingRepo;

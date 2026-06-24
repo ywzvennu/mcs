@@ -30,7 +30,8 @@
 use async_trait::async_trait;
 use mcs_core::{Action, Color};
 use mcs_domain::{
-    ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Rating, Seek, SeekId, User, UserId,
+    Challenge, ChallengeId, ChallengeStatus, ColorPreference, EvmAddress, Game, GameId,
+    GameLifecycle, Rating, Seek, SeekId, User, UserId,
 };
 use sqlx::Row;
 use time::format_description::well_known::Rfc3339;
@@ -39,7 +40,7 @@ use time::OffsetDateTime;
 use crate::{
     action_log::{ActionLogRepo, RecordedAction},
     error::{StorageError, StorageResult},
-    GameRepo, RatingRepo, Repositories, SeekRepo, SessionRepo, UserRepo,
+    ChallengeRepo, GameRepo, RatingRepo, Repositories, SeekRepo, SessionRepo, UserRepo,
 };
 
 // ---------------------------------------------------------------------------
@@ -157,6 +158,29 @@ fn decode_color_pref(s: &str) -> Result<ColorPreference, StorageError> {
     }
 }
 
+/// Encodes a [`ChallengeStatus`] as its lowercase column discriminant.
+fn encode_challenge_status(status: ChallengeStatus) -> &'static str {
+    match status {
+        ChallengeStatus::Pending => "pending",
+        ChallengeStatus::Accepted => "accepted",
+        ChallengeStatus::Declined => "declined",
+        ChallengeStatus::Canceled => "canceled",
+    }
+}
+
+/// Decodes a [`ChallengeStatus`] from its column discriminant.
+fn decode_challenge_status(s: &str) -> Result<ChallengeStatus, StorageError> {
+    match s {
+        "pending" => Ok(ChallengeStatus::Pending),
+        "accepted" => Ok(ChallengeStatus::Accepted),
+        "declined" => Ok(ChallengeStatus::Declined),
+        "canceled" => Ok(ChallengeStatus::Canceled),
+        other => Err(StorageError::Serialization(format!(
+            "unknown challenge status {other:?}"
+        ))),
+    }
+}
+
 /// Encodes a [`Color`] as its lowercase column discriminant.
 fn encode_color(color: Color) -> &'static str {
     match color {
@@ -263,6 +287,31 @@ fn decode_clock(value: Option<i64>) -> Result<Option<u64>, StorageError> {
         .transpose()
 }
 
+/// The full column list used by every `challenges` read, kept beside
+/// [`challenge_from_row`] so the queries and the row mapping stay aligned.
+const CHALLENGE_SELECT: &str = "SELECT id, challenger, challenged, variant_id, time_control, \
+     rated, color_preference, status, game_id, created_at FROM challenges";
+
+/// Reconstructs a [`Challenge`] from a database row.
+fn challenge_from_row(row: &DbRow) -> Result<Challenge, StorageError> {
+    let game_id = match row.try_get::<Option<String>, _>("game_id")? {
+        Some(s) => Some(decode_id::<GameId>(&s)?),
+        None => None,
+    };
+    Ok(Challenge {
+        id: decode_id::<ChallengeId>(&row.try_get::<String, _>("id")?)?,
+        challenger: decode_id::<UserId>(&row.try_get::<String, _>("challenger")?)?,
+        challenged: decode_id::<UserId>(&row.try_get::<String, _>("challenged")?)?,
+        variant_id: row.try_get::<String, _>("variant_id")?,
+        time_control: decode_json(&row.try_get::<String, _>("time_control")?)?,
+        rated: decode_bool(row.try_get::<i64, _>("rated")?),
+        color_preference: decode_color_pref(&row.try_get::<String, _>("color_preference")?)?,
+        status: decode_challenge_status(&row.try_get::<String, _>("status")?)?,
+        game_id,
+        created_at: decode_time(&row.try_get::<String, _>("created_at")?)?,
+    })
+}
+
 /// Reconstructs a [`Seek`] from a database row.
 fn seek_from_row(row: &DbRow) -> Result<Seek, StorageError> {
     Ok(Seek {
@@ -361,6 +410,10 @@ impl Repositories for SqlxStorage {
     }
 
     fn seeks(&self) -> &dyn SeekRepo {
+        self
+    }
+
+    fn challenges(&self) -> &dyn ChallengeRepo {
         self
     }
 
@@ -661,6 +714,80 @@ impl SeekRepo for SqlxStorage {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(seek_from_row).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ChallengeRepo
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl ChallengeRepo for SqlxStorage {
+    async fn create(&self, challenge: &Challenge) -> StorageResult<()> {
+        sqlx::query(
+            "INSERT INTO challenges \
+             (id, challenger, challenged, variant_id, time_control, rated, color_preference, \
+              status, game_id, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(challenge.id.to_string())
+        .bind(challenge.challenger.to_string())
+        .bind(challenge.challenged.to_string())
+        .bind(challenge.variant_id.clone())
+        .bind(encode_json(&challenge.time_control)?)
+        .bind(encode_bool(challenge.rated))
+        .bind(encode_color_pref(challenge.color_preference))
+        .bind(encode_challenge_status(challenge.status))
+        .bind(challenge.game_id.map(|id| id.to_string()))
+        .bind(encode_time(challenge.created_at)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get(&self, id: ChallengeId) -> StorageResult<Challenge> {
+        let row = sqlx::query(&format!("{CHALLENGE_SELECT} WHERE id = $1"))
+            .bind(id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
+        challenge_from_row(&row)
+    }
+
+    async fn list_incoming(&self, user: UserId) -> StorageResult<Vec<Challenge>> {
+        let rows = sqlx::query(&format!(
+            "{CHALLENGE_SELECT} WHERE challenged = $1 AND status = $2 ORDER BY created_at DESC"
+        ))
+        .bind(user.to_string())
+        .bind(encode_challenge_status(ChallengeStatus::Pending))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(challenge_from_row).collect()
+    }
+
+    async fn list_outgoing(&self, user: UserId) -> StorageResult<Vec<Challenge>> {
+        let rows = sqlx::query(&format!(
+            "{CHALLENGE_SELECT} WHERE challenger = $1 AND status = $2 ORDER BY created_at DESC"
+        ))
+        .bind(user.to_string())
+        .bind(encode_challenge_status(ChallengeStatus::Pending))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(challenge_from_row).collect()
+    }
+
+    async fn update(&self, challenge: &Challenge) -> StorageResult<()> {
+        let affected = sqlx::query("UPDATE challenges SET status = $1, game_id = $2 WHERE id = $3")
+            .bind(encode_challenge_status(challenge.status))
+            .bind(challenge.game_id.map(|id| id.to_string()))
+            .bind(challenge.id.to_string())
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+
+        if affected == 0 {
+            return Err(StorageError::NotFound);
+        }
+        Ok(())
     }
 }
 

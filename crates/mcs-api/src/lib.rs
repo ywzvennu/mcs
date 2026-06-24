@@ -28,6 +28,11 @@
 //! | `GET /ws/game/{id}`  | upgrade to the live-game WebSocket ([`ws`]) |
 //! | `POST /seeks`        | post a seek; queue it or pair it into a game ([`rest`]) |
 //! | `DELETE /seeks/{id}` | cancel one of the caller's own seeks ([`rest`]) |
+//! | `POST /challenges`              | challenge a specific opponent ([`challenges`]) |
+//! | `GET /challenges`               | list the caller's pending challenges ([`challenges`]) |
+//! | `POST /challenges/{id}/accept`  | accept a challenge; create the game ([`challenges`]) |
+//! | `POST /challenges/{id}/decline` | decline a challenge ([`challenges`]) |
+//! | `DELETE /challenges/{id}`       | cancel one's own challenge ([`challenges`]) |
 //! | `GET /games/{id}`         | fetch a single game by id ([`rest`]) |
 //! | `GET /games`              | list recent games ([`rest`]) |
 //! | `GET /games/{id}/moves`   | full action log for a game, ordered by ply ([`history`]) |
@@ -61,6 +66,7 @@
 #![doc(html_root_url = "https://docs.rs/mcs-api")]
 
 pub mod auth;
+pub mod challenges;
 pub mod error;
 pub mod extract;
 pub mod history;
@@ -76,6 +82,7 @@ use std::sync::Arc;
 use axum::Router;
 use mcs_payments::RequirePaymentLayer;
 
+pub use challenges::{ChallengeDto, ChallengeListResponse, CreateChallengeRequest};
 pub use error::{ApiError, ApiResult};
 pub use extract::AuthUser;
 pub use history::{MoveEntry, MovesResponse};
@@ -126,6 +133,7 @@ pub fn router(state: AppState) -> Router {
         .merge(ws::ws_router())
         .merge(create_seeks)
         .merge(rest::cancel_seek_router())
+        .merge(challenges::challenges_router())
         .merge(rest::read_router())
         .merge(history::history_router())
         .with_state(state)

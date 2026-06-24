@@ -73,6 +73,11 @@ define_id!(
     SeekId
 );
 
+define_id!(
+    /// Identifies a direct challenge between two specific players.
+    ChallengeId
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

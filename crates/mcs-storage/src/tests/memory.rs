@@ -8,11 +8,15 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use mcs_domain::{EvmAddress, Game, GameId, GameLifecycle, Rating, Seek, SeekId, User, UserId};
+use mcs_domain::{
+    Challenge, ChallengeId, ChallengeStatus, EvmAddress, Game, GameId, GameLifecycle, Rating, Seek,
+    SeekId, User, UserId,
+};
 use time::OffsetDateTime;
 
 use crate::{
     action_log::{ActionLogRepo, RecordedAction},
+    challenge::ChallengeRepo,
     error::{StorageError, StorageResult},
     game::GameRepo,
     rating::RatingRepo,
@@ -228,6 +232,63 @@ impl SeekRepo for MemorySeekRepo {
 }
 
 // ---------------------------------------------------------------------------
+// MemoryChallengeRepo
+// ---------------------------------------------------------------------------
+
+/// In-memory [`ChallengeRepo`] backed by a `HashMap`.
+#[derive(Debug, Default)]
+pub(super) struct MemoryChallengeRepo {
+    challenges: Mutex<HashMap<ChallengeId, Challenge>>,
+}
+
+#[async_trait]
+impl ChallengeRepo for MemoryChallengeRepo {
+    async fn create(&self, challenge: &Challenge) -> StorageResult<()> {
+        let mut map = self.challenges.lock().expect("mutex poisoned");
+        if map.contains_key(&challenge.id) {
+            return Err(StorageError::Conflict(format!(
+                "challenge id {} already exists",
+                challenge.id
+            )));
+        }
+        map.insert(challenge.id, challenge.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: ChallengeId) -> StorageResult<Challenge> {
+        let map = self.challenges.lock().expect("mutex poisoned");
+        map.get(&id).cloned().ok_or(StorageError::NotFound)
+    }
+
+    async fn list_incoming(&self, user: UserId) -> StorageResult<Vec<Challenge>> {
+        let map = self.challenges.lock().expect("mutex poisoned");
+        Ok(map
+            .values()
+            .filter(|c| c.challenged == user && c.status == ChallengeStatus::Pending)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_outgoing(&self, user: UserId) -> StorageResult<Vec<Challenge>> {
+        let map = self.challenges.lock().expect("mutex poisoned");
+        Ok(map
+            .values()
+            .filter(|c| c.challenger == user && c.status == ChallengeStatus::Pending)
+            .cloned()
+            .collect())
+    }
+
+    async fn update(&self, challenge: &Challenge) -> StorageResult<()> {
+        let mut map = self.challenges.lock().expect("mutex poisoned");
+        if !map.contains_key(&challenge.id) {
+            return Err(StorageError::NotFound);
+        }
+        map.insert(challenge.id, challenge.clone());
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MemorySessionRepo
 // ---------------------------------------------------------------------------
 
@@ -343,6 +404,7 @@ pub(super) struct InMemoryRepos {
     games: MemoryGameRepo,
     actions: MemoryActionLogRepo,
     seeks: MemorySeekRepo,
+    challenges: MemoryChallengeRepo,
     sessions: MemorySessionRepo,
     ratings: MemoryRatingRepo,
 }
@@ -362,6 +424,10 @@ impl Repositories for InMemoryRepos {
 
     fn seeks(&self) -> &dyn SeekRepo {
         &self.seeks
+    }
+
+    fn challenges(&self) -> &dyn ChallengeRepo {
+        &self.challenges
     }
 
     fn sessions(&self) -> &dyn SessionRepo {

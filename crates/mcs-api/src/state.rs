@@ -10,13 +10,13 @@ use std::sync::Arc;
 
 use mcs_auth::SessionConfig;
 use mcs_cluster::{LocalRegistry, NodeInfo, NodeRegistry};
-use mcs_core::VariantRegistry;
-use mcs_domain::{GameId, GameLifecycle};
-use mcs_game::{recover_game, GameCompletionHook, GameHandle, Matchmaker};
+use mcs_core::{VariantOptions, VariantRegistry};
+use mcs_domain::{Game, GameId, GameLifecycle, TimeControl, UserId};
+use mcs_game::{recover_game, GameActor, GameCompletionHook, GameHandle, Matchmaker};
 use mcs_payments::{PaymentRequirements, PaymentVerifier};
 use mcs_storage::error::StorageError;
 use mcs_storage::{ActionLogRepo, GameRepo, RatingRepo, Repositories, SeekRepo, UserRepo};
-use time::Duration;
+use time::{Duration, OffsetDateTime};
 use tokio::sync::Mutex;
 
 use crate::error::ApiError;
@@ -508,6 +508,82 @@ impl AppState {
     #[must_use]
     pub fn completion_hook(&self) -> &Arc<dyn GameCompletionHook> {
         &self.completion_hook
+    }
+
+    /// Creates, persists, spawns, and registers a live game for two named
+    /// players, returning the persisted [`Game`] record.
+    ///
+    /// This is the shared game-creation path used by both matchmaking (a paired
+    /// seek) and direct challenges (an accepted challenge): both ultimately need
+    /// the same five steps, so they are written once here rather than duplicated.
+    ///
+    /// The steps are:
+    ///
+    /// 1. Instantiate a fresh [`GameSession`](mcs_core::GameSession) for
+    ///    `variant_id` from the [`variants`](Self::variants) registry, built with
+    ///    `options`. An unknown variant surfaces as a **400 Bad Request** via the
+    ///    [`GameError`](mcs_core::GameError) mapping.
+    /// 2. Build a [`Game`] record for `white` / `black` and persist it. Play
+    ///    starts immediately, so the record is created already
+    ///    [`Active`](GameLifecycle::Active) rather than
+    ///    [`Created`](GameLifecycle::Created).
+    /// 3. Spawn a [`GameActor`] over the same backing store
+    ///    ([`game_repo`](Self::game_repo), [`action_log`](Self::action_log),
+    ///    [`completion_hook`](Self::completion_hook), `time_control`).
+    /// 4. Insert the actor's handle into the [`game_hub`](Self::game_hub) so the
+    ///    WebSocket endpoint can find the live game by id.
+    /// 5. Return the persisted [`Game`].
+    ///
+    /// `options` carries the per-game variant options. Callers that have none
+    /// (matchmaking and direct challenges both currently fall into this category)
+    /// pass [`VariantOptions::default`]; it is stored on the record so the game
+    /// can be re-created on recovery via
+    /// `VariantRegistry::new_game(variant_id, &variant_options)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::BadRequest`] for an unknown variant and propagates any
+    /// [`StorageError`] from persisting the record (mapped through the standard
+    /// [`From`] conversion).
+    pub async fn create_and_spawn_game(
+        &self,
+        white: UserId,
+        black: UserId,
+        variant_id: &str,
+        time_control: TimeControl,
+        rated: bool,
+        options: VariantOptions,
+    ) -> Result<Game, ApiError> {
+        // 1. Instantiate a fresh session for the agreed variant.
+        let session = self.variants.new_game(variant_id, &options)?;
+
+        // 2. Build and persist the durable record, already `Active`.
+        let mut game = Game::new(
+            variant_id.to_owned(),
+            options,
+            white,
+            black,
+            time_control.clone(),
+            rated,
+            OffsetDateTime::now_utc(),
+        );
+        game.lifecycle = GameLifecycle::Active;
+        self.game_repo.create(&game).await?;
+
+        // 3. Spawn the actor over the same backing store and 4. register its
+        //    handle so the WebSocket endpoint can find the live game by id.
+        let handle = GameActor::spawn(
+            game.id,
+            session,
+            Arc::clone(&self.game_repo),
+            Arc::clone(&self.action_log),
+            Arc::clone(&self.completion_hook),
+            time_control,
+        );
+        self.game_hub.insert(game.id, handle);
+
+        // 5. Hand back the persisted record.
+        Ok(game)
     }
 
     /// Resolves the live [`GameHandle`] for `game_id`, rebuilding its actor from
