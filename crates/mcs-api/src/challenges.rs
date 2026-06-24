@@ -1,4 +1,4 @@
-//! REST endpoints for direct challenges.
+//! REST endpoints for direct challenges and game rematches.
 //!
 //! A direct challenge invites a **specific** opponent to a game on agreed terms,
 //! in contrast to a [`Seek`](mcs_domain::Seek), which floats in an open pool and
@@ -14,6 +14,7 @@
 //! | `POST /challenges/{id}/accept` | yes  | Accept (challenged only); creates the game. |
 //! | `POST /challenges/{id}/decline`| yes  | Decline (challenged only). |
 //! | `DELETE /challenges/{id}`      | yes  | Cancel (challenger only). |
+//! | `POST /games/{id}/rematch`     | yes  | Offer a rematch from a finished game. |
 //!
 //! # Colour assignment
 //!
@@ -23,6 +24,14 @@
 //! challenge id (its first byte's low bit) so the same challenge always yields
 //! the same colours — this needs no RNG and is reproducible in tests, while
 //! still being effectively unpredictable to the players.
+//!
+//! # Rematch colour convention
+//!
+//! `POST /games/{id}/rematch` creates a pre-filled challenge with
+//! `color_preference` set to the **opposite** of the side the caller just played:
+//! if the caller was White, `color_preference` is `Black` (so — when the opponent
+//! accepts — the caller will play Black in the next game, swapping sides). This
+//! matches the lichess convention: rematches automatically alternate colours.
 
 use axum::extract::{Path, State};
 use axum::routing::{delete, post};
@@ -32,8 +41,8 @@ use time::OffsetDateTime;
 
 use mcs_core::{Color, VariantOptions};
 use mcs_domain::{
-    Challenge, ChallengeId, ChallengeStatus, ColorPreference, EvmAddress, GameId, TimeControl,
-    UserId,
+    Challenge, ChallengeId, ChallengeStatus, ColorPreference, EvmAddress, Game, GameId,
+    GameLifecycle, TimeControl, UserId,
 };
 
 use crate::error::{ApiError, ApiResult};
@@ -151,6 +160,15 @@ pub fn challenges_router() -> Router<AppState> {
         .route("/challenges/{id}/accept", post(accept_challenge))
         .route("/challenges/{id}/decline", post(decline_challenge))
         .route("/challenges/{id}", delete(cancel_challenge))
+}
+
+/// Builds the rematch sub-router: the single `POST /games/{id}/rematch` route.
+///
+/// Kept on its own sub-router so it can be merged next to the other game routes
+/// in [`crate::router`] without mixing concerns with the challenge lifecycle
+/// routes above.
+pub fn rematch_game_router() -> Router<AppState> {
+    Router::new().route("/games/{id}/rematch", post(rematch_game))
 }
 
 // ---------------------------------------------------------------------------
@@ -314,9 +332,99 @@ async fn cancel_challenge(
     Ok(Json(challenge.into()))
 }
 
+/// `POST /games/{id}/rematch` — offer a rematch from a finished game.
+///
+/// Creates a [`Pending`](ChallengeStatus::Pending) [`Challenge`] pre-filled
+/// from the finished game's terms. The caller becomes the challenger; the other
+/// player in the original game is the challenged. The `color_preference` is set
+/// to the **opposite** of the side the caller played, so — if the opponent
+/// accepts — the colours automatically alternate from the previous game.
+///
+/// # Errors
+///
+/// - **404 Not Found** — no game with the given id.
+/// - **403 Forbidden** — the caller was not a player in that game.
+/// - **409 Conflict** — the game has not yet finished
+///   (`lifecycle != Finished`).
+async fn rematch_game(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(game_id): Path<GameId>,
+) -> ApiResult<Json<ChallengeDto>> {
+    // Load the game; a missing id is 404.
+    let game = state
+        .storage()
+        .games()
+        .get(game_id)
+        .await
+        .map_err(|err| match err {
+            mcs_storage::StorageError::NotFound => {
+                ApiError::NotFound(format!("no game: {game_id}"))
+            }
+            other => other.into(),
+        })?;
+
+    // Only a player in the original game may offer a rematch.
+    if user.user_id != game.white && user.user_id != game.black {
+        return Err(ApiError::Forbidden(
+            "only a player of the original game may offer a rematch".to_owned(),
+        ));
+    }
+
+    // A rematch only makes sense once the game has concluded.
+    if game.lifecycle != GameLifecycle::Finished {
+        return Err(ApiError::Conflict(format!(
+            "game {game_id} has not yet finished (lifecycle: {:?})",
+            game.lifecycle
+        )));
+    }
+
+    // Determine the opponent and the caller's color preference for the rematch.
+    // The convention: the caller requests the *opposite* side they just played,
+    // so colours automatically swap when the opponent accepts.
+    let (opponent, color_preference) = rematch_color(&game, user.user_id);
+
+    let challenge = Challenge::new(
+        user.user_id,
+        opponent,
+        game.variant_id,
+        game.time_control,
+        game.rated,
+        color_preference,
+        OffsetDateTime::now_utc(),
+    );
+    state.storage().challenges().create(&challenge).await?;
+
+    Ok(Json(challenge.into()))
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Resolves the opponent and the caller's colour preference for a rematch.
+///
+/// The caller requests the **opposite** side they just played:
+///
+/// - Caller was White → requests `Black` (the opponent was Black → `opponent = black`).
+/// - Caller was Black → requests `White` (the opponent was White → `opponent = white`).
+///
+/// This means that when the opponent accepts, colours automatically swap vs. the
+/// original game — exactly the lichess rematch convention.
+///
+/// # Panics
+///
+/// Never; the caller guarantees `user_id` is either `game.white` or `game.black`
+/// before calling this (enforced by the 403 check in [`rematch_game`]).
+fn rematch_color(game: &Game, user_id: UserId) -> (UserId, ColorPreference) {
+    if user_id == game.white {
+        // Caller was White last time; they want Black this time.
+        (game.black, ColorPreference::Black)
+    } else {
+        // Caller was Black last time; they want White this time.
+        (game.white, ColorPreference::White)
+    }
+}
 
 /// Loads a challenge by id, mapping a missing one to a **404 Not Found** with an
 /// id-bearing detail (rather than the generic storage not-found message).

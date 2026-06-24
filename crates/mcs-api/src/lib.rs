@@ -35,6 +35,7 @@
 //! | `DELETE /challenges/{id}`       | cancel one's own challenge ([`challenges`]) |
 //! | `GET /games/{id}`         | fetch a single game by id ([`rest`]) |
 //! | `GET /games`              | list recent games ([`rest`]) |
+//! | `POST /games/{id}/rematch`| offer a rematch from a finished game ([`challenges`]) |
 //! | `GET /games/{id}/moves`   | full action log for a game, ordered by ply ([`history`]) |
 //! | `GET /games/{id}/pgn`     | PGN export for board-style variants ([`history`]) |
 //! | `GET /leaderboard`        | top-rated players for a variant ([`rest`]) |
@@ -135,6 +136,7 @@ pub fn router(state: AppState) -> Router {
         .merge(rest::accept_seek_router())
         .merge(rest::cancel_seek_router())
         .merge(challenges::challenges_router())
+        .merge(challenges::rematch_game_router())
         .merge(rest::read_router())
         .merge(history::history_router())
         .with_state(state)
