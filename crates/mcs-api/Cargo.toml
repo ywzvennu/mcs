@@ -21,6 +21,20 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tokio.workspace = true
+time.workspace = true
+hex = "0.4"
+# EIP-4361 message parser, used to read back the exact nonce the wallet signed.
+# Matches the parser inside `mcs-auth` (default features only: no async EIP-1271).
+siwe = { version = "0.6.1", default-features = false }
 
 [dev-dependencies]
+# Drive the router in-process without binding a socket.
 tokio = { workspace = true }
+tower = { workspace = true }
+# The concrete SQLite-backed storage used as the integration-test backend.
+mcs-storage = { workspace = true, features = ["sqlite"] }
+# Local test signer: derive an address from a fixed private key and produce
+# EIP-191 personal-sign signatures over the SIWE challenge, mirroring a wallet.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+sha3 = "0.10"
