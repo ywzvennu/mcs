@@ -44,10 +44,17 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(address = %local_addr, "mcs-server listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serving HTTP")?;
+    // Serve with per-connection `ConnectInfo<SocketAddr>` so the per-IP rate
+    // limiter (#100) can read each request's socket peer address. When a trusted
+    // reverse proxy is configured (`[limits].trusted_proxy_header`), the real
+    // client IP is taken from that header instead.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("serving HTTP")?;
 
     // Graceful shutdown drained; leave the cluster registry promptly so survivors
     // notice this node's departure without waiting for its TTL to lapse.

@@ -124,3 +124,32 @@ max_ws_message_bytes = 1048576
 # plain HTTP for `hsts_max_age_secs` seconds, which is very hard to undo.
 # hsts = false
 # hsts_max_age_secs = 31536000  # 1 year (recommended production value)
+
+[limits]
+# Abuse protection: per-IP rate limiting and resource caps. All values shown
+# here are the built-in defaults.
+#
+# SCOPE: every limit is enforced PER NODE (per server process). Behind a load
+# balancer across N nodes the effective cluster-wide limit is up to N x limit;
+# cluster-wide limiting would need a shared store (e.g. Redis) and is left as
+# future work. A value of 0 for any rate or cap DISABLES it.
+
+# Per-IP request rate limits, in requests per minute. Each value is both the
+# sustained refill rate and the burst ceiling of a token bucket keyed by client
+# IP. Exceeding a limit returns 429 Too Many Requests with a Retry-After header.
+nonce_per_minute = 10    # GET  /auth/nonce
+verify_per_minute = 20   # POST /auth/verify
+create_per_minute = 30   # POST /seeks and POST /challenges
+
+# Concurrent live-game WebSocket connections on this node.
+max_ws_connections = 10000          # global cap across all users (0 = unlimited)
+max_ws_connections_per_user = 20    # per-user cap (0 = unlimited)
+
+# Simultaneous live games a single user may be a player in on this node.
+max_games_per_user = 50             # 0 = unlimited
+
+# Trust a reverse-proxy header for the real client IP (e.g. when behind nginx or
+# a cloud load balancer). The first IP in the header is used. Leave this UNSET
+# when the server is exposed directly: a client can otherwise spoof the header
+# to evade the per-IP rate limits.
+# trusted_proxy_header = "x-forwarded-for"

@@ -107,9 +107,23 @@ pub struct VerifyResponse {
 /// The returned router is generic over [`AppState`] and is merged into the
 /// top-level router by [`crate::router`].
 pub fn auth_router() -> Router<AppState> {
-    Router::new()
-        .route("/auth/nonce", get(nonce))
-        .route("/auth/verify", post(verify))
+    Router::new().merge(nonce_router()).merge(verify_router())
+}
+
+/// Builds the single-route `GET /auth/nonce` sub-router.
+///
+/// Isolated so [`crate::router`] can wrap *only* the nonce route in the per-IP
+/// rate-limit layer (#100) without also throttling unrelated routes.
+pub fn nonce_router() -> Router<AppState> {
+    Router::new().route("/auth/nonce", get(nonce))
+}
+
+/// Builds the single-route `POST /auth/verify` sub-router.
+///
+/// Isolated so [`crate::router`] can wrap *only* the verify route in its own
+/// per-IP rate-limit layer (#100).
+pub fn verify_router() -> Router<AppState> {
+    Router::new().route("/auth/verify", post(verify))
 }
 
 // ---------------------------------------------------------------------------
