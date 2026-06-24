@@ -474,6 +474,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcs-game"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "mcs-core",
+ "mcs-domain",
+ "mcs-storage",
+ "mcs-variant-standard",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mcs-observability"
 version = "0.1.0"
 dependencies = [
