@@ -181,7 +181,9 @@ async fn redirects_when_another_node_owns_the_game() {
     let white = create_user(&app, "0x1111111111111111111111111111111111111111").await;
     let black = create_user(&app, "0x2222222222222222222222222222222222222222").await;
     let game_id = spawn_game(&app, &white, &black).await;
-    let token = issue_session(app.state.session_config(), white.id).expect("mint token");
+    let token = issue_session(app.state.session_config(), white.id)
+        .expect("mint token")
+        .token;
 
     // Pin a two-node membership, then choose *this* node to be the non-owner of
     // the game so the handler must redirect to the rendezvous owner.
@@ -254,7 +256,9 @@ async fn serves_locally_when_this_node_owns_the_game() {
     let white = create_user(&app, "0x1111111111111111111111111111111111111111").await;
     let black = create_user(&app, "0x2222222222222222222222222222222222222222").await;
     let game_id = spawn_game(&app, &white, &black).await;
-    let token = issue_session(app.state.session_config(), white.id).expect("mint token");
+    let token = issue_session(app.state.session_config(), white.id)
+        .expect("mint token")
+        .token;
 
     // Pin a two-node membership and make *this* node the rendezvous owner, so the
     // handler serves locally and the handshake upgrades cleanly.
@@ -289,7 +293,9 @@ async fn single_node_default_serves_without_redirect() {
     let white = create_user(&app, "0x1111111111111111111111111111111111111111").await;
     let black = create_user(&app, "0x2222222222222222222222222222222222222222").await;
     let game_id = spawn_game(&app, &white, &black).await;
-    let token = issue_session(app.state.session_config(), white.id).expect("mint token");
+    let token = issue_session(app.state.session_config(), white.id)
+        .expect("mint token")
+        .token;
 
     // No `with_cluster`: the default single-node LocalRegistry owns every game.
     let addr = serve(app.state.clone()).await;

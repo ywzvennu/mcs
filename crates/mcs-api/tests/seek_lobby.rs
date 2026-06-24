@@ -72,7 +72,9 @@ async fn create_user(state: &AppState, address: &str) -> User {
 
 /// Mints a session token for `user`, exactly as `/auth/verify` would.
 fn token_for(state: &AppState, user: &User) -> String {
-    issue_session(state.session_config(), user.id).expect("mint token")
+    issue_session(state.session_config(), user.id)
+        .expect("mint token")
+        .token
 }
 
 async fn body_json(body: Body) -> Value {

@@ -8,6 +8,7 @@
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
+use time::OffsetDateTime;
 
 use mcs_auth::verify_session;
 use mcs_domain::{EvmAddress, UserId};
@@ -29,7 +30,10 @@ use crate::state::AppState;
 /// 2. Verify the JWT with [`verify_session`] against the server's
 ///    [`SessionConfig`](mcs_auth::SessionConfig). This checks the HS256
 ///    signature, the `exp` (expiry) claim, and the `iss` (issuer) claim.
-/// 3. On success, expose the token subject as a [`UserId`].
+/// 3. Check the revocation denylist (#101): a token whose `jti` has been
+///    revoked (via `POST /auth/logout`) is rejected with **401**, even though
+///    its signature and expiry are still valid.
+/// 4. On success, expose the token subject as a [`UserId`].
 ///
 /// # Address claim
 ///
@@ -38,12 +42,23 @@ use crate::state::AppState;
 /// so downstream handlers receive a fully-populated [`AuthUser`] without an
 /// extra lookup; the lookup uses the verified `user_id`, so the address is
 /// always the one bound to the authenticated account.
+///
+/// # Token identity
+///
+/// The validated token's `jti` and `exp` are carried through on the extracted
+/// value so a handler such as `POST /auth/logout` can revoke *this* token
+/// without re-decoding it. They are the verified claims, not client input.
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     /// The authenticated user's stable identifier (the JWT `sub` claim).
     pub user_id: UserId,
     /// The Ethereum address bound to the authenticated account.
     pub address: EvmAddress,
+    /// The presented token's unique id (`jti`), used to revoke it on logout.
+    pub jti: String,
+    /// The presented token's expiry, recorded alongside a revocation entry so
+    /// the denylist self-trims once the token would expire anyway.
+    pub token_expires_at: OffsetDateTime,
 }
 
 impl FromRequestParts<AppState> for AuthUser {
@@ -60,6 +75,26 @@ impl FromRequestParts<AppState> for AuthUser {
         // disclose which check failed.
         let claims = verify_session(state.session_config(), token)?;
         let user_id = claims.sub;
+
+        // Revocation check (#101): a logged-out token is denylisted by its `jti`.
+        // The signature/expiry above still pass for such a token, so this is the
+        // gate that enforces logout. A denylisted token fails with the same
+        // generic 401 as any other auth failure, so we never reveal *why*.
+        if state
+            .storage()
+            .revoked_tokens()
+            .is_revoked(&claims.jti)
+            .await
+            .map_err(|_| ApiError::Unauthorized("authentication failed".to_owned()))?
+        {
+            return Err(ApiError::Unauthorized("authentication failed".to_owned()));
+        }
+
+        // The token's `exp` is a Unix-second claim; recover it as an
+        // `OffsetDateTime` so a logout handler can stamp the revocation entry's
+        // trim point. A malformed value is treated as an auth failure.
+        let token_expires_at = OffsetDateTime::from_unix_timestamp(claims.exp)
+            .map_err(|_| ApiError::Unauthorized("authentication failed".to_owned()))?;
 
         // Resolve the address bound to this verified user. A token whose subject
         // no longer exists is treated as an authentication failure rather than a
@@ -78,6 +113,8 @@ impl FromRequestParts<AppState> for AuthUser {
         Ok(AuthUser {
             user_id,
             address: user.address,
+            jti: claims.jti,
+            token_expires_at,
         })
     }
 }

@@ -55,6 +55,14 @@
 //!   malformed fails with [`AuthError::InvalidToken`]. The `iss` claim is
 //!   validated against the configured issuer to prevent cross-service token
 //!   reuse.
+//! - **Revocation / logout.** A stateless JWT is otherwise valid until its
+//!   `exp`, so logging out cannot "un-issue" it here. Each token therefore
+//!   carries a unique `jti` ([`Claims::jti`], surfaced by [`issue_session`] via
+//!   [`IssuedSession`]). The integration layer (`mcs-storage`, `mcs-api`)
+//!   persists revoked `jti`s in a small **denylist** and checks it on every
+//!   authenticated request after [`verify_session`] succeeds. The denylist is
+//!   self-trimming: an entry need only live until the token's `exp`, after
+//!   which the token is rejected on expiry regardless.
 //!
 //! ## Cryptography
 //!
@@ -77,5 +85,5 @@ mod siwe_verify;
 
 pub use challenge::{generate_nonce, ChallengeParams};
 pub use error::AuthError;
-pub use session::{issue_session, verify_session, Claims, SessionConfig};
+pub use session::{issue_session, verify_session, Claims, IssuedSession, SessionConfig};
 pub use siwe_verify::{nonce_from_message, verify_siwe};

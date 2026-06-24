@@ -1,19 +1,39 @@
 //! Sign-In with Ethereum (SIWE) HTTP endpoints and session issuance.
 //!
-//! Two endpoints implement the wallet login handshake:
+//! Three endpoints implement the wallet login handshake and logout:
 //!
 //! | Method & path      | Purpose |
 //! |--------------------|---------|
 //! | `GET /auth/nonce`  | Issue a single-use SIWE challenge for an address. |
 //! | `POST /auth/verify`| Verify the signed challenge and mint a session JWT. |
+//! | `POST /auth/logout`| Revoke the caller's current session token. |
 //!
 //! The flow is: the client requests a nonce for its address, the wallet signs
 //! the returned challenge message, and the client posts `{ message, signature }`
 //! back. The server verifies the signature, atomically consumes the nonce to
 //! defeat replay, upserts the user, and returns a bearer token to be presented
 //! on subsequent requests (see [`AuthUser`](crate::AuthUser)).
+//!
+//! ## Session model & revocation (#101)
+//!
+//! Sessions are **stateless HS256 JWTs**: a token is self-validating (its
+//! signature, `exp`, and `iss` claims) and needs no per-request storage
+//! round-trip to *prove* it. That also means it cannot simply be "un-issued" —
+//! it is valid until `exp`.
+//!
+//! To support logout, each token carries a unique `jti` (JWT ID). The server
+//! keeps a small **persisted denylist** of revoked `jti`s
+//! ([`RevokedTokenRepo`](mcs_storage::RevokedTokenRepo)). `POST /auth/logout`
+//! adds the caller's current `jti` to it, and the
+//! [`AuthUser`](crate::AuthUser) extractor checks the denylist on every
+//! authenticated request — so a logged-out token is rejected immediately, on
+//! this and every node sharing the store, and the rejection survives a restart.
+//! Each entry is stored with the token's `exp` and is purged once that passes,
+//! since the token is rejected on expiry anyway; the denylist therefore stays
+//! bounded by the number of *unexpired* revoked tokens.
 
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -23,6 +43,7 @@ use mcs_auth::{generate_nonce, issue_session, nonce_from_message, verify_siwe, C
 use mcs_domain::{EvmAddress, UserId};
 
 use crate::error::{ApiError, ApiResult};
+use crate::extract::AuthUser;
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -102,12 +123,15 @@ pub struct VerifyResponse {
 // Router
 // ---------------------------------------------------------------------------
 
-/// Builds the `/auth` sub-router (nonce challenge + signature verification).
+/// Builds the `/auth` sub-router (nonce challenge + verify + logout).
 ///
 /// The returned router is generic over [`AppState`] and is merged into the
 /// top-level router by [`crate::router`].
 pub fn auth_router() -> Router<AppState> {
-    Router::new().merge(nonce_router()).merge(verify_router())
+    Router::new()
+        .merge(nonce_router())
+        .merge(verify_router())
+        .merge(logout_router())
 }
 
 /// Builds the single-route `GET /auth/nonce` sub-router.
@@ -124,6 +148,15 @@ pub fn nonce_router() -> Router<AppState> {
 /// per-IP rate-limit layer (#100).
 pub fn verify_router() -> Router<AppState> {
     Router::new().route("/auth/verify", post(verify))
+}
+
+/// Builds the single-route `POST /auth/logout` sub-router.
+///
+/// Logout requires authentication (it revokes *the caller's own* token), so it
+/// is not behind the per-IP login rate limiter; it is merged directly into the
+/// top-level router by [`crate::router`].
+pub fn logout_router() -> Router<AppState> {
+    Router::new().route("/auth/logout", post(logout))
 }
 
 // ---------------------------------------------------------------------------
@@ -219,12 +252,35 @@ async fn verify(
     }
 
     // Get-or-create the user for this address, then mint the session token.
+    // The issued token carries a unique `jti`, the key under which logout later
+    // revokes it; we only need the encoded token here.
     let user = state.storage().users().upsert_by_address(&address).await?;
-    let token = issue_session(state.session_config(), user.id)?;
+    let issued = issue_session(state.session_config(), user.id)?;
 
     Ok(Json(VerifyResponse {
-        token,
+        token: issued.token,
         user_id: user.id,
         address: user.address,
     }))
+}
+
+/// `POST /auth/logout` — revoke the caller's current session token.
+///
+/// Requires authentication: the [`AuthUser`] extractor validates the bearer
+/// token and hands the handler that token's verified `jti` and `exp`. We add
+/// the `jti` to the revocation denylist (stamped with the token's `exp` so the
+/// entry self-trims), after which the same token is rejected by the extractor
+/// on every subsequent request — on this and any node sharing the store, and
+/// across restarts.
+///
+/// Idempotent: logging out with an already-revoked token still succeeds with
+/// **204 No Content** (re-revoking the same `jti` is a no-op). A different,
+/// non-revoked token is unaffected.
+async fn logout(State(state): State<AppState>, user: AuthUser) -> ApiResult<StatusCode> {
+    state
+        .storage()
+        .revoked_tokens()
+        .revoke(&user.jti, user.token_expires_at)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }

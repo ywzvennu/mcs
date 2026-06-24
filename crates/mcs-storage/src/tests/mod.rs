@@ -19,16 +19,16 @@ use mcs_domain::{
     ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Seek, TimeControl, User, UserId,
 };
 use memory::{
-    InMemoryRepos, MemoryActionLogRepo, MemoryGameRepo, MemoryRatingRepo, MemorySeekRepo,
-    MemorySessionRepo, MemoryUserRepo,
+    InMemoryRepos, MemoryActionLogRepo, MemoryGameRepo, MemoryRatingRepo, MemoryRevokedTokenRepo,
+    MemorySeekRepo, MemorySessionRepo, MemoryUserRepo,
 };
 use time::OffsetDateTime;
 
 use mcs_domain::Rating;
 
 use crate::{
-    ActionLogRepo, GameRepo, RatingRepo, RecordedAction, Repositories, SeekRepo, SessionRepo,
-    StorageError, UserRepo,
+    ActionLogRepo, GameRepo, RatingRepo, RecordedAction, Repositories, RevokedTokenRepo, SeekRepo,
+    SessionRepo, StorageError, UserRepo,
 };
 
 // ---------------------------------------------------------------------------
@@ -453,6 +453,50 @@ async fn session_repo_nonce_per_address_is_independent() {
     // consuming for addr1 must not affect addr2
     assert!(repo.consume_nonce(&addr1, nonce).await.unwrap());
     assert!(repo.consume_nonce(&addr2, nonce).await.unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// RevokedTokenRepo — logout denylist
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn revoked_token_revoke_then_is_revoked() {
+    let repo = MemoryRevokedTokenRepo::default();
+    let expires = OffsetDateTime::now_utc() + time::Duration::hours(1);
+
+    assert!(!repo.is_revoked("jti-a").await.unwrap());
+    repo.revoke("jti-a", expires).await.unwrap();
+    assert!(repo.is_revoked("jti-a").await.unwrap());
+    // A different token is unaffected.
+    assert!(!repo.is_revoked("jti-b").await.unwrap());
+}
+
+#[tokio::test]
+async fn revoked_token_revoke_is_idempotent() {
+    let repo = MemoryRevokedTokenRepo::default();
+    let expires = OffsetDateTime::now_utc() + time::Duration::hours(1);
+    repo.revoke("jti", expires).await.unwrap();
+    // Revoking again must not error.
+    repo.revoke("jti", expires).await.unwrap();
+    assert!(repo.is_revoked("jti").await.unwrap());
+}
+
+#[tokio::test]
+async fn revoked_token_purge_expired_drops_only_elapsed() {
+    let repo = MemoryRevokedTokenRepo::default();
+    let now = OffsetDateTime::now_utc();
+    // One already-expired, one still-valid entry.
+    repo.revoke("old", now - time::Duration::hours(1))
+        .await
+        .unwrap();
+    repo.revoke("fresh", now + time::Duration::hours(1))
+        .await
+        .unwrap();
+
+    let removed = repo.purge_expired(now).await.unwrap();
+    assert_eq!(removed, 1, "only the expired entry is purged");
+    assert!(!repo.is_revoked("old").await.unwrap());
+    assert!(repo.is_revoked("fresh").await.unwrap());
 }
 
 // ---------------------------------------------------------------------------
