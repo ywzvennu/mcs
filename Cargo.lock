@@ -1147,6 +1147,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcs-payments"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "mcs-server"
 version = "0.1.0"
 dependencies = [
