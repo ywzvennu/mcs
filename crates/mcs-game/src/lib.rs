@@ -79,6 +79,15 @@
 //! # }
 //! ```
 //!
+//! ## Recovery
+//!
+//! Because every applied move is durably logged, a game in progress survives a
+//! server restart. [`recover_game`] rebuilds a live actor from storage: it
+//! recreates the variant's session, replays the action log to the current
+//! position, and spawns a *resumed* actor (see
+//! [`GameActor::spawn_resumed`]) seeded with the persisted ply and clocks — so
+//! play continues seamlessly and server downtime is never charged to a player.
+//!
 //! ## Scope
 //!
 //! This crate contains the session actor and its authoritative clock engine.
@@ -92,14 +101,16 @@ mod completion;
 mod error;
 mod event;
 pub mod matchmaking;
+mod recovery;
 mod time_source;
 
-pub use actor::{GameActor, GameHandle};
+pub use actor::{ClockRemaining, GameActor, GameHandle};
 pub use clock::ClockEngine;
 pub use completion::{GameCompletionHook, NoopHook};
 pub use error::GameSessionError;
 pub use event::GameEvent;
 pub use matchmaking::{Matchmaker, MatchmakingError, Pairing, SubmitOutcome};
+pub use recovery::{recover_game, RecoveryError};
 pub use time_source::{SystemTimeSource, TimeSource};
 
 #[cfg(test)]

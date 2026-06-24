@@ -1184,6 +1184,8 @@ dependencies = [
  "mcs-api",
  "mcs-auth",
  "mcs-core",
+ "mcs-domain",
+ "mcs-game",
  "mcs-observability",
  "mcs-payments",
  "mcs-storage",

@@ -12,6 +12,7 @@
 //! reply. The handle is the public API of this crate.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use mcs_core::{
     Action, ActionEffect, Color, EndReason, GameSession, GameStatus, Outcome, PlayerView,
@@ -39,6 +40,40 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// operation, plus at most one persistence call on game end), so a modest
 /// buffer keeps producers from blocking under normal load.
 const COMMAND_CHANNEL_CAPACITY: usize = 64;
+
+/// Each side's persisted remaining time, used to seed a resumed game's clock.
+///
+/// Passed to [`GameActor::spawn_resumed`] (typically built from a [`Game`]'s
+/// [`clock_white_ms`](mcs_domain::Game::clock_white_ms) /
+/// [`clock_black_ms`](mcs_domain::Game::clock_black_ms) snapshot fields), this
+/// is the durable "how much time was left" reading the recovered
+/// [`ClockEngine`] resumes from. Only [`TimeControl::RealTime`] consumes these
+/// values; correspondence and unlimited games ignore them (see
+/// [`ClockEngine::from_remaining`](crate::ClockEngine::from_remaining)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockRemaining {
+    /// White's remaining time as of the last persisted snapshot.
+    pub white: Duration,
+    /// Black's remaining time as of the last persisted snapshot.
+    pub black: Duration,
+}
+
+impl ClockRemaining {
+    /// Builds a [`ClockRemaining`] from the optional whole-millisecond fields of
+    /// a persisted [`Game`] snapshot.
+    ///
+    /// A `None` field (an untimed game, or a snapshot recorded before any move)
+    /// defaults to [`Duration::ZERO`]; for an untimed game the seeded values are
+    /// ignored anyway, since [`ClockEngine::from_remaining`](crate::ClockEngine::from_remaining)
+    /// builds no clock for [`TimeControl::Unlimited`].
+    #[must_use]
+    pub fn from_millis(white_ms: Option<u64>, black_ms: Option<u64>) -> Self {
+        Self {
+            white: Duration::from_millis(white_ms.unwrap_or(0)),
+            black: Duration::from_millis(black_ms.unwrap_or(0)),
+        }
+    }
+}
 
 /// A request sent from a [`GameHandle`] to the actor task.
 ///
@@ -382,6 +417,114 @@ impl GameActor {
         time_control: TimeControl,
         time: Box<dyn TimeSource>,
     ) -> GameHandle {
+        // A fresh game starts at ply 0 with both clocks at their full budget.
+        Self::spawn_inner(
+            game_id,
+            session,
+            repo,
+            action_log,
+            hook,
+            time_control,
+            None,
+            time,
+        )
+    }
+
+    /// Spawns an actor that **resumes** an in-progress game from durable state,
+    /// returning a handle to it.
+    ///
+    /// This is the recovery counterpart to [`spawn`](GameActor::spawn): the
+    /// caller has already rebuilt `session` to the current position (for example
+    /// by replaying the action log — see [`recover_game`](crate::recover_game)),
+    /// and supplies the persisted progress so the resumed actor continues
+    /// seamlessly rather than starting over:
+    ///
+    /// - `start_ply` seeds the next half-move index, so the first move recorded
+    ///   after recovery lands at the ply the log left off at (the game's
+    ///   [`ply`](mcs_domain::Game::ply), i.e. one past the last recorded `ply`)
+    ///   rather than colliding with `0`;
+    /// - `clock_remaining` seeds the [`ClockEngine`] from each side's persisted
+    ///   remaining time via [`ClockEngine::from_remaining`], and the side to
+    ///   move's clock is then started at the recovery instant.
+    ///
+    /// # Downtime is not charged
+    ///
+    /// The side-to-move clock resumes from its **persisted remaining as of
+    /// now**: the engine is seeded with the last durable remaining time and only
+    /// begins ticking at the recovery instant. Any wall-clock time the server
+    /// spent down between the last recorded move and this resume is therefore
+    /// *not* deducted from either player — a crash never costs a player time
+    /// they did not actually spend thinking.
+    // The resumed spawn mirrors `spawn` plus the two recovery seeds (ply and
+    // per-side remaining), so it is inherently parameter-heavy; the alternative
+    // (a wrapper struct) would only obscure the call site.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn spawn_resumed(
+        game_id: GameId,
+        session: Box<dyn GameSession>,
+        repo: Arc<dyn GameRepo>,
+        action_log: Arc<dyn ActionLogRepo>,
+        hook: Arc<dyn GameCompletionHook>,
+        time_control: TimeControl,
+        start_ply: u32,
+        clock_remaining: ClockRemaining,
+    ) -> GameHandle {
+        Self::spawn_resumed_with_time_source(
+            game_id,
+            session,
+            repo,
+            action_log,
+            hook,
+            time_control,
+            start_ply,
+            clock_remaining,
+            Box::new(SystemTimeSource),
+        )
+    }
+
+    /// Like [`spawn_resumed`](GameActor::spawn_resumed) but with an injected
+    /// [`TimeSource`], for deterministic recovery tests.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_resumed_with_time_source(
+        game_id: GameId,
+        session: Box<dyn GameSession>,
+        repo: Arc<dyn GameRepo>,
+        action_log: Arc<dyn ActionLogRepo>,
+        hook: Arc<dyn GameCompletionHook>,
+        time_control: TimeControl,
+        start_ply: u32,
+        clock_remaining: ClockRemaining,
+        time: Box<dyn TimeSource>,
+    ) -> GameHandle {
+        Self::spawn_inner(
+            game_id,
+            session,
+            repo,
+            action_log,
+            hook,
+            time_control,
+            Some((start_ply, clock_remaining)),
+            time,
+        )
+    }
+
+    /// The shared spawn path for both fresh and resumed games.
+    ///
+    /// `resume` is `None` for a fresh game (ply 0, full budget) and
+    /// `Some((start_ply, clock_remaining))` to seed the next ply and the
+    /// per-side remaining time of a recovered game.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_inner(
+        game_id: GameId,
+        session: Box<dyn GameSession>,
+        repo: Arc<dyn GameRepo>,
+        action_log: Arc<dyn ActionLogRepo>,
+        hook: Arc<dyn GameCompletionHook>,
+        time_control: TimeControl,
+        resume: Option<(u32, ClockRemaining)>,
+        time: Box<dyn TimeSource>,
+    ) -> GameHandle {
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
@@ -391,13 +534,22 @@ impl GameActor {
             events: events_tx.clone(),
         };
 
+        let next_ply = resume.as_ref().map_or(0, |(ply, _)| *ply);
+
         // An unlimited game has genuinely no clock to track or report; every
         // other time control gets an authoritative engine, started for the side
-        // to move while the game is still ongoing.
+        // to move while the game is still ongoing. A resumed game seeds the
+        // engine from its persisted per-side remaining time (so downtime is not
+        // charged), a fresh one from the full budget.
         let clock = if time_control.is_unlimited() {
             None
         } else {
-            let mut clock = ClockEngine::new(&time_control);
+            let mut clock = match &resume {
+                Some((_, remaining)) => {
+                    ClockEngine::from_remaining(&time_control, remaining.white, remaining.black)
+                }
+                None => ClockEngine::new(&time_control),
+            };
             if !session.status().is_finished() {
                 clock.start(session.to_move(), time.now());
             }
@@ -409,7 +561,7 @@ impl GameActor {
             session,
             repo,
             action_log,
-            next_ply: 0,
+            next_ply,
             game: None,
             hook,
             events: events_tx,

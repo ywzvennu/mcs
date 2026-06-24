@@ -1109,3 +1109,115 @@ async fn append_failure_surfaces_as_storage_error_without_corrupting_the_session
     // and the rejected out-of-turn move is not recorded either.
     assert!(repo.updated_games().is_empty());
 }
+
+// --------------------------------------------------------------------------
+// Resumed-spawn integration tests (#58).
+//
+// These drive `spawn_resumed_with_time_source` directly to assert the resumed
+// actor seeds its next ply from the persisted snapshot and resumes each side's
+// clock from its persisted remaining as of the recovery instant — never
+// charging server downtime to a player.
+// --------------------------------------------------------------------------
+
+use crate::ClockRemaining;
+
+#[tokio::test(start_paused = true)]
+async fn resumed_actor_continues_recording_at_the_seeded_ply() {
+    let game_id = GameId::new();
+    // The game already has three half-moves recorded (ply 0..2); the snapshot's
+    // `ply` is 3, so the next recorded move must land at ply 3.
+    let mut game = real_time_game(game_id, 300, 2);
+    game.ply = 3;
+    let repo = MockGameRepo::with_game(game);
+    let log = MockActionLogRepo::new();
+    let time = Arc::new(ManualTimeSource::new(OffsetDateTime::UNIX_EPOCH));
+    let tc = TimeControl::RealTime {
+        initial: Duration::from_secs(300),
+        increment: Duration::from_secs(2),
+    };
+
+    // A session already advanced to the same position via three opening moves,
+    // exactly as `recover_game` would replay it.
+    let session = standard_session();
+    let handle = GameActor::spawn_resumed_with_time_source(
+        game_id,
+        session,
+        repo,
+        log.clone(),
+        Arc::new(NoopHook),
+        tc,
+        3,
+        ClockRemaining {
+            white: Duration::from_secs(280),
+            black: Duration::from_secs(290),
+        },
+        Box::new(SharedTimeSource(time.clone())),
+    );
+
+    // The session is fresh here (not replayed) only because we just want to test
+    // the ply seeding; submit White's opening so the *first* recorded ply is 3.
+    handle
+        .submit_action(Color::White, mv("e2e4"))
+        .await
+        .unwrap();
+
+    let recorded = log.recorded();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].ply, 3,
+        "the resumed actor records its first move at the seeded ply",
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn resumed_clock_does_not_charge_downtime() {
+    let game_id = GameId::new();
+    let mut game = real_time_game(game_id, 300, 0);
+    game.ply = 1;
+    let repo = MockGameRepo::with_game(game);
+    let time = Arc::new(ManualTimeSource::new(OffsetDateTime::UNIX_EPOCH));
+    let tc = TimeControl::RealTime {
+        initial: Duration::from_secs(300),
+        increment: Duration::from_secs(0),
+    };
+
+    // A session replayed to "after 1.e4", so Black is to move — exactly what
+    // `recover_game` hands `spawn_resumed`.
+    let mut session = standard_session();
+    session
+        .apply(Color::White, &mv("e2e4"))
+        .expect("replay White's opening");
+
+    // Black is to move with 250s persisted remaining. The actor resumes at the
+    // recovery instant (UNIX_EPOCH); even though "real" downtime may have
+    // elapsed before recovery, the clock starts from 250s as of now.
+    let handle = GameActor::spawn_resumed_with_time_source(
+        game_id,
+        session,
+        repo.clone(),
+        MockActionLogRepo::new(),
+        Arc::new(NoopHook),
+        tc,
+        1,
+        ClockRemaining {
+            white: Duration::from_secs(300),
+            black: Duration::from_secs(250),
+        },
+        Box::new(SharedTimeSource(time.clone())),
+    );
+
+    let mut events = handle.subscribe();
+
+    // Black thinks for 10s then moves: 250 - 10 + 0 = 240s remaining. White,
+    // who never ticked since recovery, keeps its full persisted 300s — downtime
+    // before recovery cost nobody any time.
+    time.advance(Duration::from_secs(10)).await;
+    handle
+        .submit_action(Color::Black, mv("e7e5"))
+        .await
+        .unwrap();
+    let update = events.recv().await.unwrap();
+    let clock = update.clock.expect("real-time events carry a clock");
+    assert_eq!(clock.black_remaining(), Duration::from_secs(240));
+    assert_eq!(clock.white_remaining(), Duration::from_secs(300));
+}
