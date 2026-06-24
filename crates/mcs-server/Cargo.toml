@@ -1,0 +1,44 @@
+[package]
+name = "mcs-server"
+description = "The runnable MCS binary: loads layered configuration, wires storage, variants, auth, and the HTTP API together, and serves it with graceful shutdown."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "mcs-server"
+path = "src/main.rs"
+
+[dependencies]
+mcs-api.workspace = true
+mcs-storage.workspace = true
+mcs-core.workspace = true
+mcs-auth.workspace = true
+# This binary is the single place variants are registered at startup, which
+# keeps `mcs-api` variant-agnostic. The standard-chess variant is wired in here.
+mcs-variant-standard.workspace = true
+# `mcs-observability` is intentionally referenced by path: it is a leaf
+# observability crate not (yet) listed in `[workspace.dependencies]`, and adding
+# it there would mean editing the root manifest, which this crate must not do.
+mcs-observability = { path = "../mcs-observability" }
+
+axum.workspace = true
+tokio.workspace = true
+# Compose the observability Tower layers (request-id + HTTP trace) into a stack.
+tower.workspace = true
+figment.workspace = true
+serde.workspace = true
+tracing.workspace = true
+time.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+# Drive the assembled router in-process without binding a socket.
+tower = { workspace = true }

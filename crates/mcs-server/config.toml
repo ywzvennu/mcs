@@ -1,0 +1,51 @@
+# Sample MCS server configuration.
+#
+# Every key below is OPTIONAL: each one shown here is set to its built-in
+# default, so deleting this file entirely yields an identical configuration.
+# Copy it, adjust the values you care about, and place it next to the binary
+# (or point `MCS_CONFIG` at it).
+#
+# Precedence, lowest to highest:
+#   1. built-in defaults
+#   2. this file (config.toml, or $MCS_CONFIG)
+#   3. environment variables prefixed `MCS_` (nested keys use `__`,
+#      e.g. `MCS_SIWE__DOMAIN=chess.example`)
+
+# The address the HTTP server binds to.
+bind = "127.0.0.1:8080"
+
+# Storage connection string passed to SqlxStorage::connect.
+#   sqlite://mcs.db?mode=rwc  -> single file in the working dir, created on first run (dev default)
+#   sqlite::memory:           -> ephemeral, in-memory (tests only)
+#   postgres://user:pass@host/db -> requires the `postgres` storage feature
+database_url = "sqlite://mcs.db?mode=rwc"
+
+[log]
+# Output format: "pretty" (human-readable) or "json" (structured).
+format = "pretty"
+# Fallback tracing filter when RUST_LOG is unset. Accepts EnvFilter syntax,
+# e.g. "info" or "info,mcs_api=debug".
+level = "info"
+
+[session]
+# HMAC-SHA256 signing secret for session JWTs. REQUIRED in production: keep it
+# secret and high-entropy (>= 32 bytes). If omitted, the server generates a
+# random ephemeral secret at startup and logs a warning — every restart then
+# invalidates all existing sessions. Uncomment and set a stable value:
+# secret = "change-me-to-a-long-random-string"
+# Token lifetime in seconds (default: 86400 = 24 hours).
+ttl_secs = 86400
+# The `iss` (issuer) claim written into and required on session tokens.
+issuer = "mcs"
+
+[siwe]
+# Sign-In with Ethereum challenge parameters. `domain`/`uri` bind every issued
+# challenge to this deployment's identity.
+domain = "localhost:8080"
+uri = "http://localhost:8080"
+# EIP-155 chain ID the session is bound to (1 = Ethereum mainnet).
+chain_id = 1
+# Human-readable statement shown in the user's wallet (single line).
+statement = "Sign in to MCS."
+# How long a freshly issued nonce stays valid, in seconds (default: 600 = 10m).
+nonce_ttl_secs = 600
