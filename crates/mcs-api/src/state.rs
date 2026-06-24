@@ -10,6 +10,7 @@ use std::sync::Arc;
 use mcs_auth::SessionConfig;
 use mcs_core::VariantRegistry;
 use mcs_game::{GameCompletionHook, Matchmaker};
+use mcs_payments::{PaymentRequirements, PaymentVerifier};
 use mcs_storage::{GameRepo, RatingRepo, Repositories, SeekRepo, UserRepo};
 use time::Duration;
 
@@ -58,6 +59,61 @@ impl SiweConfig {
             statement,
             nonce_ttl,
         }
+    }
+}
+
+/// An optional x402 payment gate for game creation (#45).
+///
+/// When present in [`AppState`], the router applies a
+/// [`RequirePaymentLayer`](mcs_payments::RequirePaymentLayer) to the
+/// `POST /seeks` creation route only (see [`crate::rest::seek_router`]), so a
+/// caller must settle a payment before a seek is queued or paired into a game.
+/// When absent (the default), `POST /seeks` is free and the router behaves
+/// exactly as it did before payments were introduced.
+///
+/// This is the project's hook for charging per game: per the roadmap, RBC game
+/// creation is the resource that would be priced here, but the gate is variant-
+/// agnostic — it simply wraps the one creation route.
+#[derive(Clone)]
+pub struct PaymentGate {
+    /// The payment terms advertised in every `402 Payment Required` body. The
+    /// layer accepts a list so a deployment can offer multiple schemes/networks;
+    /// the config-driven path builds a single entry.
+    requirements: Vec<PaymentRequirements>,
+    /// The shared verifier. Development uses
+    /// [`MockVerifier`](mcs_payments::MockVerifier); production supplies a real
+    /// facilitator-backed [`PaymentVerifier`].
+    verifier: Arc<dyn PaymentVerifier>,
+}
+
+impl PaymentGate {
+    /// Builds a gate from the advertised `requirements` and a shared `verifier`.
+    #[must_use]
+    pub fn new(requirements: PaymentRequirements, verifier: Arc<dyn PaymentVerifier>) -> Self {
+        Self {
+            requirements: vec![requirements],
+            verifier,
+        }
+    }
+
+    /// Returns the advertised payment terms (sent in `402` bodies).
+    #[must_use]
+    pub fn requirements(&self) -> &[PaymentRequirements] {
+        &self.requirements
+    }
+
+    /// Returns the shared payment verifier.
+    #[must_use]
+    pub fn verifier(&self) -> &Arc<dyn PaymentVerifier> {
+        &self.verifier
+    }
+}
+
+impl std::fmt::Debug for PaymentGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaymentGate")
+            .field("requirements", &self.requirements)
+            .finish_non_exhaustive()
     }
 }
 
@@ -114,6 +170,13 @@ pub struct AppState {
     /// as `Arc<dyn GameCompletionHook>` so the actor stays decoupled from the
     /// concrete [`RatingUpdateHook`].
     completion_hook: Arc<dyn GameCompletionHook>,
+    /// The optional x402 payment gate for game creation (#45).
+    ///
+    /// `None` by default — `POST /seeks` is free and the router is unchanged.
+    /// When `Some`, [`crate::router`] wraps only the `POST /seeks` route in a
+    /// [`RequirePaymentLayer`](mcs_payments::RequirePaymentLayer). Configure it
+    /// with [`with_payment`](AppState::with_payment).
+    payment_gate: Option<PaymentGate>,
 }
 
 impl AppState {
@@ -173,7 +236,50 @@ impl AppState {
             matchmaker: Arc::new(Matchmaker::new(seek_repo)),
             game_repo,
             completion_hook,
+            // Payments are off by default: the router behaves exactly as before
+            // until a caller opts in via `with_payment`.
+            payment_gate: None,
         }
+    }
+
+    /// Enables the x402 payment gate on game creation, returning the modified
+    /// state (builder style).
+    ///
+    /// This does **not** change the `AppState::new` signature: state is created
+    /// payment-free, and a caller that wants gating chains `with_payment(..)`.
+    /// Once set, [`crate::router`] wraps the `POST /seeks` route — and only that
+    /// route — in a [`RequirePaymentLayer`](mcs_payments::RequirePaymentLayer):
+    /// an unpaid request gets `402 Payment Required` (with the `requirements` in
+    /// the body), and a request carrying a valid `X-PAYMENT` header proceeds to
+    /// the handler. All other routes remain free.
+    ///
+    /// Ordering: the payment layer wraps the route, so it runs **before** the
+    /// handler's [`AuthUser`](crate::AuthUser) extractor. An unpaid request is
+    /// therefore answered with `402` whether or not it is authenticated; a paid
+    /// request then still needs a valid session (`401` otherwise). This keeps
+    /// the payment challenge cheap to serve and independent of auth state.
+    ///
+    /// * `requirements` — the payment terms advertised in `402` bodies.
+    /// * `verifier` — the shared verifier; use
+    ///   [`MockVerifier`](mcs_payments::MockVerifier) in development and a real
+    ///   facilitator-backed [`PaymentVerifier`] in production.
+    #[must_use]
+    pub fn with_payment(
+        mut self,
+        requirements: PaymentRequirements,
+        verifier: Arc<dyn PaymentVerifier>,
+    ) -> Self {
+        self.payment_gate = Some(PaymentGate::new(requirements, verifier));
+        self
+    }
+
+    /// Returns the configured payment gate, if any.
+    ///
+    /// [`crate::router`] consults this to decide whether to wrap the creation
+    /// route in the x402 layer. `None` means game creation is free.
+    #[must_use]
+    pub fn payment_gate(&self) -> Option<&PaymentGate> {
+        self.payment_gate.as_ref()
     }
 
     /// Returns the shared storage handle.
@@ -261,6 +367,7 @@ impl std::fmt::Debug for AppState {
             .field("matchmaker", &self.matchmaker)
             .field("game_repo", &"<dyn GameRepo>")
             .field("completion_hook", &"<dyn GameCompletionHook>")
+            .field("payment_gate", &self.payment_gate)
             .finish()
     }
 }

@@ -49,3 +49,36 @@ chain_id = 1
 statement = "Sign in to MCS."
 # How long a freshly issued nonce stays valid, in seconds (default: 600 = 10m).
 nonce_ttl_secs = 600
+
+[payments]
+# x402 payment gating for game creation (POST /seeks). DISABLED by default: the
+# server boots free and `POST /seeks` behaves exactly as before. This is the
+# hook where, per the roadmap, RBC (and other) game creation would be charged.
+#
+# When `enabled = true`, the server advertises the terms below in a
+# `402 Payment Required` response to any unpaid `POST /seeks`; a client that
+# retries with a valid `X-PAYMENT` header (a settled x402 payment) is let
+# through to create the seek/game. Only the creation route is gated — reads,
+# seek cancellation, auth, and the WebSocket stay free.
+enabled = false
+# The x402 scheme. The canonical value is "exact" (transfer exactly the amount).
+scheme = "exact"
+# Target network, e.g. "base" or "base-sepolia".
+network = "base-sepolia"
+# Accepted payment-token contract address (default: USDC on Base Sepolia).
+asset = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+# On-chain address that must RECEIVE the payment. The default is the zero
+# address (an invalid recipient) on purpose: enabling payments without setting
+# a real `pay_to` is almost certainly a mistake. Set this before going live.
+pay_to = "0x0000000000000000000000000000000000000000"
+# Maximum token amount accepted, in the asset's smallest unit
+# (e.g. "10000" = 0.01 USDC at 6 decimals).
+max_amount_required = "10000"
+# Human-readable description shown to the payer before paying.
+description = "Create an MCS game."
+# Maximum seconds a signed authorization may stay pending before it expires.
+max_timeout_seconds = 300
+# Which verifier to build. "mock" is the DEV-ONLY MockVerifier: it performs no
+# cryptographic or on-chain checks and must NEVER be used in production. The
+# production path is a facilitator-backed verifier (see mcs_payments docs).
+verifier = "mock"

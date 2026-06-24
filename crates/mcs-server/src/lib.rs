@@ -94,7 +94,26 @@ pub fn build_state(cfg: &Config, storage: Arc<SqlxStorage>, session_secret: Vec<
         cfg.nonce_ttl(),
     );
 
-    AppState::new(storage, Arc::new(variants), session_config, siwe_config)
+    let state = AppState::new(storage, Arc::new(variants), session_config, siwe_config);
+
+    // Optionally gate game creation behind an x402 payment (#45). Off by default:
+    // when `[payments].enabled` is false the state is returned untouched and
+    // `POST /seeks` stays free. When enabled, build the requirements + verifier
+    // and attach the gate; the API then wraps only the creation route. This is
+    // the hook where, per the roadmap, RBC game creation would be charged.
+    if cfg.payments.enabled {
+        let requirements = cfg.payments.requirements("/seeks");
+        let verifier = cfg.payments.build_verifier();
+        tracing::info!(
+            scheme = %cfg.payments.scheme,
+            network = %cfg.payments.network,
+            pay_to = %cfg.payments.pay_to,
+            "x402 payment gate enabled on game creation"
+        );
+        state.with_payment(requirements, verifier)
+    } else {
+        state
+    }
 }
 
 /// Assembles the complete application [`Router`] from an [`AppState`].

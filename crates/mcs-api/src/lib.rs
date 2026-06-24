@@ -40,7 +40,8 @@
 //! game record in the shared [`GameHub`]. The REST game endpoints (#14, [`rest`])
 //! create those games — pairing seeks, spawning actors, and registering them in
 //! the same hub — and read them back over plain HTTP. Game creation is isolated
-//! on [`rest::seek_router`] so a future x402 payment middleware can wrap only it.
+//! on [`rest::create_seek_router`] so the x402 payment middleware (#45) wraps
+//! only it when an [`AppState`] carries a [`PaymentGate`](state::PaymentGate).
 //! All HTTP handlers return [`ApiResult<T>`] so the error contract applies
 //! everywhere.
 //!
@@ -67,7 +68,10 @@ pub mod state;
 pub mod variants;
 pub mod ws;
 
+use std::sync::Arc;
+
 use axum::Router;
+use mcs_payments::RequirePaymentLayer;
 
 pub use error::{ApiError, ApiResult};
 pub use extract::AuthUser;
@@ -77,7 +81,7 @@ pub use rest::{
     CancelSeekResponse, CreateSeekRequest, CreateSeekResponse, GameDto, GameListResponse,
     LeaderboardEntry, LeaderboardQuery, LeaderboardResponse, ProfileDto, RatingDto,
 };
-pub use state::{AppState, SiweConfig};
+pub use state::{AppState, PaymentGate, SiweConfig};
 pub use variants::{VariantDto, VariantListResponse};
 pub use ws::{ClientMessage, ServerMessage, PROTOCOL_VERSION};
 
@@ -89,15 +93,35 @@ pub use ws::{ClientMessage, ServerMessage, PROTOCOL_VERSION};
 ///
 /// As later issues land, their sub-routers are merged in here; the auth routes
 /// and the [`AuthUser`] extractor are unaffected by those additions.
+///
+/// # x402 payment gate (#45)
+///
+/// When the [`AppState`] carries a [`PaymentGate`](state::PaymentGate) (set via
+/// [`AppState::with_payment`]), the `POST /seeks` creation route — and only that
+/// route — is wrapped in a
+/// [`RequirePaymentLayer`](mcs_payments::RequirePaymentLayer): an unpaid request
+/// receives `402 Payment Required` with the advertised terms, while a request
+/// carrying a valid `X-PAYMENT` header proceeds to the handler. When no gate is
+/// configured (the default), creation is free and this router is byte-for-byte
+/// the one that shipped before payments existed.
 pub fn router(state: AppState) -> Router {
+    // Game creation is gated when (and only when) a payment gate is configured.
+    // The layer wraps the one-route `create_seek_router` so cancellation, reads,
+    // auth, and the WebSocket all stay free.
+    let create_seeks = match state.payment_gate() {
+        Some(gate) => rest::create_seek_router().layer(RequirePaymentLayer::new(
+            gate.requirements().to_vec(),
+            Arc::clone(gate.verifier()),
+        )),
+        None => rest::create_seek_router(),
+    };
+
     Router::new()
         .merge(variants::variants_router())
         .merge(auth::auth_router())
         .merge(ws::ws_router())
-        // Game creation (`POST /seeks`) is isolated on its own sub-router so a
-        // future x402 payment middleware can wrap only it; see
-        // [`rest::seek_router`].
-        .merge(rest::seek_router())
+        .merge(create_seeks)
+        .merge(rest::cancel_seek_router())
         .merge(rest::read_router())
         .with_state(state)
 }
