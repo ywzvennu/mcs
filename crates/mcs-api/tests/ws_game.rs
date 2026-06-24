@@ -113,9 +113,12 @@ async fn spawn_game(app: &TestApp, white: &User, black: &User) -> mcs_domain::Ga
         .expect("persist game record");
 
     // The actor needs a bare `GameRepo`; hand it the same SqlxStorage the API
-    // reads through, so both see one in-memory database.
+    // reads through, so both see one in-memory database. The completion hook is
+    // the state's own rating updater, so a game finished over the socket also
+    // updates ratings.
     let repo: Arc<dyn GameRepo> = app.storage.clone();
-    let handle = GameActor::spawn(game_id, session, repo, time_control);
+    let hook = app.state.completion_hook().clone();
+    let handle = GameActor::spawn(game_id, session, repo, hook, time_control);
     app.state.game_hub().insert(game_id, handle);
 
     game_id

@@ -22,6 +22,7 @@ use time::OffsetDateTime;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::clock::ClockEngine;
+use crate::completion::GameCompletionHook;
 use crate::error::GameSessionError;
 use crate::event::GameEvent;
 use crate::time_source::{SystemTimeSource, TimeSource};
@@ -256,6 +257,9 @@ pub struct GameActor {
     game_id: GameId,
     session: Box<dyn GameSession>,
     repo: Arc<dyn GameRepo>,
+    /// Invoked once, after the finished result is persisted, so subsystems such
+    /// as ratings or payouts can react without the actor depending on them.
+    hook: Arc<dyn GameCompletionHook>,
     events: broadcast::Sender<GameEvent>,
     /// The authoritative clock for this game, or `None` for an unlimited game
     /// (which has no clock to track, never flags, and reports no clock in its
@@ -305,17 +309,23 @@ impl GameActor {
     /// every broadcast [`GameEvent`], and — for real-time and correspondence
     /// games — ends the game with a [`EndReason::Timeout`] result if the side
     /// to move flags, even if that player simply stops moving.
+    ///
+    /// `hook` is run exactly once when the game finishes, immediately after the
+    /// final record is persisted (see [`GameCompletionHook`]). Callers that want
+    /// no completion side effect pass an `Arc<NoopHook>`.
     #[must_use]
     pub fn spawn(
         game_id: GameId,
         session: Box<dyn GameSession>,
         repo: Arc<dyn GameRepo>,
+        hook: Arc<dyn GameCompletionHook>,
         time_control: TimeControl,
     ) -> GameHandle {
         Self::spawn_with_time_source(
             game_id,
             session,
             repo,
+            hook,
             time_control,
             Box::new(SystemTimeSource),
         )
@@ -330,6 +340,7 @@ impl GameActor {
         game_id: GameId,
         session: Box<dyn GameSession>,
         repo: Arc<dyn GameRepo>,
+        hook: Arc<dyn GameCompletionHook>,
         time_control: TimeControl,
         time: Box<dyn TimeSource>,
     ) -> GameHandle {
@@ -359,6 +370,7 @@ impl GameActor {
             game_id,
             session,
             repo,
+            hook,
             events: events_tx,
             clock,
             time,
@@ -569,20 +581,32 @@ impl GameActor {
         Ok(effect)
     }
 
-    /// Loads the [`Game`] record, marks it finished with `outcome`, and writes
-    /// it back. Idempotent: persists at most once per actor.
+    /// Loads the [`Game`] record, marks it finished with `outcome`, writes it
+    /// back, and runs the completion hook. Idempotent: persists — and runs the
+    /// hook — at most once per actor.
+    ///
+    /// The hook is invoked only after the record is durably persisted, so a
+    /// consumer (e.g. a rating updater) sees the finished game in storage. It
+    /// runs on this same actor task; the [`GameCompletionHook`] contract forbids
+    /// it from panicking, so a hook failure never disturbs the game.
     async fn persist_finished(&mut self, outcome: Outcome) -> Result<(), GameSessionError> {
         if self.persisted {
             return Ok(());
         }
 
         let mut game: Game = self.repo.get(self.game_id).await?;
-        game.finish(outcome, OffsetDateTime::now_utc());
+        game.finish(outcome.clone(), OffsetDateTime::now_utc());
         debug_assert_eq!(game.lifecycle, GameLifecycle::Finished);
         self.repo.update(&game).await?;
         self.persisted = true;
 
         tracing::info!(game_id = %self.game_id, "game finished and persisted");
+
+        // Notify subsystems (ratings, payouts, …) of the result. This runs after
+        // the write succeeds so the hook can rely on the finished record being
+        // visible, and after `persisted` is set so it fires exactly once.
+        self.hook.on_finished(&game, &outcome).await;
+
         Ok(())
     }
 }
