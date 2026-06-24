@@ -1,10 +1,13 @@
-//! Serde wire types for the standard-chess variant.
+//! Serde wire types for the standard-chess and Chess960 variants.
 //!
-//! These strongly typed structs are what the variant serializes through the
+//! These strongly typed structs are what both variants serialize through the
 //! type-erased [`Action`](mcs_core::Action),
 //! [`PlayerView`](mcs_core::PlayerView), and [`Event`](mcs_core::Event)
 //! newtypes from `mcs-core`. Keeping them in one place documents the exact JSON
-//! shape that crosses the variant boundary.
+//! shape that crosses the variant boundary. The two variants share these types
+//! and differ only in how castling moves are spelled in the UCI strings —
+//! classic (`e1g1`) for `standard`, king-to-rook (`e1h1`) for `chess960`. See
+//! the [crate docs](crate) for details.
 
 use mcs_core::{Color, GameStatus, Outcome};
 use serde::{Deserialize, Serialize};

@@ -1,15 +1,17 @@
-//! The standard-chess [`GameSession`] implementation, backed by `shakmaty`.
+//! The chess [`GameSession`] implementation, backed by `cozy-chess`.
+//!
+//! A single [`StandardGame`] type serves both ordinary chess and Chess960; they
+//! differ only in their start position and in how castling moves are spelled on
+//! the wire (see [`CastlingUci`]).
 
 use std::str::FromStr;
 
+use cozy_chess::util::{display_san_move, display_uci_move, parse_uci_move};
+use cozy_chess::{Board, GameStatus as BoardStatus, Move};
 use mcs_core::{
     Action, ActionEffect, Color, EndReason, Event, GameError, GameSession, GameStatus, Outcome,
     PlayerView,
 };
-use shakmaty::fen::Fen;
-use shakmaty::san::SanPlus;
-use shakmaty::uci::UciMove;
-use shakmaty::{Chess, EnPassantMode, Position};
 
 use crate::wire::{StandardAction, StandardEvent, StandardView};
 
@@ -18,78 +20,205 @@ use crate::wire::{StandardAction, StandardEvent, StandardView};
 /// Re-exported publicly as [`crate::STANDARD_VARIANT_ID`].
 pub(crate) const VARIANT_ID: &str = "standard";
 
-/// A single in-progress game of standard chess.
+/// The variant identifier for Chess960.
 ///
-/// Wraps a [`shakmaty::Chess`] position — the source of truth for all rules —
-/// plus the bookkeeping that shakmaty does not track for us: a pending draw
-/// offer and the final outcome once the game is over (so resignations and draw
-/// agreements, which are not board states, can be recorded).
+/// Re-exported publicly as [`crate::CHESS960_VARIANT_ID`].
+pub(crate) const CHESS960_VARIANT_ID: &str = "chess960";
+
+/// How castling moves are spelled in the UCI strings that cross the wire.
+///
+/// `cozy-chess` always represents castling internally as *king-captures-own-rook*
+/// (Fischer-random / FRC style, e.g. `e1h1` for White kingside). That is correct
+/// for Chess960, where the rook can start on any file, but standard clients and
+/// the existing protocol expect the classic two-square king move (`e1g1`,
+/// `e1c1`, `e8g8`, `e8c8`). This enum selects which spelling the variant accepts
+/// from, and renders to, clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CastlingUci {
+    /// Classic UCI: castling is the two-square king move (`e1g1` / `e1c1`).
+    ///
+    /// Used by the `standard` variant so existing clients are unaffected.
+    Classic,
+    /// UCI_960 / king-to-rook: castling targets the rook's square (`e1h1`).
+    ///
+    /// Used by the `chess960` variant, where the rook file is not fixed.
+    KingToRook,
+}
+
+/// A single in-progress game of standard chess or Chess960.
+///
+/// Wraps a [`cozy_chess::Board`] — the source of truth for all rules — plus the
+/// bookkeeping the board does not track for us: which variant this is (for the
+/// reported id and the castling-UCI convention), a pending draw offer, and the
+/// final outcome once the game is over (so resignations and draw agreements,
+/// which are not board states, can be recorded).
 #[derive(Debug)]
 pub struct StandardGame {
-    /// The underlying chess position. shakmaty enforces all move legality.
-    position: Chess,
+    /// The underlying board. `cozy-chess` enforces all move legality.
+    board: Board,
+    /// The id this session reports (`"standard"` or `"chess960"`).
+    variant_id: &'static str,
+    /// How castling moves are spelled on the wire for this variant.
+    castling_uci: CastlingUci,
     /// The color with an outstanding, unanswered draw offer, if any.
     draw_offer: Option<Color>,
     /// The recorded outcome once the game has finished. `None` while ongoing.
     ///
     /// Board-driven endings (checkmate, stalemate, insufficient material) can
-    /// always be re-derived from `position`, but resignation and draw-agreement
+    /// always be re-derived from `board`, but resignation and draw-agreement
     /// endings cannot, so the outcome is stored explicitly the moment the game
     /// ends for any reason.
     outcome: Option<Outcome>,
 }
 
 impl Default for StandardGame {
-    /// Creates a game from the standard initial position.
+    /// Creates a standard game from the standard initial position.
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl StandardGame {
-    /// Creates a new game from the standard initial chess position.
+    /// Creates a new standard-chess game from the initial position.
     #[must_use]
     pub fn new() -> Self {
+        Self::from_board(Board::default(), VARIANT_ID, CastlingUci::Classic)
+    }
+
+    /// Creates a new Chess960 game from the standard initial position.
+    ///
+    /// For an arbitrary starting layout use [`StandardGame::chess960`] or
+    /// [`StandardGame::from_fen`].
+    #[must_use]
+    pub fn new_chess960() -> Self {
+        Self::from_board(
+            Board::default(),
+            CHESS960_VARIANT_ID,
+            CastlingUci::KingToRook,
+        )
+    }
+
+    /// Creates a Chess960 game from a Scharnagl start-position number.
+    ///
+    /// `position` is the standard 0..=959 Chess960 numbering; position `518` is
+    /// the classical chess setup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GameError::InvalidActionPayload`] if `position` is `>= 960`.
+    pub fn chess960(position: u32) -> Result<Self, GameError> {
+        if position >= 960 {
+            return Err(GameError::InvalidActionPayload(format!(
+                "chess960 position must be in 0..=959, got {position}"
+            )));
+        }
+        Ok(Self::from_board(
+            Board::chess960_startpos(position),
+            CHESS960_VARIANT_ID,
+            CastlingUci::KingToRook,
+        ))
+    }
+
+    /// Creates a Chess960 game from a starting FEN.
+    ///
+    /// Accepts both ordinary FEN (`KQkq`-style castling fields) and Shredder /
+    /// X-FEN (`HAha`-style, naming the rook files) — the latter is unambiguous
+    /// for the off-centre rook placements Chess960 allows, so it is tried as a
+    /// fallback when the standard interpretation does not validate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GameError::InvalidActionPayload`] if `fen` is not a valid
+    /// position under either interpretation.
+    pub fn from_fen(fen: &str) -> Result<Self, GameError> {
+        // Try standard FEN first; fall back to Shredder FEN, which is the
+        // unambiguous form for arbitrary Chess960 castling rights.
+        let board = Board::from_fen(fen, false)
+            .or_else(|_| Board::from_fen(fen, true))
+            .map_err(|e| GameError::InvalidActionPayload(format!("invalid FEN '{fen}': {e}")))?;
+        Ok(Self::from_board(
+            board,
+            CHESS960_VARIANT_ID,
+            CastlingUci::KingToRook,
+        ))
+    }
+
+    /// Internal constructor shared by every entry point.
+    fn from_board(board: Board, variant_id: &'static str, castling_uci: CastlingUci) -> Self {
         Self {
-            position: Chess::default(),
+            board,
+            variant_id,
+            castling_uci,
             draw_offer: None,
             outcome: None,
         }
     }
 
-    /// Maps a `shakmaty` color onto the core [`Color`].
-    fn from_shakmaty_color(color: shakmaty::Color) -> Color {
+    /// Maps a `cozy-chess` color onto the core [`Color`].
+    fn from_cc_color(color: cozy_chess::Color) -> Color {
         match color {
-            shakmaty::Color::White => Color::White,
-            shakmaty::Color::Black => Color::Black,
+            cozy_chess::Color::White => Color::White,
+            cozy_chess::Color::Black => Color::Black,
         }
     }
 
     /// Renders the current position as a FEN string.
     fn fen(&self) -> String {
-        // `EnPassantMode::Legal` only records an en-passant square when a
-        // capture is actually possible, matching how engines and the FIDE rules
-        // present a position.
-        Fen::from_position(self.position.clone(), EnPassantMode::Legal).to_string()
+        // The default `Display` produces standard (FIDE) FEN with `KQkq`-style
+        // castling fields, which is what clients expect for both variants.
+        self.board.to_string()
     }
 
-    /// Returns every legal move in the current position as UCI strings.
+    /// Renders a single move as a wire UCI string under this variant's
+    /// castling convention.
+    fn render_uci(&self, mv: Move) -> String {
+        match self.castling_uci {
+            // Classic UCI: translate cozy-chess's king-to-rook castle back to the
+            // two-square king move (`e1h1` -> `e1g1`).
+            CastlingUci::Classic => display_uci_move(&self.board, mv).to_string(),
+            // Chess960: keep the king-to-rook spelling cozy-chess emits.
+            CastlingUci::KingToRook => mv.to_string(),
+        }
+    }
+
+    /// Parses a wire UCI string into a board move under this variant's castling
+    /// convention.
+    fn parse_uci(&self, uci: &str) -> Result<Move, GameError> {
+        let parsed = match self.castling_uci {
+            // Classic UCI: translate `e1g1`/`e1c1` to cozy-chess's king-to-rook
+            // form against the current position.
+            CastlingUci::Classic => parse_uci_move(&self.board, uci),
+            // Chess960 already uses king-to-rook UCI, so parse it directly.
+            CastlingUci::KingToRook => Move::from_str(uci),
+        };
+        parsed.map_err(|e| GameError::InvalidActionPayload(format!("invalid UCI '{uci}': {e}")))
+    }
+
+    /// Returns every legal move in the current position as wire UCI strings.
     fn legal_moves_uci(&self) -> Vec<String> {
-        self.position
-            .legal_moves()
-            .iter()
-            .map(|m| UciMove::from_move(m, self.position.castles().mode()).to_string())
-            .collect()
+        let mut moves = Vec::new();
+        self.board.generate_moves(|piece_moves| {
+            for mv in piece_moves {
+                moves.push(self.render_uci(mv));
+            }
+            false
+        });
+        moves
+    }
+
+    /// Whether the side to move is currently in check.
+    fn is_check(&self) -> bool {
+        !self.board.checkers().is_empty()
     }
 
     /// Builds the full, perfect-information view of the current position.
     ///
     /// The same view is returned to both players and to spectators, because
-    /// standard chess hides no information.
+    /// neither standard chess nor Chess960 hides any information.
     fn build_view(&self) -> StandardView {
         StandardView {
             fen: self.fen(),
-            side_to_move: Self::from_shakmaty_color(self.position.turn()),
+            side_to_move: Self::from_cc_color(self.board.side_to_move()),
             // Once the game is over there are no further legal moves to offer.
             legal_moves_uci: if self.outcome.is_some() {
                 Vec::new()
@@ -97,65 +226,105 @@ impl StandardGame {
                 self.legal_moves_uci()
             },
             status: self.status(),
-            check: self.position.is_check(),
+            check: self.is_check(),
             draw_offer: self.draw_offer,
         }
     }
 
-    /// Derives the board-driven outcome of the current position, if the game
-    /// has reached an automatic termination (checkmate, stalemate, or
-    /// insufficient material).
+    /// Derives the board-driven outcome of the current position, if the game has
+    /// reached an automatic termination (checkmate, stalemate, insufficient
+    /// material, or the fifty-move rule).
     ///
-    /// shakmaty's [`Position::outcome`] reports these by inspecting the board;
-    /// rule-based draws that depend on move history (threefold repetition, the
-    /// fifty-move rule) are not auto-claimed for a standard `Chess` position and
-    /// would surface as explicit draw claims, which are out of scope here.
+    /// [`Board::status`] reports `Won` only when the side to move has no legal
+    /// moves *and* is in check — i.e. it has just been checkmated — so the winner
+    /// is always the side that did not just move. A `Drawn` status from
+    /// cozy-chess is stalemate (no moves, not in check) or the fifty-move rule.
+    ///
+    /// cozy-chess does **not** itself terminate on insufficient material, so we
+    /// detect dead positions explicitly and report them as a draw, matching FIDE
+    /// rules and the previous engine's behaviour.
     fn board_outcome(&self) -> Option<Outcome> {
-        let shakmaty_outcome = self.position.outcome()?;
-        Some(match shakmaty_outcome.winner() {
-            Some(winner) => {
-                // A decisive board ending in standard chess is always checkmate;
-                // shakmaty only reports a winner when the side to move is mated.
-                Outcome::win(Self::from_shakmaty_color(winner), EndReason::Checkmate)
+        match self.board.status() {
+            BoardStatus::Won => {
+                // The side to move is mated, so the *other* side delivered it.
+                let winner = Self::from_cc_color(!self.board.side_to_move());
+                Some(Outcome::win(winner, EndReason::Checkmate))
             }
-            None => {
-                // A drawn board ending is either stalemate or insufficient
-                // material. Distinguish them so the end reason is precise.
-                let reason = if self.position.is_stalemate() {
-                    EndReason::Stalemate
+            BoardStatus::Drawn => {
+                let reason = if self.board.halfmove_clock() >= 100 {
+                    EndReason::FiftyMoveRule
                 } else {
-                    EndReason::InsufficientMaterial
+                    // The only other `Drawn` cause cozy-chess reports is a side
+                    // to move with no legal moves and not in check: stalemate.
+                    EndReason::Stalemate
                 };
-                Outcome::draw(reason)
+                Some(Outcome::draw(reason))
             }
-        })
+            BoardStatus::Ongoing => {
+                // cozy-chess keeps dead positions `Ongoing`; terminate them here.
+                self.is_insufficient_material()
+                    .then(|| Outcome::draw(EndReason::InsufficientMaterial))
+            }
+        }
+    }
+
+    /// Whether the position is a dead draw by insufficient mating material.
+    ///
+    /// Covers the FIDE "impossibility of checkmate" cases that can never be won
+    /// by either side regardless of play: king versus king, king and a single
+    /// minor piece (bishop or knight) versus king, and king and bishop versus
+    /// king and bishop with both bishops on the same colour squares. Positions
+    /// with any pawn, rook, or queen — or with enough minor pieces to force mate
+    /// — are not dead and return `false`.
+    fn is_insufficient_material(&self) -> bool {
+        let board = &self.board;
+        // Any pawn, rook, or queen means mate is still possible.
+        if !(board.pieces(cozy_chess::Piece::Pawn)
+            | board.pieces(cozy_chess::Piece::Rook)
+            | board.pieces(cozy_chess::Piece::Queen))
+        .is_empty()
+        {
+            return false;
+        }
+
+        let knights = board.pieces(cozy_chess::Piece::Knight);
+        let bishops = board.pieces(cozy_chess::Piece::Bishop);
+        let minors = knights.len() + bishops.len();
+
+        match minors {
+            // K vs K.
+            0 => true,
+            // K + single minor vs K: cannot force mate.
+            1 => true,
+            // K + B vs K + B is dead only if the bishops are same-coloured.
+            2 if knights.is_empty() => {
+                let dark = (bishops & cozy_chess::BitBoard::DARK_SQUARES).len();
+                // Both bishops dark, or both light.
+                dark == 0 || dark == 2
+            }
+            _ => false,
+        }
     }
 
     /// Applies a UCI move on behalf of `player`, returning the resulting effect.
     fn apply_move(&mut self, player: Color, uci: &str) -> Result<ActionEffect, GameError> {
         // It must be the mover's turn.
-        if Self::from_shakmaty_color(self.position.turn()) != player {
+        if Self::from_cc_color(self.board.side_to_move()) != player {
             return Err(GameError::NotYourTurn);
         }
 
         // Parse the UCI string, then validate it against the current position.
-        let parsed: UciMove = UciMove::from_str(uci)
-            .map_err(|e| GameError::InvalidActionPayload(format!("invalid UCI '{uci}': {e}")))?;
-        let chess_move = parsed
-            .to_move(&self.position)
-            .map_err(|_| GameError::IllegalAction)?;
+        let mv = self.parse_uci(uci)?;
+        if !self.board.is_legal(mv) {
+            return Err(GameError::IllegalAction);
+        }
 
-        // Capture SAN before playing, then play the (legal) move. `play`
-        // consumes the position, so swap in a temporary default and restore the
-        // advanced position afterwards.
-        let san = SanPlus::from_move(self.position.clone(), &chess_move).to_string();
-        let played_uci =
-            UciMove::from_move(&chess_move, self.position.castles().mode()).to_string();
-        let previous = std::mem::take(&mut self.position);
-        self.position = previous
-            .play(&chess_move)
-            // The move was validated as legal above, so this cannot fail.
-            .map_err(|_| GameError::IllegalAction)?;
+        // Capture SAN and the canonical wire UCI *before* playing, since both are
+        // rendered against the pre-move position.
+        let san = display_san_move(&self.board, mv).to_string();
+        let played_uci = self.render_uci(mv);
+        // The move was validated as legal above, so this cannot fail.
+        self.board.play(mv);
 
         // A move always supersedes any pending draw offer.
         self.draw_offer = None;
@@ -191,11 +360,11 @@ impl StandardGame {
 
 impl GameSession for StandardGame {
     fn variant_id(&self) -> &'static str {
-        VARIANT_ID
+        self.variant_id
     }
 
     fn to_move(&self) -> Color {
-        Self::from_shakmaty_color(self.position.turn())
+        Self::from_cc_color(self.board.side_to_move())
     }
 
     fn status(&self) -> GameStatus {

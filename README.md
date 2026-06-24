@@ -1,11 +1,12 @@
 # MCS — Modular Chess Server
 
 MCS is a modular, open-source chess server backend written in Rust. It is
-designed to host multiple chess variants under a single, uniform API. Standard
-chess is the first supported variant; Reconnaissance Blind Chess (RBC) and
-additional variants are planned. The server is structured as a Cargo workspace
-of focused crates so that variant implementations, storage backends, and
-transport layers can evolve independently.
+designed to host multiple chess variants under a single, uniform API. It ships
+three variants today — **standard** chess, **Chess960** (Fischer Random), and
+**Reconnaissance Blind Chess (RBC)** — and more are planned. The server is
+structured as a Cargo workspace of focused crates so that variant
+implementations, storage backends, and transport layers can evolve
+independently.
 
 > **Status:** Early development. The workspace skeleton and core abstractions
 > are in place; most crates are stubs that will be filled in incrementally.
@@ -18,7 +19,7 @@ transport layers can evolve independently.
 crates/
   mcs-core              # Variant-agnostic engine abstraction (GameSession trait,
                         #   type-erased actions/views, VariantRegistry)
-  mcs-variant-standard  # Standard chess adapter built on shakmaty
+  mcs-variant-standard  # Standard chess + Chess960 adapter built on cozy-chess
   mcs-domain            # Shared entities and value objects (GameId, PlayerId, …)
   mcs-storage           # Repository traits + sqlx implementation
                         #   (SQLite by default, PostgreSQL pluggable)
@@ -36,7 +37,7 @@ crates/
 | Async runtime   | [tokio](https://tokio.rs)                               |
 | HTTP / WS       | [axum](https://github.com/tokio-rs/axum) (REST + WS)   |
 | Persistence     | [sqlx](https://github.com/launchbadger/sqlx) — SQLite (default), PostgreSQL (pluggable) |
-| Chess logic     | [shakmaty](https://github.com/niklasf/shakmaty) for standard chess |
+| Chess logic     | [cozy-chess](https://github.com/analog-hors/cozy-chess) (MIT) for standard chess and Chess960 |
 | Authentication  | SIWE (Sign-In with Ethereum) — EVM wallet-based auth    |
 | Payments        | x402 HTTP-native payments (planned)                     |
 | Serialization   | serde / serde_json                                      |
@@ -82,3 +83,9 @@ link an issue before submitting a PR.
 MCS is dual-licensed under **MIT OR Apache-2.0**. You may choose either
 license. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE)
 for the full texts.
+
+Every dependency is permissively licensed (the chess engine is
+[cozy-chess](https://github.com/analog-hors/cozy-chess), MIT), so the
+**assembled server binary is also MIT OR Apache-2.0** — there is no GPL
+copyleft obligation. `cargo deny check` enforces this with no license
+exceptions.
