@@ -45,7 +45,7 @@ async fn app_with_cors(cors: CorsSettings) -> axum::Router {
     let state = mcs_server::build_state(&cfg, storage, b"test-secret-bytes-not-for-prod".to_vec())
         .expect("build state");
     let cors_layer = cfg.cors.build_cors_layer();
-    router_with_cors(state, Some(cors_layer))
+    router_with_cors(state, Some(cors_layer), None)
 }
 
 // ── Allowed-origin tests ─────────────────────────────────────────────────────

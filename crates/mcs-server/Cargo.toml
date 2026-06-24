@@ -49,10 +49,11 @@ axum.workspace = true
 tokio.workspace = true
 # Compose the observability Tower layers (request-id + HTTP trace) into a stack.
 tower.workspace = true
-# CORS middleware for browser clients (#98). `tower-http` is a workspace dep with
-# the `cors` feature already enabled; referenced here so the composition root can
-# build and apply `CorsLayer` from `[cors]` config.
-tower-http.workspace = true
+# Security headers, request timeout, and body-size limiting (#99). The
+# workspace dep enables `trace`, `cors`, and `request-id`; `set-header`,
+# `timeout`, and `limit` are needed here and enabled on this crate's own
+# reference (the root manifest must not be edited per project rules).
+tower-http = { workspace = true, features = ["set-header", "timeout", "limit"] }
 figment.workspace = true
 serde.workspace = true
 tracing.workspace = true

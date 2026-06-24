@@ -44,6 +44,43 @@
 //! | `cors.allow_credentials` | `MCS_CORS__ALLOW_CREDENTIALS` | `false`          |
 //! | `cors.max_age_secs` | `MCS_CORS__MAX_AGE_SECS` | `3600` (1h)               |
 //! | `cors.allow_any_origin` | `MCS_CORS__ALLOW_ANY_ORIGIN` | `false`            |
+//! | `http.request_timeout_secs` | `MCS_HTTP__REQUEST_TIMEOUT_SECS` | `30`       |
+//! | `http.max_body_bytes` | `MCS_HTTP__MAX_BODY_BYTES` | `65536` (64 KiB)       |
+//! | `http.max_ws_message_bytes` | `MCS_HTTP__MAX_WS_MESSAGE_BYTES` | `1048576` (1 MiB) |
+//! | `http.hsts` | `MCS_HTTP__HSTS` | `false`                                        |
+//! | `http.hsts_max_age_secs` | `MCS_HTTP__HSTS_MAX_AGE_SECS` | `31536000` (1y) |
+//!
+//! # HTTP hardening (#99)
+//!
+//! A suite of security headers is injected into **every** HTTP response by a
+//! `SetResponseHeader` layer applied inside the router:
+//!
+//! | Header | Value |
+//! |--------|-------|
+//! | `X-Content-Type-Options` | `nosniff` |
+//! | `X-Frame-Options` | `DENY` |
+//! | `Content-Security-Policy` | `default-src 'none'; frame-ancestors 'none'` |
+//! | `Referrer-Policy` | `no-referrer` |
+//! | `Strict-Transport-Security` | *only when `[http].hsts = true`* |
+//!
+//! **HSTS note**: `Strict-Transport-Security` must only be sent over TLS.
+//! Enable it by setting `[http].hsts = true` **after** placing a TLS
+//! terminator (e.g. nginx, a cloud load balancer, or Caddy) in front of this
+//! server. Never enable it while the server terminates plain HTTP connections —
+//! the browser will then refuse to connect over plain HTTP for
+//! `hsts_max_age_secs` seconds, which is very hard to undo.
+//!
+//! A **request timeout** (`[http].request_timeout_secs`, default 30 s) aborts
+//! handlers that take too long and returns 408/504 to the client, protecting
+//! the server from slow-loris style attacks and runaway handlers.
+//!
+//! A **body-size limit** (`[http].max_body_bytes`, default 64 KiB) rejects
+//! oversized JSON request bodies with **413 Payload Too Large** before the
+//! handler even runs, protecting memory against upload attacks.
+//!
+//! A **WebSocket message-size limit** (`[http].max_ws_message_bytes`, default
+//! 1 MiB) is set on each upgraded WebSocket connection to prevent a rogue
+//! client from sending arbitrarily large frames.
 //!
 //! # CORS (#98)
 //!
@@ -157,6 +194,8 @@ pub struct Config {
     pub cluster: ClusterSettings,
     /// Cross-Origin Resource Sharing configuration for browser clients (#98).
     pub cors: CorsSettings,
+    /// HTTP hardening limits and security-header settings (#99).
+    pub http: HttpSettings,
 }
 
 /// Logging configuration.
@@ -328,6 +367,90 @@ pub struct ClusterSettings {
     pub heartbeat_interval_secs: u64,
 }
 
+/// HTTP hardening limits and security-header settings (#99).
+///
+/// All values have safe, conservative defaults: the server ships with security
+/// headers enabled, a 30-second request timeout, and a 64 KiB body limit.
+/// Operators only need to touch this section to raise limits or to enable HSTS
+/// (which **requires** a TLS terminator in front of the server — see the
+/// module-level notes).
+///
+/// # `config.toml` sample
+///
+/// ```toml
+/// [http]
+/// # How long a handler may run before the server returns 408/504.
+/// request_timeout_secs = 30
+///
+/// # Maximum JSON / form body accepted before the handler is called.
+/// # Bodies exceeding this size are rejected with 413 Payload Too Large.
+/// max_body_bytes = 65536
+///
+/// # Maximum WebSocket message size (single frame or reassembled message).
+/// # Frames exceeding this size are rejected and the socket is closed.
+/// max_ws_message_bytes = 1048576
+///
+/// # Enable Strict-Transport-Security ONLY behind a TLS terminator.
+/// # Never enable while the server itself handles plain HTTP connections.
+/// # hsts = false
+/// # hsts_max_age_secs = 31536000  # 1 year
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpSettings {
+    /// How long a handler may run before the server considers the request
+    /// timed out and returns a timeout error, in seconds.
+    ///
+    /// Default: `30`.
+    pub request_timeout_secs: u64,
+
+    /// Maximum accepted request body size, in bytes. Bodies larger than this
+    /// are rejected with **413 Payload Too Large** before the handler runs.
+    ///
+    /// The default (65 536 = 64 KiB) is generous for JSON API payloads and
+    /// tight enough to protect against trivial memory-exhaustion attacks.
+    pub max_body_bytes: usize,
+
+    /// Maximum WebSocket message size, in bytes. A single message that exceeds
+    /// this limit (whether a single frame or a fragmented multi-frame message)
+    /// is rejected and the socket is closed by the server.
+    ///
+    /// Default: `1 048 576` (1 MiB).
+    pub max_ws_message_bytes: usize,
+
+    /// Whether to include `Strict-Transport-Security` in every response.
+    ///
+    /// **Only enable behind a TLS terminator.** When the server itself handles
+    /// plain HTTP connections, setting this to `true` causes browsers to refuse
+    /// to connect over plain HTTP for [`hsts_max_age_secs`](Self::hsts_max_age_secs)
+    /// seconds — which is very hard to undo.
+    ///
+    /// Default: `false`.
+    pub hsts: bool,
+
+    /// The `max-age` directive of the `Strict-Transport-Security` header, in
+    /// seconds. Only consulted when [`hsts`](Self::hsts) is `true`.
+    ///
+    /// Default: `31 536 000` (1 year — the recommended production value).
+    pub hsts_max_age_secs: u64,
+}
+
+impl Default for HttpSettings {
+    fn default() -> Self {
+        Self {
+            request_timeout_secs: 30,
+            // 64 KiB: generous for JSON API payloads, tight against memory attacks.
+            max_body_bytes: 64 * 1024,
+            // 1 MiB: enough for a complete board state JSON with commentary.
+            max_ws_message_bytes: 1024 * 1024,
+            // HSTS is off by default: it must only be enabled behind TLS.
+            hsts: false,
+            // 1 year: the standard production HSTS max-age.
+            hsts_max_age_secs: 365 * 24 * 60 * 60,
+        }
+    }
+}
+
 /// Cross-Origin Resource Sharing (CORS) configuration for browser clients (#98).
 ///
 /// Controls which origins can make cross-origin HTTP requests to the API. By
@@ -433,6 +556,7 @@ impl Default for Config {
             payments: PaymentSettings::default(),
             cluster: ClusterSettings::default(),
             cors: CorsSettings::default(),
+            http: HttpSettings::default(),
         }
     }
 }
@@ -567,6 +691,39 @@ impl CorsSettings {
         }
 
         layer
+    }
+}
+
+impl HttpSettings {
+    /// Returns the request timeout as a [`StdDuration`].
+    #[must_use]
+    pub fn request_timeout(&self) -> StdDuration {
+        StdDuration::from_secs(self.request_timeout_secs)
+    }
+
+    /// Builds the `Strict-Transport-Security` header value string when
+    /// [`hsts`](Self::hsts) is enabled, or `None` when it is disabled.
+    ///
+    /// The value uses `max-age=<secs>; includeSubDomains` — the recommended
+    /// production form. `preload` is omitted because registering a domain for
+    /// browser preload lists is an operator decision made outside the server.
+    ///
+    /// # Why `None` when disabled?
+    ///
+    /// Sending an HSTS header over a plain-HTTP connection is dangerous: the
+    /// browser will then refuse to connect over plain HTTP for `max-age` seconds,
+    /// which is very hard to undo. The default is therefore to omit the header
+    /// entirely, and only emit it when the operator has explicitly opted in.
+    #[must_use]
+    pub fn hsts_header_value(&self) -> Option<String> {
+        if self.hsts {
+            Some(format!(
+                "max-age={}; includeSubDomains",
+                self.hsts_max_age_secs
+            ))
+        } else {
+            None
+        }
     }
 }
 
@@ -714,6 +871,93 @@ mod tests {
         assert_eq!(cfg.session.issuer, "mcs");
         assert!(cfg.session.secret.is_none());
         assert_eq!(cfg.siwe.chain_id, 1);
+    }
+
+    // ── HttpSettings tests (#99) ─────────────────────────────────────────────
+
+    #[test]
+    fn http_settings_defaults_are_sensible() {
+        let cfg = Config::default();
+        // 30-second default timeout.
+        assert_eq!(cfg.http.request_timeout_secs, 30);
+        // 64 KiB body limit.
+        assert_eq!(cfg.http.max_body_bytes, 64 * 1024);
+        // 1 MiB WS message limit.
+        assert_eq!(cfg.http.max_ws_message_bytes, 1024 * 1024);
+        // HSTS off by default (unsafe to send over plain HTTP).
+        assert!(!cfg.http.hsts, "hsts must be off by default");
+        // 1-year HSTS max-age when enabled.
+        assert_eq!(cfg.http.hsts_max_age_secs, 365 * 24 * 60 * 60);
+    }
+
+    #[test]
+    fn http_settings_hsts_header_value_when_disabled() {
+        let settings = HttpSettings::default();
+        assert!(
+            settings.hsts_header_value().is_none(),
+            "hsts is off by default; no header value should be produced"
+        );
+    }
+
+    #[test]
+    fn http_settings_hsts_header_value_when_enabled() {
+        let settings = HttpSettings {
+            hsts: true,
+            hsts_max_age_secs: 31_536_000,
+            ..HttpSettings::default()
+        };
+        let value = settings
+            .hsts_header_value()
+            .expect("hsts enabled must produce a value");
+        assert!(
+            value.contains("max-age=31536000"),
+            "hsts header must contain max-age; got {value:?}"
+        );
+        assert!(
+            value.contains("includeSubDomains"),
+            "hsts header should include includeSubDomains; got {value:?}"
+        );
+    }
+
+    #[test]
+    fn http_settings_request_timeout_converts() {
+        let settings = HttpSettings {
+            request_timeout_secs: 60,
+            ..HttpSettings::default()
+        };
+        assert_eq!(
+            settings.request_timeout(),
+            StdDuration::from_secs(60),
+            "request_timeout() must return the configured seconds as a Duration"
+        );
+    }
+
+    /// The `[http]` section parses from TOML, overriding only the keys given.
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn http_section_parses_from_toml() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                r#"
+                    [http]
+                    request_timeout_secs = 60
+                    max_body_bytes = 131072
+                    max_ws_message_bytes = 2097152
+                    hsts = true
+                    hsts_max_age_secs = 63072000
+                "#,
+            )?;
+            let cfg = Config::load().expect("load config with [http]");
+            assert_eq!(cfg.http.request_timeout_secs, 60);
+            assert_eq!(cfg.http.max_body_bytes, 131_072);
+            assert_eq!(cfg.http.max_ws_message_bytes, 2_097_152);
+            assert!(cfg.http.hsts);
+            assert_eq!(cfg.http.hsts_max_age_secs, 63_072_000);
+            // An unrelated section must not be disturbed.
+            assert!(!cfg.payments.enabled);
+            Ok(())
+        });
     }
 
     #[test]
