@@ -86,6 +86,7 @@ async fn seed_active_game(repo: &dyn GameRepo) -> Game {
             initial: Duration::from_secs(300),
             increment: Duration::from_secs(2),
         },
+        true,
         OffsetDateTime::now_utc(),
     );
     game.lifecycle = GameLifecycle::Active;

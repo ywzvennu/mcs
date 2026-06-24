@@ -132,6 +132,7 @@ async fn spawn_game(app: &TestApp, white: &User, black: &User) -> GameId {
         white.id,
         black.id,
         time_control.clone(),
+        true,
         OffsetDateTime::now_utc(),
     );
     let game_id = game.id;

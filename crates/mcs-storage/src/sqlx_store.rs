@@ -176,6 +176,20 @@ fn decode_color(s: &str) -> Result<Color, StorageError> {
     }
 }
 
+/// Encodes a boolean as the integer column form (`0`/`1`).
+///
+/// The `rated` flag is stored as an INTEGER (0 = casual, 1 = rated) so the DDL
+/// stays portable across SQLite and Postgres without a backend-specific boolean
+/// type — matching how the schema already stores small integers.
+fn encode_bool(value: bool) -> i64 {
+    i64::from(value)
+}
+
+/// Decodes a boolean from its integer column form. Any non-zero value is `true`.
+fn decode_bool(value: i64) -> bool {
+    value != 0
+}
+
 /// Encodes an optional millisecond clock as the signed integer column form.
 ///
 /// The values originate as `u64` but fit comfortably in `i64` for any
@@ -191,7 +205,7 @@ fn encode_clock(ms: Option<u64>) -> Option<i64> {
 /// The full column list used by every `games` read, kept in one place so the
 /// row-mapping in [`game_from_row`] stays in lock-step with the queries.
 const GAME_SELECT: &str = "SELECT id, variant_id, variant_options, white, black, lifecycle, \
-     outcome, time_control, ply, clock_white_ms, clock_black_ms, side_to_move, \
+     outcome, time_control, rated, ply, clock_white_ms, clock_black_ms, side_to_move, \
      created_at, updated_at FROM games";
 
 /// Reconstructs a [`User`] from a database row.
@@ -223,6 +237,7 @@ fn game_from_row(row: &DbRow) -> Result<Game, StorageError> {
         lifecycle: decode_lifecycle(&row.try_get::<String, _>("lifecycle")?)?,
         outcome,
         time_control: decode_json(&row.try_get::<String, _>("time_control")?)?,
+        rated: decode_bool(row.try_get::<i64, _>("rated")?),
         ply: decode_u32(row.try_get::<i64, _>("ply")?, "ply")?,
         clock_white_ms: decode_clock(row.try_get::<Option<i64>, _>("clock_white_ms")?)?,
         clock_black_ms: decode_clock(row.try_get::<Option<i64>, _>("clock_black_ms")?)?,
@@ -256,6 +271,7 @@ fn seek_from_row(row: &DbRow) -> Result<Seek, StorageError> {
         variant_id: row.try_get::<String, _>("variant_id")?,
         time_control: decode_json(&row.try_get::<String, _>("time_control")?)?,
         color_preference: decode_color_pref(&row.try_get::<String, _>("color_preference")?)?,
+        rated: decode_bool(row.try_get::<i64, _>("rated")?),
         created_at: decode_time(&row.try_get::<String, _>("created_at")?)?,
     })
 }
@@ -425,8 +441,8 @@ impl GameRepo for SqlxStorage {
         sqlx::query(
             "INSERT INTO games \
              (id, variant_id, variant_options, white, black, lifecycle, outcome, time_control, \
-              ply, clock_white_ms, clock_black_ms, side_to_move, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+              rated, ply, clock_white_ms, clock_black_ms, side_to_move, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(game.id.to_string())
         .bind(game.variant_id.clone())
@@ -436,6 +452,7 @@ impl GameRepo for SqlxStorage {
         .bind(encode_lifecycle(game.lifecycle))
         .bind(outcome)
         .bind(encode_json(&game.time_control)?)
+        .bind(encode_bool(game.rated))
         .bind(i64::from(game.ply))
         .bind(encode_clock(game.clock_white_ms))
         .bind(encode_clock(game.clock_black_ms))
@@ -459,9 +476,10 @@ impl GameRepo for SqlxStorage {
         let outcome = game.outcome.as_ref().map(encode_json).transpose()?;
         let affected = sqlx::query(
             "UPDATE games SET variant_id = $1, variant_options = $2, white = $3, black = $4, \
-             lifecycle = $5, outcome = $6, time_control = $7, ply = $8, clock_white_ms = $9, \
-             clock_black_ms = $10, side_to_move = $11, created_at = $12, updated_at = $13 \
-             WHERE id = $14",
+             lifecycle = $5, outcome = $6, time_control = $7, rated = $8, ply = $9, \
+             clock_white_ms = $10, clock_black_ms = $11, side_to_move = $12, created_at = $13, \
+             updated_at = $14 \
+             WHERE id = $15",
         )
         .bind(game.variant_id.clone())
         .bind(encode_json(&game.variant_options)?)
@@ -470,6 +488,7 @@ impl GameRepo for SqlxStorage {
         .bind(encode_lifecycle(game.lifecycle))
         .bind(outcome)
         .bind(encode_json(&game.time_control)?)
+        .bind(encode_bool(game.rated))
         .bind(i64::from(game.ply))
         .bind(encode_clock(game.clock_white_ms))
         .bind(encode_clock(game.clock_black_ms))
@@ -598,14 +617,15 @@ impl SeekRepo for SqlxStorage {
     async fn create(&self, seek: &Seek) -> StorageResult<()> {
         sqlx::query(
             "INSERT INTO seeks \
-             (id, creator, variant_id, time_control, color_preference, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             (id, creator, variant_id, time_control, color_preference, rated, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(seek.id.to_string())
         .bind(seek.creator.to_string())
         .bind(seek.variant_id.clone())
         .bind(encode_json(&seek.time_control)?)
         .bind(encode_color_pref(seek.color_preference))
+        .bind(encode_bool(seek.rated))
         .bind(encode_time(seek.created_at)?)
         .execute(&self.pool)
         .await?;
@@ -614,7 +634,7 @@ impl SeekRepo for SqlxStorage {
 
     async fn get(&self, id: SeekId) -> StorageResult<Option<Seek>> {
         let row = sqlx::query(
-            "SELECT id, creator, variant_id, time_control, color_preference, created_at \
+            "SELECT id, creator, variant_id, time_control, color_preference, rated, created_at \
              FROM seeks WHERE id = $1",
         )
         .bind(id.to_string())
@@ -635,7 +655,7 @@ impl SeekRepo for SqlxStorage {
 
     async fn list_open(&self) -> StorageResult<Vec<Seek>> {
         let rows = sqlx::query(
-            "SELECT id, creator, variant_id, time_control, color_preference, created_at \
+            "SELECT id, creator, variant_id, time_control, color_preference, rated, created_at \
              FROM seeks",
         )
         .fetch_all(&self.pool)

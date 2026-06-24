@@ -75,6 +75,15 @@ pub struct Game {
     pub outcome: Option<Outcome>,
     /// Time control for this game.
     pub time_control: TimeControl,
+    /// Whether this game counts towards the players' ratings.
+    ///
+    /// A **rated** game (`true`) feeds the post-game Glicko-2 update; a
+    /// **casual** game (`false`) is exempt — it is played for fun and leaves
+    /// both players' ratings untouched. Both players agree on this value at
+    /// matchmaking time (a rated seek only ever pairs with another rated seek,
+    /// and likewise for casual), so the flag is fixed for the life of the game.
+    #[serde(default = "default_rated")]
+    pub rated: bool,
     /// Number of plies (half-moves) played so far in the live snapshot.
     ///
     /// `0` for a freshly created game. Updated via
@@ -101,6 +110,12 @@ pub struct Game {
     pub updated_at: OffsetDateTime,
 }
 
+/// The serde default for [`Game::rated`]: records that predate the rated/casual
+/// distinction deserialize as **rated**, preserving their original behaviour.
+fn default_rated() -> bool {
+    true
+}
+
 impl Game {
     /// Creates a new [`Game`] record in the [`GameLifecycle::Created`] state.
     ///
@@ -117,6 +132,9 @@ impl Game {
     /// * `white` – the user assigned the white pieces.
     /// * `black` – the user assigned the black pieces.
     /// * `time_control` – the agreed time control.
+    /// * `rated` – whether the game counts towards ratings (`true`) or is a
+    ///   casual game exempt from rating changes (`false`); both players agree on
+    ///   this at matchmaking.
     /// * `now` – the creation/update timestamp; pass `OffsetDateTime::now_utc()`
     ///   in application code.
     #[must_use]
@@ -126,6 +144,7 @@ impl Game {
         white: UserId,
         black: UserId,
         time_control: TimeControl,
+        rated: bool,
         now: OffsetDateTime,
     ) -> Self {
         Self {
@@ -137,6 +156,7 @@ impl Game {
             lifecycle: GameLifecycle::Created,
             outcome: None,
             time_control,
+            rated,
             ply: 0,
             clock_white_ms: None,
             clock_black_ms: None,
@@ -209,6 +229,7 @@ mod tests {
                 initial: Duration::from_secs(300),
                 increment: Duration::from_secs(0),
             },
+            true,
             OffsetDateTime::UNIX_EPOCH,
         )
     }
@@ -311,5 +332,44 @@ mod tests {
         let a = sample_game();
         let b = sample_game();
         assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn new_defaults_to_the_rated_flag_passed_in() {
+        let rated = sample_game();
+        assert!(rated.rated, "sample_game is constructed rated");
+
+        let casual = Game::new(
+            "standard".to_owned(),
+            VariantOptions::default(),
+            UserId::new(),
+            UserId::new(),
+            TimeControl::Unlimited,
+            false,
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        assert!(!casual.rated);
+    }
+
+    #[test]
+    fn rated_flag_survives_serde_round_trip() {
+        for rated in [true, false] {
+            let mut game = sample_game();
+            game.rated = rated;
+            let json = serde_json::to_string(&game).unwrap();
+            let back: Game = serde_json::from_str(&json).unwrap();
+            assert_eq!(game, back);
+            assert_eq!(back.rated, rated);
+        }
+    }
+
+    #[test]
+    fn missing_rated_field_deserializes_as_rated() {
+        // A record serialized before the rated/casual distinction has no
+        // `rated` key; it must deserialize as a rated game.
+        let mut value = serde_json::to_value(sample_game()).unwrap();
+        value.as_object_mut().unwrap().remove("rated");
+        let back: Game = serde_json::from_value(value).unwrap();
+        assert!(back.rated);
     }
 }

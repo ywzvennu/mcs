@@ -56,6 +56,7 @@ fn sample_game(white: UserId, black: UserId) -> Game {
         white,
         black,
         TimeControl::Unlimited,
+        true,
         OffsetDateTime::UNIX_EPOCH,
     )
 }
@@ -66,6 +67,7 @@ fn sample_seek(creator: UserId) -> Seek {
         "standard".to_owned(),
         TimeControl::Unlimited,
         ColorPreference::Random,
+        true,
         OffsetDateTime::UNIX_EPOCH,
     )
 }
@@ -293,6 +295,55 @@ async fn game_variant_options_round_trip() {
     let fetched = storage.games().get(game.id).await.unwrap();
     assert_eq!(fetched.variant_options, game.variant_options);
     assert_eq!(fetched, game);
+}
+
+#[tokio::test]
+async fn game_rated_flag_round_trips_for_both_values() {
+    let storage = storage().await;
+
+    // The default-constructed game is rated; persist and read it back.
+    let rated = sample_game(UserId::new(), UserId::new());
+    assert!(rated.rated, "sample game defaults to rated");
+    storage.games().create(&rated).await.unwrap();
+    assert!(storage.games().get(rated.id).await.unwrap().rated);
+
+    // A casual game round-trips as casual.
+    let mut casual = sample_game(UserId::new(), UserId::new());
+    casual.rated = false;
+    storage.games().create(&casual).await.unwrap();
+    let fetched = storage.games().get(casual.id).await.unwrap();
+    assert!(!fetched.rated);
+    assert_eq!(fetched, casual);
+}
+
+#[tokio::test]
+async fn game_rated_flag_survives_update() {
+    let storage = storage().await;
+    let mut game = sample_game(UserId::new(), UserId::new());
+    game.rated = false;
+    storage.games().create(&game).await.unwrap();
+
+    // An unrelated update must not disturb the persisted `rated` flag.
+    game.lifecycle = GameLifecycle::Active;
+    storage.games().update(&game).await.unwrap();
+    assert!(!storage.games().get(game.id).await.unwrap().rated);
+}
+
+#[tokio::test]
+async fn seek_rated_flag_round_trips_for_both_values() {
+    let storage = storage().await;
+
+    let rated = sample_seek(UserId::new());
+    assert!(rated.rated, "sample seek defaults to rated");
+    storage.seeks().create(&rated).await.unwrap();
+    assert_eq!(storage.seeks().get(rated.id).await.unwrap(), Some(rated));
+
+    let mut casual = sample_seek(UserId::new());
+    casual.rated = false;
+    storage.seeks().create(&casual).await.unwrap();
+    let fetched = storage.seeks().get(casual.id).await.unwrap();
+    assert_eq!(fetched.as_ref().map(|s| s.rated), Some(false));
+    assert_eq!(fetched, Some(casual));
 }
 
 #[tokio::test]

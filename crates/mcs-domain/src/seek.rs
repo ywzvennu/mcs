@@ -41,9 +41,23 @@ pub struct Seek {
     pub time_control: TimeControl,
     /// Which side the challenger prefers to play.
     pub color_preference: ColorPreference,
+    /// Whether the challenger wants a rated game.
+    ///
+    /// A rated seek (`true`) only ever matches another rated seek, and a casual
+    /// seek (`false`) only matches another casual seek, so both players always
+    /// agree: the resulting game is rated exactly when both seeks were. A casual
+    /// game is exempt from rating changes.
+    #[serde(default = "default_rated")]
+    pub rated: bool,
     /// When this seek was posted (UTC).
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+}
+
+/// The serde default for [`Seek::rated`]: seeks that predate the rated/casual
+/// distinction deserialize as **rated**.
+fn default_rated() -> bool {
+    true
 }
 
 impl Seek {
@@ -55,6 +69,8 @@ impl Seek {
     /// * `variant_id` – the variant string identifier.
     /// * `time_control` – the desired time control.
     /// * `color_preference` – the desired side.
+    /// * `rated` – whether the challenger wants a rated game (`true`) or a casual
+    ///   one (`false`); the matchmaker only pairs seeks that agree on this.
     /// * `created_at` – creation timestamp; pass `OffsetDateTime::now_utc()`
     ///   in application code.
     #[must_use]
@@ -63,6 +79,7 @@ impl Seek {
         variant_id: String,
         time_control: TimeControl,
         color_preference: ColorPreference,
+        rated: bool,
         created_at: OffsetDateTime,
     ) -> Self {
         Self {
@@ -71,6 +88,7 @@ impl Seek {
             variant_id,
             time_control,
             color_preference,
+            rated,
             created_at,
         }
     }
@@ -93,6 +111,7 @@ mod tests {
                 increment: Duration::from_secs(5),
             },
             ColorPreference::Random,
+            true,
             OffsetDateTime::UNIX_EPOCH,
         )
     }
@@ -105,6 +124,7 @@ mod tests {
             "standard".to_owned(),
             TimeControl::Unlimited,
             ColorPreference::White,
+            true,
             OffsetDateTime::UNIX_EPOCH,
         );
         let b = Seek::new(
@@ -112,9 +132,30 @@ mod tests {
             "standard".to_owned(),
             TimeControl::Unlimited,
             ColorPreference::White,
+            true,
             OffsetDateTime::UNIX_EPOCH,
         );
         assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn rated_flag_survives_serde_round_trip() {
+        for rated in [true, false] {
+            let mut seek = sample_seek();
+            seek.rated = rated;
+            let json = serde_json::to_string(&seek).unwrap();
+            let back: Seek = serde_json::from_str(&json).unwrap();
+            assert_eq!(seek, back);
+            assert_eq!(back.rated, rated);
+        }
+    }
+
+    #[test]
+    fn missing_rated_field_deserializes_as_rated() {
+        let mut value = serde_json::to_value(sample_seek()).unwrap();
+        value.as_object_mut().unwrap().remove("rated");
+        let back: Seek = serde_json::from_value(value).unwrap();
+        assert!(back.rated);
     }
 
     #[test]

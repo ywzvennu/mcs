@@ -56,6 +56,7 @@ fn sample_game(white: UserId, black: UserId) -> Game {
         white,
         black,
         TimeControl::Unlimited,
+        true,
         OffsetDateTime::UNIX_EPOCH,
     )
 }
@@ -66,6 +67,7 @@ fn sample_seek(creator: UserId) -> Seek {
         "standard".to_owned(),
         TimeControl::Unlimited,
         ColorPreference::Random,
+        true,
         OffsetDateTime::UNIX_EPOCH,
     )
 }
