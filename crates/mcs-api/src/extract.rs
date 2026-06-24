@@ -71,6 +71,10 @@ impl FromRequestParts<AppState> for AuthUser {
             .await
             .map_err(|_| ApiError::Unauthorized("authentication failed".to_owned()))?;
 
+        // Stamp this user as active on every authenticated request so that
+        // presence queries stay current without a dedicated heartbeat endpoint.
+        state.presence().mark_seen(user_id);
+
         Ok(AuthUser {
             user_id,
             address: user.address,

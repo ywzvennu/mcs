@@ -72,6 +72,7 @@ pub mod error;
 pub mod extract;
 pub mod history;
 pub mod hub;
+pub mod presence;
 pub mod rating;
 pub mod rest;
 pub mod state;
@@ -88,12 +89,14 @@ pub use error::{ApiError, ApiResult};
 pub use extract::AuthUser;
 pub use history::{MoveEntry, MovesResponse};
 pub use hub::GameHub;
+pub use presence::{InProcessPresence, PresenceTracker};
 pub use rating::RatingUpdateHook;
 pub use rest::{
     CancelSeekResponse, CreateSeekRequest, CreateSeekResponse, GameDto, GameListResponse,
     LeaderboardEntry, LeaderboardQuery, LeaderboardResponse, ProfileDto, RatingDto,
+    UserStatusResponse,
 };
-pub use state::{AppState, Cluster, PaymentGate, SiweConfig};
+pub use state::{AppState, Cluster, PaymentGate, SiweConfig, DEFAULT_ONLINE_TTL};
 pub use variants::{VariantDto, VariantListResponse};
 pub use ws::{ClientMessage, OwnerInfo, RedirectBody, ServerMessage, PROTOCOL_VERSION};
 
