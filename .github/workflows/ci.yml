@@ -20,7 +20,7 @@ jobs:
     name: ci
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -41,3 +41,121 @@ jobs:
 
       - name: Build
         run: cargo build --all --all-features
+
+  # ---------------------------------------------------------------------------
+  # Redis integration tests — exercises the Redis-backed NodeRegistry against a
+  # real Redis 7 instance provided by the GitHub Actions service container.
+  # ---------------------------------------------------------------------------
+  redis:
+    name: redis integration tests
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    env:
+      MCS_TEST_REDIS_URL: "redis://localhost:6379"
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: redis
+
+      - name: Run mcs-cluster Redis integration tests
+        run: >
+          cargo test -p mcs-cluster --features redis -- --ignored
+          --test-threads=1
+
+      - name: Run mcs-server cluster_redis integration test
+        run: >
+          cargo test -p mcs-server --test cluster_redis -- --ignored
+          --test-threads=1
+
+  # ---------------------------------------------------------------------------
+  # Postgres compile check — ensures the postgres feature compiles cleanly and
+  # passes clippy. No tests are run; a live Postgres instance is not provisioned.
+  # ---------------------------------------------------------------------------
+  postgres-compile:
+    name: postgres compile check
+    runs-on: ubuntu-latest
+    env:
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: postgres
+
+      - name: Clippy (postgres feature)
+        run: >
+          cargo clippy -p mcs-storage
+          --no-default-features --features postgres
+          --all-targets -- -D warnings
+
+      - name: Build (postgres feature)
+        run: >
+          cargo build -p mcs-storage
+          --no-default-features --features postgres
+
+  # ---------------------------------------------------------------------------
+  # MSRV check — builds the workspace with the minimum supported Rust version
+  # declared in Cargo.toml (`rust-version = "1.82"`).
+  # ---------------------------------------------------------------------------
+  msrv:
+    name: MSRV (1.82)
+    runs-on: ubuntu-latest
+    env:
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.82 toolchain
+        uses: dtolnay/rust-toolchain@1.82
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Build workspace (MSRV)
+        run: cargo build --workspace --locked
+
+  # ---------------------------------------------------------------------------
+  # Dependency audit — checks for known security advisories, license compliance,
+  # and duplicate crates using cargo-deny (deny.toml at workspace root).
+  # ---------------------------------------------------------------------------
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Run cargo-deny on the host toolchain rather than the action's musl
+      # container, which fails to honour the repo's rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny check
+        run: cargo deny check
