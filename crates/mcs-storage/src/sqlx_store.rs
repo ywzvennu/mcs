@@ -365,7 +365,19 @@ impl SqlxStorage {
     /// - [`StorageError::Backend`] if the pool cannot be established or a
     ///   migration fails to apply.
     pub async fn connect(database_url: &str) -> StorageResult<Self> {
-        let pool = DbPool::connect(database_url).await?;
+        // In-memory SQLite gives every *connection* its own private database, so
+        // a multi-connection pool would scatter writes across disjoint DBs and
+        // reads would non-deterministically miss them. Pin in-memory SQLite to a
+        // single connection so all access shares one coherent database. File
+        // SQLite and Postgres keep the default pool sizing.
+        let pool = if database_url.contains(":memory:") {
+            sqlx::pool::PoolOptions::<Backend>::new()
+                .max_connections(1)
+                .connect(database_url)
+                .await?
+        } else {
+            DbPool::connect(database_url).await?
+        };
         MIGRATOR
             .run(&pool)
             .await
