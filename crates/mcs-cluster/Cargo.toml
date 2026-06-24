@@ -1,0 +1,41 @@
+[package]
+name = "mcs-cluster"
+description = "Optional clustering primitives — rendezvous-hash directory and node registry for horizontal scaling of the MCS server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Default features are empty on purpose: the crate must build, and its pure HRW
+# directory and in-process `LocalRegistry` must work, with no Redis present. CI
+# has no Redis, so the default path is what gets compiled and tested there.
+default = []
+# Enable the Redis-backed `NodeRegistry`. The `redis` crate is pulled in only
+# under this feature, so a deployment that runs a single node (or coordinates
+# through some other backend) never links it.
+redis = ["dep:redis"]
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# Redis client, optional and gated behind the `redis` feature above. Declared
+# directly here (rather than in the workspace) because it is specific to this
+# crate's optional backend.
+redis = { version = "0.27", features = [
+  "tokio-comp",
+  "aio",
+  "connection-manager",
+], optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true }
