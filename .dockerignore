@@ -1,0 +1,45 @@
+# Build artefacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Version-control metadata
+.git
+.gitignore
+.gitattributes
+
+# Local databases / dev state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Secrets and environment files
+.env
+.env.*
+*.local
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+
+# LLM / AI assistant material
+CLAUDE.md
+CLAUDE.local.md
+GEMINI.md
+.cursorrules
+.cursor/
+.aider*
+.claude/
+*.plan.md
+/notes/
+/scratch/
+
+# CI
+.github/
+
+# Documentation that is not needed inside the image
+*.md
+LICENSE-*
