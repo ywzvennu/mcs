@@ -20,6 +20,10 @@ mcs-api.workspace = true
 mcs-storage.workspace = true
 mcs-core.workspace = true
 mcs-auth.workspace = true
+# Recover in-progress games at startup: `recover_game` rebuilds each unfinished
+# game's live actor from its durable action log (#58).
+mcs-game.workspace = true
+mcs-domain.workspace = true
 # This binary is the single place variants are registered at startup, which
 # keeps `mcs-api` variant-agnostic. All supported variants are wired in here.
 mcs-variant-standard.workspace = true

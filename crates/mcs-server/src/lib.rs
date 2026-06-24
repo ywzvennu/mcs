@@ -138,21 +138,83 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware)
 }
 
+/// Rebuilds the live actors for every game that was still in progress, inserting
+/// each into the [`AppState`]'s live-game hub.
+///
+/// After a restart a game in progress exists only in storage. This lists every
+/// unfinished [`Game`](mcs_domain::Game) via
+/// [`GameRepo::list_unfinished`](mcs_storage::GameRepo::list_unfinished) and, for
+/// each, calls [`mcs_game::recover_game`] to replay its durable action log into a
+/// resumed [`GameActor`](mcs_game::GameActor), then registers the returned handle
+/// in [`AppState::game_hub`] so clients can reconnect and play on. Each side's
+/// clock resumes from its last persisted remaining time as of *now*, so the time
+/// the server was down is not charged to either player.
+///
+/// Recovery is best-effort and isolated: a single game that fails to recover (an
+/// unknown variant, an unreadable or divergent log) is logged at `WARN` and
+/// skipped — it never aborts startup or blocks the other games. The number of
+/// games successfully recovered is returned and logged at `INFO`.
+///
+/// Called once during [`build_app`], before the server begins serving.
+///
+/// # Errors
+///
+/// Returns an error only if the initial
+/// [`list_unfinished`](mcs_storage::GameRepo::list_unfinished) query fails;
+/// per-game recovery failures are logged and skipped rather than propagated.
+pub async fn recover_games(state: &AppState) -> anyhow::Result<usize> {
+    let unfinished = state.game_repo().list_unfinished().await?;
+    let total = unfinished.len();
+
+    let mut recovered = 0usize;
+    for game in &unfinished {
+        match mcs_game::recover_game(
+            game,
+            state.variants(),
+            state.action_log().clone(),
+            state.game_repo().clone(),
+            state.completion_hook().clone(),
+        )
+        .await
+        {
+            Ok(handle) => {
+                state.game_hub().insert(game.id, handle);
+                recovered += 1;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    game_id = %game.id,
+                    %error,
+                    "skipping a game that could not be recovered",
+                );
+            }
+        }
+    }
+
+    tracing::info!(count = recovered, total, "recovered in-progress games",);
+
+    Ok(recovered)
+}
+
 /// Connects storage and assembles the application [`Router`] from `cfg`.
 ///
 /// This is the config-driven entry point used by [`main`](crate): it connects
 /// [`SqlxStorage`](mcs_storage::SqlxStorage) (building the pool and running
-/// migrations), then builds the state and router. The session `secret` is
-/// supplied separately so the caller controls the ephemeral-secret policy.
+/// migrations), builds the state, **recovers any games that were in progress**
+/// (see [`recover_games`]) into the live-game hub, then assembles the router.
+/// The session `secret` is supplied separately so the caller controls the
+/// ephemeral-secret policy.
 ///
 /// # Errors
 ///
-/// Returns an error if the storage backend cannot be connected or its
-/// migrations fail to apply.
+/// Returns an error if the storage backend cannot be connected, its migrations
+/// fail to apply, or the unfinished-games query fails. Individual games that
+/// cannot be recovered are logged and skipped, never aborting startup.
 ///
 /// [`main`]: ../mcs_server/fn.main.html
 pub async fn build_app(cfg: &Config, session_secret: Vec<u8>) -> anyhow::Result<Router> {
     let storage = Arc::new(SqlxStorage::connect(&cfg.database_url).await?);
     let state = build_state(cfg, storage, session_secret);
+    recover_games(&state).await?;
     Ok(router(state))
 }

@@ -109,6 +109,49 @@ impl ClockEngine {
         Self { mode }
     }
 
+    /// Rebuilds a clock for `time_control` from persisted per-side *remaining*
+    /// times, rather than from the full starting budget.
+    ///
+    /// This is the recovery counterpart to [`new`](ClockEngine::new): after a
+    /// restart the durable record carries each side's last-known remaining time
+    /// (the [`clock_white_ms`](mcs_domain::Game::clock_white_ms) /
+    /// [`clock_black_ms`](mcs_domain::Game::clock_black_ms) snapshot fields), and
+    /// this constructor seeds the engine with exactly those values so play
+    /// resumes where it left off. As with [`new`](ClockEngine::new) no clock is
+    /// yet ticking; the caller invokes [`start`](ClockEngine::start) to begin the
+    /// side-to-move's clock at the recovery instant.
+    ///
+    /// The `_remaining` arguments are honoured only for
+    /// [`TimeControl::RealTime`], whose per-side budget is what actually drains.
+    /// [`TimeControl::Correspondence`] resets a fresh per-move deadline on resume
+    /// (its "remaining" is a deadline, not a bank) and
+    /// [`TimeControl::Unlimited`] has no timing state at all, so both ignore the
+    /// supplied remaining times and behave identically to
+    /// [`new`](ClockEngine::new).
+    #[must_use]
+    pub fn from_remaining(
+        time_control: &TimeControl,
+        white_remaining: Duration,
+        black_remaining: Duration,
+    ) -> Self {
+        let mode = match *time_control {
+            TimeControl::RealTime { increment, .. } => Mode::RealTime(RealTimeState {
+                white_remaining,
+                black_remaining,
+                increment,
+                ticking: None,
+            }),
+            TimeControl::Correspondence { days_per_move } => {
+                Mode::Correspondence(CorrespondenceState {
+                    per_move: Duration::from_secs(u64::from(days_per_move) * SECONDS_PER_DAY),
+                    ticking: None,
+                })
+            }
+            TimeControl::Unlimited => Mode::Unlimited,
+        };
+        Self { mode }
+    }
+
     /// Returns `true` if this engine tracks a draining real-time budget.
     ///
     /// Correspondence and unlimited games still track a (deadline or absent)
@@ -480,6 +523,70 @@ mod tests {
         assert_eq!(snap.white_remaining(), Duration::from_secs(50));
         assert_eq!(snap.black_remaining(), Duration::from_secs(60));
         assert_eq!(snap.turn_started_at(), Some(base()));
+    }
+
+    #[test]
+    fn from_remaining_seeds_persisted_budgets() {
+        // A recovered real-time game resumes with each side's persisted bank,
+        // not the full initial budget, and with no clock yet ticking.
+        let engine = ClockEngine::from_remaining(
+            &real_time(180, 2),
+            Duration::from_secs(90),
+            Duration::from_secs(45),
+        );
+        assert!(engine.is_real_time());
+        assert_eq!(
+            engine.remaining(Color::White, base()),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            engine.remaining(Color::Black, base()),
+            Duration::from_secs(45)
+        );
+        assert_eq!(engine.flagged(base()), None);
+        assert_eq!(engine.flag_deadline(), None);
+    }
+
+    #[test]
+    fn from_remaining_resumes_ticking_for_side_to_move() {
+        // Seed Black with 30s remaining, then start Black's clock at `base`:
+        // 10s later Black shows 20s, White's bank is untouched, and the
+        // increment is preserved for the next completed move.
+        let mut engine = ClockEngine::from_remaining(
+            &real_time(180, 5),
+            Duration::from_secs(120),
+            Duration::from_secs(30),
+        );
+        engine.start(Color::Black, base());
+        let now = base() + Duration::from_secs(10);
+        assert_eq!(engine.remaining(Color::Black, now), Duration::from_secs(20));
+        assert_eq!(
+            engine.remaining(Color::White, now),
+            Duration::from_secs(120)
+        );
+
+        // Black moves having spent 10s: 30 - 10 + 5 = 25 banked.
+        engine.on_move(Color::Black, now);
+        assert_eq!(engine.remaining(Color::Black, now), Duration::from_secs(25));
+    }
+
+    #[test]
+    fn from_remaining_ignores_remaining_for_correspondence_and_unlimited() {
+        // Correspondence resets a fresh per-move deadline regardless of the
+        // persisted "remaining" values.
+        let corr = ClockEngine::from_remaining(
+            &TimeControl::Correspondence { days_per_move: 2 },
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        assert!(!corr.is_real_time());
+        // Unlimited carries no timing at all.
+        let unlimited = ClockEngine::from_remaining(
+            &TimeControl::Unlimited,
+            Duration::from_secs(99),
+            Duration::from_secs(99),
+        );
+        assert_eq!(unlimited.remaining(Color::White, base()), Duration::ZERO);
     }
 
     #[test]
