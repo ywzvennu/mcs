@@ -64,7 +64,7 @@ pub use error::{StorageError, StorageResult};
 pub use game::GameRepo;
 pub use rating::RatingRepo;
 pub use repositories::Repositories;
-pub use seek::SeekRepo;
+pub use seek::{ClaimOutcome, SeekRepo};
 pub use session::SessionRepo;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub use sqlx_store::SqlxStorage;

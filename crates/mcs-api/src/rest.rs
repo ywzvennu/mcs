@@ -5,14 +5,27 @@
 //! live game, and the game is then read back over plain HTTP (`GET /games/{id}`,
 //! `GET /games`) or streamed over the WebSocket endpoint (#15).
 //!
-//! | Method & path        | Auth | Purpose |
-//! |----------------------|------|---------|
-//! | `POST /seeks`        | yes  | Post a seek; queue it or pair it into a game. |
-//! | `DELETE /seeks/{id}` | yes  | Cancel one of the caller's own open seeks. |
-//! | `GET /games/{id}`    | no   | Fetch a single game record by id. |
-//! | `GET /games`         | no   | List the most recently created games. |
-//! | `GET /users/{id}`    | no   | Public profile for a user. |
-//! | `GET /profile`       | yes  | Public profile for the authenticated caller. |
+//! | Method & path             | Auth | Purpose |
+//! |---------------------------|------|---------|
+//! | `POST /seeks`             | yes  | Post a seek; queue it or pair it into a game. |
+//! | `GET /seeks`              | no   | Browse the open-seek lobby. |
+//! | `POST /seeks/{id}/accept` | yes  | Join an open seek directly, creating the game. |
+//! | `DELETE /seeks/{id}`      | yes  | Cancel one of the caller's own open seeks. |
+//! | `GET /games/{id}`         | no   | Fetch a single game record by id. |
+//! | `GET /games`              | no   | List the most recently created games. |
+//! | `GET /users/{id}`         | no   | Public profile for a user. |
+//! | `GET /profile`            | yes  | Public profile for the authenticated caller. |
+//!
+//! # Seek lobby (#77)
+//!
+//! Alongside auto-matching (`POST /seeks`), a seek can be **browsed** and
+//! **joined directly**: `GET /seeks` lists the open pool and
+//! `POST /seeks/{id}/accept` lets a second player take a specific seek,
+//! bypassing the matchmaker. The accept path atomically claims the seek (so two
+//! simultaneous accepts cannot both create a game — see
+//! [`SeekRepo::claim`](mcs_storage::SeekRepo::claim)) and then spawns the game
+//! through the same [`AppState::create_and_spawn_game`] helper a paired seek
+//! uses.
 //!
 //! # Payment middleware (x402)
 //!
@@ -28,12 +41,13 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use mcs_core::VariantOptions;
+use mcs_core::{Color, VariantOptions};
 use mcs_domain::{
     ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Rating, Seek, SeekId, TimeControl,
     User, UserId,
 };
 use mcs_game::{Pairing, SubmitOutcome};
+use mcs_storage::ClaimOutcome;
 
 use crate::error::{ApiError, ApiResult};
 use crate::extract::AuthUser;
@@ -106,6 +120,52 @@ pub enum CreateSeekResponse {
         /// The created game record.
         game: GameDto,
     },
+}
+
+/// The creator of an open seek, as exposed in the lobby listing.
+///
+/// The `user_id` is always present; the `address` is resolved best-effort over
+/// the user store and omitted (rather than failing the whole listing) when the
+/// account cannot be looked up — mirroring how [`LeaderboardEntry`] treats a
+/// missing account.
+#[derive(Debug, Clone, Serialize)]
+pub struct SeekCreatorDto {
+    /// The creator's stable identifier.
+    pub user_id: UserId,
+    /// The creator's Ethereum address, if it could be resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<EvmAddress>,
+}
+
+/// One open seek in the lobby, as returned by `GET /seeks`.
+///
+/// A thin, explicit projection of the domain [`Seek`]: the creator is expanded
+/// into a [`SeekCreatorDto`] (id plus best-effort address) so a client can
+/// render the lobby without a second round-trip per row.
+#[derive(Debug, Clone, Serialize)]
+pub struct SeekDto {
+    /// The seek's stable identifier; join it with `POST /seeks/{id}/accept`.
+    pub seek_id: SeekId,
+    /// The player who posted the seek.
+    pub creator: SeekCreatorDto,
+    /// The variant on offer (e.g. `"standard"`).
+    pub variant_id: String,
+    /// The time control on offer.
+    pub time_control: TimeControl,
+    /// Whether the resulting game would be rated.
+    pub rated: bool,
+    /// The creator's colour preference (honoured on accept).
+    pub color_preference: ColorPreference,
+    /// When the seek was posted (RFC 3339, UTC).
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Response body for `GET /seeks`: the open-seek lobby.
+#[derive(Debug, Clone, Serialize)]
+pub struct SeekListResponse {
+    /// The seeks currently awaiting an opponent, in no guaranteed order.
+    pub seeks: Vec<SeekDto>,
 }
 
 /// A player's Glicko-2 rating, as exposed on the wire.
@@ -307,12 +367,25 @@ pub fn cancel_seek_router() -> Router<AppState> {
     Router::new().route("/seeks/{id}", delete(cancel_seek))
 }
 
-/// Builds the read sub-router: game lookups, the game list, and profiles.
+/// Builds the seek **accept** sub-router: the single `POST /seeks/{id}/accept`
+/// route.
+///
+/// Kept out of [`create_seek_router`] on purpose: the x402 payment layer (#45)
+/// gates *seek creation* (`POST /seeks`), and a direct join is a distinct action
+/// the gate should not double-charge. Accepting is authenticated (the handler
+/// takes an [`AuthUser`]) but free, exactly like cancellation.
+pub fn accept_seek_router() -> Router<AppState> {
+    Router::new().route("/seeks/{id}/accept", post(accept_seek))
+}
+
+/// Builds the read sub-router: the seek lobby, game lookups, the game list, and
+/// profiles.
 ///
 /// These endpoints are unauthenticated reads, except `GET /profile`, which
 /// requires a session to identify "the caller".
 pub fn read_router() -> Router<AppState> {
     Router::new()
+        .route("/seeks", get(list_seeks))
         .route("/games/{id}", get(get_game))
         .route("/games", get(list_games))
         .route("/leaderboard", get(leaderboard))
@@ -412,6 +485,141 @@ async fn cancel_seek(
 pub struct CancelSeekResponse {
     /// The id of the seek that was cancelled.
     pub cancelled: SeekId,
+}
+
+/// `GET /seeks` — browse the open-seek lobby (public read).
+///
+/// Returns every seek currently awaiting an opponent, projected to [`SeekDto`].
+/// Each creator's address is resolved best-effort: a seek whose creator account
+/// can no longer be read simply omits the address rather than failing the whole
+/// listing — the same robustness `GET /leaderboard` applies.
+async fn list_seeks(State(state): State<AppState>) -> ApiResult<Json<SeekListResponse>> {
+    let open = state.storage().seeks().list_open().await?;
+
+    let mut seeks = Vec::with_capacity(open.len());
+    for seek in open {
+        // Best-effort address resolution; a missing account omits the address.
+        let address = state
+            .storage()
+            .users()
+            .get(seek.creator)
+            .await
+            .ok()
+            .map(|u| u.address);
+        seeks.push(SeekDto {
+            seek_id: seek.id,
+            creator: SeekCreatorDto {
+                user_id: seek.creator,
+                address,
+            },
+            variant_id: seek.variant_id,
+            time_control: seek.time_control,
+            rated: seek.rated,
+            color_preference: seek.color_preference,
+            created_at: seek.created_at,
+        });
+    }
+
+    Ok(Json(SeekListResponse { seeks }))
+}
+
+/// `POST /seeks/{id}/accept` — join an open seek directly, creating the game.
+///
+/// This is the lobby's direct-join path: the matchmaker is bypassed and the
+/// accepter takes a *specific* seek, with the game's variant, time control, and
+/// rated flag fixed by that seek. The sequence is:
+///
+/// 1. Load the seek; a missing one is **404 Not Found**.
+/// 2. Reject the creator accepting their own seek with **400 Bad Request** —
+///    there would be no opponent.
+/// 3. **Atomically claim** the seek via [`SeekRepo::claim`](mcs_storage::SeekRepo::claim).
+///    When several callers race to accept the same seek, exactly one wins the
+///    claim and proceeds; every loser gets **409 Conflict**. This also covers an
+///    already-taken seek (matched, cancelled, or claimed): the claim reports it
+///    absent, so the caller is told it is gone.
+/// 4. Resolve colours from the *creator's* preference (the creator keeps their
+///    preferred side; the accepter takes the other; see [`resolve_seek_color`]).
+/// 5. Create the game through the shared
+///    [`AppState::create_and_spawn_game`](crate::state::AppState::create_and_spawn_game)
+///    helper — the same path a paired seek takes — and return it, so the client
+///    can open the socket at `/ws/game/{id}`.
+///
+/// The 404 / claim ordering is deliberate: a clear "no such seek" is reported
+/// before the claim, while the claim itself collapses the *racing* "someone else
+/// just took it" into a 409.
+async fn accept_seek(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<SeekId>,
+) -> ApiResult<Json<GameDto>> {
+    let seeks = state.storage().seeks();
+
+    // 1. The seek must exist. A clean not-found is friendlier than forcing the
+    //    claim to disambiguate "never existed" from "just taken".
+    let seek = seeks
+        .get(id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("no open seek: {id}")))?;
+
+    // 2. A creator cannot accept their own seek — there would be no opponent.
+    if seek.creator == user.user_id {
+        return Err(ApiError::BadRequest(
+            "you cannot accept your own seek".to_owned(),
+        ));
+    }
+
+    // 3. Atomically claim it. Exactly one of any concurrent accepters wins; the
+    //    rest (and any accept of an already-taken seek) get 409.
+    if state.storage().seeks().claim(id).await? == ClaimOutcome::AlreadyClaimed {
+        return Err(ApiError::Conflict(format!(
+            "seek {id} has already been taken"
+        )));
+    }
+
+    // 4. Resolve colours: the creator keeps their preferred side; the accepter
+    //    takes the other.
+    let creator_color = resolve_seek_color(seek.color_preference, seek.id);
+    let (white, black) = match creator_color {
+        Color::White => (seek.creator, user.user_id),
+        Color::Black => (user.user_id, seek.creator),
+    };
+
+    // 5. Create the game through the shared helper — identical to the paired-seek
+    //    path. Seeks carry no per-game options yet, so use the variant defaults.
+    let game = state
+        .create_and_spawn_game(
+            white,
+            black,
+            &seek.variant_id,
+            seek.time_control,
+            seek.rated,
+            VariantOptions::default(),
+        )
+        .await?;
+
+    Ok(Json(game.into()))
+}
+
+/// Resolves a seek creator's [`ColorPreference`] into a concrete [`Color`].
+///
+/// [`White`](ColorPreference::White) and [`Black`](ColorPreference::Black) map
+/// directly. [`Random`](ColorPreference::Random) is resolved deterministically
+/// from the seek id — the low bit of its first byte — so the same seek always
+/// yields the same colours: no RNG, reproducible in tests, yet effectively
+/// unpredictable to the players. This matches how direct challenges
+/// (`crate::challenges`) assign colours.
+fn resolve_seek_color(pref: ColorPreference, id: SeekId) -> Color {
+    match pref {
+        ColorPreference::White => Color::White,
+        ColorPreference::Black => Color::Black,
+        ColorPreference::Random => {
+            if id.as_uuid().as_bytes()[0] & 1 == 0 {
+                Color::White
+            } else {
+                Color::Black
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

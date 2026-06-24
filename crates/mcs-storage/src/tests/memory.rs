@@ -24,6 +24,7 @@ use crate::{
     seek::SeekRepo,
     session::SessionRepo,
     user::UserRepo,
+    ClaimOutcome,
 };
 
 // ---------------------------------------------------------------------------
@@ -223,6 +224,17 @@ impl SeekRepo for MemorySeekRepo {
         let mut map = self.seeks.lock().expect("mutex poisoned");
         map.remove(&id);
         Ok(())
+    }
+
+    async fn claim(&self, id: SeekId) -> StorageResult<ClaimOutcome> {
+        // Atomic under the single map lock: the remove both deletes and reports
+        // prior presence, so concurrent claimants of one seek can never both win.
+        let mut map = self.seeks.lock().expect("mutex poisoned");
+        if map.remove(&id).is_some() {
+            Ok(ClaimOutcome::Claimed)
+        } else {
+            Ok(ClaimOutcome::AlreadyClaimed)
+        }
     }
 
     async fn list_open(&self) -> StorageResult<Vec<Seek>> {

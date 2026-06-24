@@ -40,7 +40,8 @@ use time::OffsetDateTime;
 use crate::{
     action_log::{ActionLogRepo, RecordedAction},
     error::{StorageError, StorageResult},
-    ChallengeRepo, GameRepo, RatingRepo, Repositories, SeekRepo, SessionRepo, UserRepo,
+    ChallengeRepo, ClaimOutcome, GameRepo, RatingRepo, Repositories, SeekRepo, SessionRepo,
+    UserRepo,
 };
 
 // ---------------------------------------------------------------------------
@@ -704,6 +705,25 @@ impl SeekRepo for SqlxStorage {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn claim(&self, id: SeekId) -> StorageResult<ClaimOutcome> {
+        // Atomic claim: a single DELETE both removes the seek and reports how
+        // many rows it touched. Because the delete is the test, two concurrent
+        // accepts of the same seek can never both observe it as present — at
+        // most one DELETE matches a row, so exactly one caller is `Claimed`.
+        // This mirrors the single-use nonce consumption in `consume_nonce`.
+        let affected = sqlx::query("DELETE FROM seeks WHERE id = $1")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+
+        if affected > 0 {
+            Ok(ClaimOutcome::Claimed)
+        } else {
+            Ok(ClaimOutcome::AlreadyClaimed)
+        }
     }
 
     async fn list_open(&self) -> StorageResult<Vec<Seek>> {
