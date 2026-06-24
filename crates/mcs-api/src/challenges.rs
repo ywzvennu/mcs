@@ -426,6 +426,22 @@ fn rematch_color(game: &Game, user_id: UserId) -> (UserId, ColorPreference) {
     }
 }
 
+/// Resolves the `(white, black)` players for a rematch with the colours swapped
+/// from `game`.
+///
+/// This is the lichess rematch convention — the two players trade sides — applied
+/// directly to produce the *new* game's seating: the player who was Black becomes
+/// White and vice versa. It is the single source of truth for the swap, shared by
+/// the offline REST path (via [`rematch_color`], which expresses the same
+/// convention as the *challenger's* colour preference) and the live WebSocket
+/// rematch path ([`crate::ws`]), which has both players present and so can create
+/// the swapped game immediately.
+#[must_use]
+pub(crate) fn rematch_colors(game: &Game) -> (UserId, UserId) {
+    // Swap: last game's Black plays White now, last game's White plays Black.
+    (game.black, game.white)
+}
+
 /// Loads a challenge by id, mapping a missing one to a **404 Not Found** with an
 /// id-bearing detail (rather than the generic storage not-found message).
 async fn load_challenge(state: &AppState, id: ChallengeId) -> ApiResult<Challenge> {

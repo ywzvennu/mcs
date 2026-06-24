@@ -210,11 +210,11 @@ async fn snapshot_then_move_advances_the_board() {
         .expect("ws handshake succeeds");
 
     // 1. The opening frame is a Snapshot from White's perspective. It fully
-    //    describes the position: protocol v2, clocks, ply, and side to move.
+    //    describes the position: protocol v3, clocks, ply, and side to move.
     let snapshot = next_json(&mut socket).await;
     assert_eq!(snapshot["type"], "snapshot");
     assert_eq!(snapshot["your_color"], "white");
-    assert_eq!(snapshot["protocol_version"], 2);
+    assert_eq!(snapshot["protocol_version"], 3);
     assert_eq!(snapshot["ply"], 0, "no moves played yet");
     assert_eq!(snapshot["side_to_move"], "white", "White starts");
     // A 5+2 real-time game: both clocks present, each at ~300_000 ms.
