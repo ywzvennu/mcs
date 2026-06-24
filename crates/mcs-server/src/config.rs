@@ -35,6 +35,11 @@
 //! | `env`              | `MCS_ENV`             | `development`                 |
 //! | `bind`             | `MCS_BIND`            | `127.0.0.1:8080`              |
 //! | `database_url`     | `MCS_DATABASE_URL`   | `sqlite://mcs.db?mode=rwc`    |
+//! | `database.max_connections` | `MCS_DATABASE__MAX_CONNECTIONS` | `10`           |
+//! | `database.acquire_timeout_secs` | `MCS_DATABASE__ACQUIRE_TIMEOUT_SECS` | `30`  |
+//! | `database.idle_timeout_secs` | `MCS_DATABASE__IDLE_TIMEOUT_SECS` | `600`       |
+//! | `database.max_lifetime_secs` | `MCS_DATABASE__MAX_LIFETIME_SECS` | `0` (none)  |
+//! | `database.statement_timeout_secs` | `MCS_DATABASE__STATEMENT_TIMEOUT_SECS` | `0` (PG only) |
 //! | `log.format`       | `MCS_LOG__FORMAT`    | `pretty`                      |
 //! | `log.level`        | `MCS_LOG__LEVEL`     | `info`                        |
 //! | `session.secret`   | `MCS_SESSION__SECRET`| *(none — ephemeral)*          |
@@ -317,6 +322,8 @@ pub struct Config {
     /// the working directory, creating it on first run. Use `sqlite::memory:`
     /// for an ephemeral, test-only database.
     pub database_url: String,
+    /// Connection-pool tuning for the storage backend (#105).
+    pub database: DatabaseSettings,
     /// Logging configuration.
     pub log: LogConfig,
     /// Session-token (JWT) configuration.
@@ -333,6 +340,93 @@ pub struct Config {
     pub http: HttpSettings,
     /// Abuse-protection limits: per-IP rate limiting and resource caps (#100).
     pub limits: LimitsSettings,
+}
+
+/// Database connection-pool tuning (#105).
+///
+/// These knobs size the storage pool for a production deployment. They matter
+/// most for Postgres, where many server nodes share a single instance, but the
+/// defaults are conservative enough for a single-node SQLite file too.
+///
+/// Durations are expressed in whole seconds so they map cleanly onto plain
+/// environment variables and TOML integers. A `0` (or omitted) optional timeout
+/// disables that bound.
+///
+/// # `config.toml` sample
+///
+/// ```toml
+/// [database]
+/// # Maximum pool connections. For Postgres, keep `nodes * max_connections`
+/// # comfortably under the server's `max_connections` setting.
+/// max_connections = 10
+///
+/// # How long `acquire` waits for a free connection before erroring.
+/// acquire_timeout_secs = 30
+///
+/// # Close a connection idle in the pool for this long. 0 = keep indefinitely.
+/// idle_timeout_secs = 600
+///
+/// # Recycle any connection older than this. 0 = no maximum lifetime.
+/// # Useful behind a load balancer that drops idle backend TCP connections.
+/// max_lifetime_secs = 1800
+///
+/// # Postgres only: per-statement timeout (SET statement_timeout). 0 = unset.
+/// # Ignored on SQLite.
+/// statement_timeout_secs = 30
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DatabaseSettings {
+    /// Maximum number of connections the pool may open. Default: `10`.
+    ///
+    /// In-memory SQLite is always pinned to a single connection regardless of
+    /// this value (see [`mcs_storage::PoolConfig`]).
+    pub max_connections: u32,
+    /// How long `acquire` waits for a free connection before returning a timeout
+    /// error, in seconds. Default: `30`.
+    pub acquire_timeout_secs: u64,
+    /// Close a connection idle in the pool for at least this many seconds. `0`
+    /// keeps idle connections indefinitely. Default: `600` (10 min).
+    pub idle_timeout_secs: u64,
+    /// Recycle any connection older than this many seconds, regardless of use.
+    /// `0` (the default) imposes no maximum lifetime.
+    pub max_lifetime_secs: u64,
+    /// Postgres-only per-statement timeout, in seconds (issued as
+    /// `SET statement_timeout`). `0` (the default) leaves it unset. Ignored on
+    /// SQLite.
+    pub statement_timeout_secs: u64,
+}
+
+impl Default for DatabaseSettings {
+    fn default() -> Self {
+        // Mirror `mcs_storage::PoolConfig::default` so the two never drift.
+        Self {
+            max_connections: 10,
+            acquire_timeout_secs: 30,
+            idle_timeout_secs: 600,
+            max_lifetime_secs: 0,
+            statement_timeout_secs: 0,
+        }
+    }
+}
+
+impl DatabaseSettings {
+    /// Builds the storage layer's [`PoolConfig`](mcs_storage::PoolConfig) from
+    /// these settings, translating each whole-second value into a
+    /// [`Duration`](std::time::Duration) and mapping the `0`-means-disabled
+    /// optional timeouts onto `None`.
+    #[must_use]
+    pub fn to_pool_config(&self) -> mcs_storage::PoolConfig {
+        let secs = |s: u64| std::time::Duration::from_secs(s);
+        let opt = |s: u64| (s != 0).then(|| secs(s));
+        mcs_storage::PoolConfig {
+            max_connections: self.max_connections,
+            acquire_timeout: secs(self.acquire_timeout_secs),
+            idle_timeout: opt(self.idle_timeout_secs),
+            max_lifetime: opt(self.max_lifetime_secs),
+            statement_timeout: opt(self.statement_timeout_secs),
+        }
+    }
 }
 
 /// Logging configuration.
@@ -782,6 +876,7 @@ impl Default for Config {
             env: RunMode::default(),
             bind: SocketAddr::from(([127, 0, 0, 1], 8080)),
             database_url: "sqlite://mcs.db?mode=rwc".to_owned(),
+            database: DatabaseSettings::default(),
             log: LogConfig::default(),
             session: SessionSettings::default(),
             siwe: SiweSettings::default(),
@@ -2052,6 +2147,85 @@ mod tests {
             assert_eq!(cfg.cluster.heartbeat_interval_secs, 10);
             // An untouched section keeps its default.
             assert!(!cfg.payments.enabled);
+            Ok(())
+        });
+    }
+
+    // ── Database / pool config tests (#105) ──────────────────────────────────
+
+    #[test]
+    fn database_defaults_mirror_pool_config_default() {
+        let cfg = Config::default();
+        assert_eq!(cfg.database.max_connections, 10);
+        assert_eq!(cfg.database.acquire_timeout_secs, 30);
+        assert_eq!(cfg.database.idle_timeout_secs, 600);
+        assert_eq!(cfg.database.max_lifetime_secs, 0);
+        assert_eq!(cfg.database.statement_timeout_secs, 0);
+
+        // The translated pool config must match the storage crate's default so
+        // the two never drift.
+        assert_eq!(
+            cfg.database.to_pool_config(),
+            mcs_storage::PoolConfig::default()
+        );
+    }
+
+    #[test]
+    fn database_to_pool_config_maps_zero_to_none() {
+        let settings = DatabaseSettings {
+            max_connections: 25,
+            acquire_timeout_secs: 5,
+            idle_timeout_secs: 0,
+            max_lifetime_secs: 1800,
+            statement_timeout_secs: 0,
+        };
+        let pool = settings.to_pool_config();
+        assert_eq!(pool.max_connections, 25);
+        assert_eq!(pool.acquire_timeout, std::time::Duration::from_secs(5));
+        // 0 disables the optional timeouts.
+        assert_eq!(pool.idle_timeout, None);
+        assert_eq!(pool.statement_timeout, None);
+        // A non-zero optional value is carried through.
+        assert_eq!(
+            pool.max_lifetime,
+            Some(std::time::Duration::from_secs(1800))
+        );
+    }
+
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn database_section_parses_from_toml() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                r#"
+                    [database]
+                    max_connections = 50
+                    acquire_timeout_secs = 15
+                    idle_timeout_secs = 120
+                    max_lifetime_secs = 1800
+                    statement_timeout_secs = 30
+                "#,
+            )?;
+            let cfg = Config::load().expect("load config with [database]");
+            assert_eq!(cfg.database.max_connections, 50);
+            assert_eq!(cfg.database.acquire_timeout_secs, 15);
+            assert_eq!(cfg.database.idle_timeout_secs, 120);
+            assert_eq!(cfg.database.max_lifetime_secs, 1800);
+            assert_eq!(cfg.database.statement_timeout_secs, 30);
+            Ok(())
+        });
+    }
+
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn database_max_connections_overrides_via_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("MCS_DATABASE__MAX_CONNECTIONS", "42");
+            let cfg = Config::load().expect("load config with MCS_DATABASE__MAX_CONNECTIONS");
+            assert_eq!(cfg.database.max_connections, 42);
+            // Untouched keys keep their defaults.
+            assert_eq!(cfg.database.acquire_timeout_secs, 30);
             Ok(())
         });
     }

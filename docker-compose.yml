@@ -103,12 +103,84 @@ services:
     networks:
       - mcs-net
 
+  # ----------------------------------------------------------------------------
+  # Postgres deployment profile (`--profile postgres`)
+  #
+  # A production-shaped path: a single shared Postgres instance plus one
+  # mcs-server built with the Postgres backend (`DB_BACKEND=postgres`). Unlike
+  # the per-node SQLite files above, all game state lives in Postgres, so this is
+  # the backend to grow into a multi-node cluster (point several `mcs-pg` nodes
+  # at the same database and Redis).
+  #
+  #   docker compose --profile postgres up --build
+  #
+  # The default (no-profile) stack — redis, node-a, node-b — is unaffected: these
+  # services only start when the `postgres` profile is selected.
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    profiles: ["postgres"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "mcs"
+      POSTGRES_PASSWORD: "mcs"
+      POSTGRES_DB: "mcs"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # `pg_isready` returns 0 only once the server accepts connections, so the
+      # server waits for a usable database before running migrations.
+      test: ["CMD-SHELL", "pg_isready -U mcs -d mcs"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - mcs-net
+
+  mcs-pg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Build the Postgres-only binary (no SQLite driver).
+        DB_BACKEND: postgres
+    profiles: ["postgres"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8083:8080"
+    environment:
+      MCS_BIND: "0.0.0.0:8080"
+      # Shared Postgres DSN. Migrations run automatically on startup.
+      MCS_DATABASE_URL: "postgres://mcs:mcs@postgres:5432/mcs"
+      MCS_LOG__FORMAT: "json"
+      # Connection-pool tuning (see ops/README.md and the [database] section).
+      MCS_DATABASE__MAX_CONNECTIONS: "10"
+      MCS_DATABASE__ACQUIRE_TIMEOUT_SECS: "30"
+      MCS_DATABASE__IDLE_TIMEOUT_SECS: "600"
+      MCS_DATABASE__MAX_LIFETIME_SECS: "1800"
+      MCS_DATABASE__STATEMENT_TIMEOUT_SECS: "30"
+      # REQUIRED: replace with a stable, high-entropy value (>= 32 bytes).
+      MCS_SESSION__SECRET: "change-me-to-a-long-random-secret-min-32-bytes"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - mcs-net
+
 volumes:
   # Each node gets its own SQLite file.  This means game seeks and completed
   # games are owned by the node that created them.  Switching to a shared
   # Postgres instance removes this constraint; see ops/README.md.
   node-a-data:
   node-b-data:
+  # Durable storage for the Postgres profile's database.
+  postgres-data:
 
 networks:
   mcs-net:

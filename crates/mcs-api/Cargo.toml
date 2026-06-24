@@ -14,7 +14,13 @@ workspace = true
 [dependencies]
 mcs-core.workspace = true
 mcs-domain.workspace = true
-mcs-storage.workspace = true
+# Backend-agnostic: only the repository traits/types are used in library code,
+# so disable the default `sqlite` backend feature here. Otherwise it would leak
+# (via Cargo feature unification) into the Postgres-only server build and
+# silently select the SQLite backend. The integration tests below opt the
+# concrete SQLite backend back in via the dev-dependency. A `path` dep is
+# required because `default-features = false` is ignored under `workspace = true`.
+mcs-storage = { path = "../mcs-storage", default-features = false }
 mcs-auth.workspace = true
 mcs-game.workspace = true
 # The Glicko-2 rating engine, with the `domain` feature so we can convert
