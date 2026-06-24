@@ -377,6 +377,66 @@ async fn events_are_broadcast_to_subscribers() {
 }
 
 #[tokio::test]
+async fn snapshot_reports_status_clock_ply_and_side_to_move() {
+    let game_id = GameId::new();
+    let repo = MockGameRepo::with_game(active_game(game_id));
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo,
+        MockActionLogRepo::new(),
+        Arc::new(NoopHook),
+        TimeControl::RealTime {
+            initial: Duration::from_secs(300),
+            increment: Duration::from_secs(0),
+        },
+    );
+
+    // A fresh game: no moves played, White to move, both clocks at the budget.
+    let initial = handle.snapshot().await.unwrap();
+    assert_eq!(initial.status, mcs_core::GameStatus::Ongoing);
+    assert_eq!(initial.ply, 0);
+    assert_eq!(initial.side_to_move, Some(Color::White));
+    let clock = initial.clock.expect("a real-time game reports a clock");
+    // White's clock is ticking and slightly drained; Black's is the full budget.
+    assert!(clock.white_remaining() <= Duration::from_secs(300));
+    assert_eq!(clock.black_remaining(), Duration::from_secs(300));
+
+    // After one move the ply advances and it is Black to move.
+    handle
+        .submit_action(Color::White, mv("e2e4"))
+        .await
+        .unwrap();
+    let after = handle.snapshot().await.unwrap();
+    assert_eq!(after.ply, 1);
+    assert_eq!(after.side_to_move, Some(Color::Black));
+    assert!(!after.status.is_finished());
+}
+
+#[tokio::test]
+async fn snapshot_of_finished_game_has_no_side_to_move() {
+    let game_id = GameId::new();
+    let repo = MockGameRepo::with_game(active_game(game_id));
+    let handle = GameActor::spawn(
+        game_id,
+        standard_session(),
+        repo,
+        MockActionLogRepo::new(),
+        Arc::new(NoopHook),
+        TimeControl::Unlimited,
+    );
+
+    play_fools_mate(&handle).await;
+
+    let snapshot = handle.snapshot().await.unwrap();
+    assert!(snapshot.status.is_finished());
+    assert_eq!(snapshot.side_to_move, None, "a finished game has no mover");
+    assert_eq!(snapshot.ply, 4, "fool's mate is four half-moves");
+    // An unlimited game tracks no clock.
+    assert_eq!(snapshot.clock, None);
+}
+
+#[tokio::test]
 async fn out_of_turn_action_is_rejected() {
     let game_id = GameId::new();
     let repo = MockGameRepo::with_game(active_game(game_id));

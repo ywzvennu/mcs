@@ -19,6 +19,7 @@ use mcs_core::{
 };
 use mcs_domain::{Clock, Game, GameId, GameLifecycle, TimeControl};
 use mcs_storage::{ActionLogRepo, GameRepo, RecordedAction};
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -75,6 +76,44 @@ impl ClockRemaining {
     }
 }
 
+/// An atomic, game-level read of a live game's position metadata.
+///
+/// Returned by [`GameHandle::snapshot`], this is the actor's own, consistent
+/// view of "where the game is right now": its lifecycle status, both clocks as
+/// of the read instant, the current half-move index, and whose turn it is. All
+/// four fields are sampled together inside the actor — between two of its
+/// command dispatches — so they can never disagree with one another (for
+/// example, a clock read from one instant paired with a ply from another).
+///
+/// It deliberately carries **no per-player view**: the view is partial
+/// information and must be rendered for a specific audience, so callers combine
+/// this game-level snapshot with [`GameHandle::view_for`] (or
+/// [`GameHandle::spectator_view`]) themselves. Keeping the two separate is what
+/// lets the WebSocket layer resync a reconnecting client without ever leaking
+/// an opponent's hidden state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameSnapshot {
+    /// The game's effective lifecycle status as of the read, including a
+    /// timeout the actor declared that the underlying session does not know
+    /// about (see [`GameActor`]'s flag handling).
+    pub status: GameStatus,
+
+    /// Both sides' remaining time, live as of the read instant, or `None` for
+    /// an unlimited game that tracks no clock.
+    ///
+    /// For a running real-time clock the side-to-move's figure already has the
+    /// time elapsed since their turn began deducted, so a reconnecting client
+    /// can render an accurate countdown immediately.
+    pub clock: Option<Clock>,
+
+    /// The next half-move index — equivalently, the number of half-moves played
+    /// so far. A fresh game reports `0`; it advances by one per recorded move.
+    pub ply: u32,
+
+    /// Whose turn it is, or `None` once the game has finished.
+    pub side_to_move: Option<Color>,
+}
+
 /// A request sent from a [`GameHandle`] to the actor task.
 ///
 /// Each variant carries a [`oneshot`] sender on which the actor returns the
@@ -106,6 +145,10 @@ enum Command {
     Outcome {
         reply: oneshot::Sender<Option<Outcome>>,
     },
+    /// Fetch an atomic, game-level [`GameSnapshot`] of the current position.
+    Snapshot {
+        reply: oneshot::Sender<GameSnapshot>,
+    },
 }
 
 impl std::fmt::Debug for Command {
@@ -119,6 +162,7 @@ impl std::fmt::Debug for Command {
             Command::LegalActions { player, .. } => return write!(f, "LegalActions({player})"),
             Command::Status { .. } => "Status",
             Command::Outcome { .. } => "Outcome",
+            Command::Snapshot { .. } => "Snapshot",
         };
         f.write_str(name)
     }
@@ -270,6 +314,36 @@ impl GameHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Outcome { reply })
+            .await
+            .map_err(|_| GameSessionError::ActorUnavailable)?;
+        response
+            .await
+            .map_err(|_| GameSessionError::ActorUnavailable)
+    }
+
+    /// Returns an atomic, game-level [`GameSnapshot`] of the current position.
+    ///
+    /// The status, both clocks, the ply, and the side to move are all sampled
+    /// together inside the actor at a single instant, so they are mutually
+    /// consistent — unlike calling [`status`](GameHandle::status),
+    /// [`view_for`](GameHandle::view_for) and friends separately, which could
+    /// interleave with a move and observe a torn state. The clocks are read
+    /// live as of "now", so a running clock already reflects the time elapsed in
+    /// the current turn.
+    ///
+    /// This carries no per-player view; a caller that needs one (for example to
+    /// resync a reconnecting client) pairs this with
+    /// [`view_for`](GameHandle::view_for) or
+    /// [`spectator_view`](GameHandle::spectator_view) for the appropriate
+    /// audience, so partial-information variants never leak hidden state.
+    ///
+    /// # Errors
+    ///
+    /// [`GameSessionError::ActorUnavailable`] if the actor task has stopped.
+    pub async fn snapshot(&self) -> Result<GameSnapshot, GameSessionError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Snapshot { reply })
             .await
             .map_err(|_| GameSessionError::ActorUnavailable)?;
         response
@@ -715,6 +789,36 @@ impl GameActor {
                 self.check_flag().await;
                 let _ = reply.send(self.effective_outcome());
             }
+            Command::Snapshot { reply } => {
+                // Re-check the flag first so a game whose side-to-move has just
+                // run out of time reports as finished, with no side to move.
+                self.check_flag().await;
+                let _ = reply.send(self.snapshot());
+            }
+        }
+    }
+
+    /// Captures the actor's current position as an atomic [`GameSnapshot`].
+    ///
+    /// Sampled in one go from the actor's own state: the effective status (which
+    /// accounts for an actor-declared timeout), both clocks live as of `now`,
+    /// the next ply, and — while the game is ongoing — the side to move. Callers
+    /// should run [`check_flag`](GameActor::check_flag) immediately before this
+    /// so a freshly elapsed clock is reflected as a finished game.
+    fn snapshot(&self) -> GameSnapshot {
+        let now = self.time.now();
+        let status = self.effective_status();
+        let clock = self.clock.as_ref().map(|clock| clock.snapshot(now));
+        let side_to_move = if self.is_over() {
+            None
+        } else {
+            Some(self.session.to_move())
+        };
+        GameSnapshot {
+            status,
+            clock,
+            ply: self.next_ply,
+            side_to_move,
         }
     }
 

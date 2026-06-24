@@ -27,13 +27,41 @@
 //! The shapes are [`ClientMessage`] (client → server) and [`ServerMessage`]
 //! (server → client).
 //!
-//! 1. On connect the server sends exactly one [`ServerMessage::Snapshot`] with
-//!    the player's current view, the game status, and the connection's color.
+//! 1. On connect the server sends exactly one [`ServerMessage::Snapshot`]. It
+//!    fully describes the current position from the connection's perspective —
+//!    the player's view, the game status, the connection's color, both clocks,
+//!    the half-move count (`ply`), and whose turn it is — so a freshly
+//!    *reconnecting* client can resync to the live state in a single frame
+//!    without re-rendering the game from scratch.
 //! 2. Thereafter every applied action produces a [`ServerMessage::Update`]
 //!    carrying the per-player [`PlayerView`] and the broadcast [`GameEvent`].
 //! 3. A client submits play with [`ClientMessage::Submit`]; a rejected action
 //!    (illegal, out of turn, finished, or sent by a spectator) comes back as a
 //!    [`ServerMessage::Error`] without closing the socket.
+//!
+//! # Reconnect & resync
+//!
+//! The game runs in its own actor, wholly independent of any socket: a
+//! disconnect never resigns, pauses, or ends the game, and clocks keep ticking.
+//! A reconnecting client therefore simply opens a new socket and is brought up
+//! to date by the opening [`ServerMessage::Snapshot`], which reflects every move
+//! and clock tick that happened while it was away.
+//!
+//! Two mechanisms make a brief drop seamless:
+//!
+//! - **Catch-up replay (`?since_ply=N`).** A client that knows the last ply it
+//!   rendered may reconnect with the optional `since_ply` query parameter. After
+//!   the snapshot, the server replays the actions recorded *after* ply `N` as
+//!   [`ServerMessage::Replay`] frames, so a short gap need not re-render the
+//!   board. To avoid leaking hidden information, raw recorded actions are
+//!   streamed **only for perfect-information variants** (detected by the
+//!   connection's [`PlayerView`] being equal to the public spectator view); for
+//!   a hidden-information variant the snapshot alone is the resync and no replay
+//!   is sent (it is always correct, just less incremental).
+//! - **Self-heal on lag.** If this connection falls so far behind the broadcast
+//!   buffer that it observes a [`Lagged`](RecvError::Lagged), the server does
+//!   *not* drop it: it sends a fresh [`ServerMessage::Snapshot`] to resync and
+//!   then resumes streaming from the newest events.
 
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
@@ -41,10 +69,13 @@ use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
+use std::sync::Arc;
+
 use mcs_auth::verify_session;
 use mcs_core::{Action, Color, GameStatus, PlayerView};
-use mcs_domain::GameId;
-use mcs_game::{GameEvent, GameHandle, GameSessionError};
+use mcs_domain::{Clock, GameId};
+use mcs_game::{GameEvent, GameHandle, GameSessionError, GameSnapshot};
+use mcs_storage::ActionLogRepo;
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -54,7 +85,12 @@ use crate::state::AppState;
 /// It is included in the opening [`ServerMessage::Snapshot`] so a client can
 /// detect a server it does not understand and refuse to proceed. Bump it on any
 /// breaking change to the [`ClientMessage`] / [`ServerMessage`] schema.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Version `2` enriches the opening snapshot for reconnect/resync — it now
+/// carries `clock`, `ply`, and `side_to_move` alongside the original
+/// `view`/`status`/`your_color` — and adds the `?since_ply=N` catch-up
+/// mechanism with its [`ServerMessage::Replay`] frames.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Connection role
@@ -121,26 +157,86 @@ pub enum ClientMessage {
     },
 }
 
+/// Both sides' remaining clock time, in whole milliseconds, as carried in a
+/// [`ServerMessage::Snapshot`].
+///
+/// Derived from the game-level [`GameSnapshot`]'s [`Clock`] reading taken at the
+/// snapshot instant, so a (re)connecting client can render an accurate clock —
+/// including a live countdown for the side to move — straight from the opening
+/// frame. Absent for an unlimited game, which tracks no clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClockView {
+    /// White's remaining time, in whole milliseconds, as of the snapshot.
+    pub white_ms: u64,
+    /// Black's remaining time, in whole milliseconds, as of the snapshot.
+    pub black_ms: u64,
+}
+
+impl ClockView {
+    /// Builds a [`ClockView`] from a domain [`Clock`] snapshot, truncating each
+    /// side's remaining duration to whole milliseconds (clocks only ever round
+    /// *down*).
+    fn from_clock(clock: &Clock) -> Self {
+        Self {
+            white_ms: whole_millis(clock.white_remaining()),
+            black_ms: whole_millis(clock.black_remaining()),
+        }
+    }
+}
+
 /// A message sent **from the server to a client** over the game socket.
 ///
 /// JSON, internally tagged on `"type"`. The first frame is always a
-/// [`ServerMessage::Snapshot`]; subsequent frames are [`ServerMessage::Update`]
-/// or [`ServerMessage::Error`].
+/// [`ServerMessage::Snapshot`]; subsequent frames are [`ServerMessage::Replay`]
+/// (only right after a `?since_ply` reconnect), [`ServerMessage::Update`], or
+/// [`ServerMessage::Error`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    /// The opening frame: the current game state from the connection's
-    /// perspective.
+    /// The opening frame: the full current game state from the connection's
+    /// perspective, sufficient on its own to (re)synchronise the client.
+    ///
+    /// Besides the player's `view`, `status`, and `your_color`, it carries the
+    /// game-level position metadata — both `clock`s, the half-move count `ply`,
+    /// and whose turn it is (`side_to_move`) — sampled atomically from the actor
+    /// via [`GameHandle::snapshot`], so the four never disagree. A reconnecting
+    /// client can therefore resume from a single frame, with clocks and turn
+    /// already advanced to reflect anything that happened while it was away.
     Snapshot {
         /// The protocol version the server speaks (see [`PROTOCOL_VERSION`]).
         protocol_version: u32,
         /// The connection's player view of the current position. For a
         /// spectator this is the public spectator view.
         view: PlayerView,
-        /// The game's lifecycle status at connection time.
+        /// The game's lifecycle status at the time of the snapshot.
         status: GameStatus,
         /// The color this connection plays, or `None` for a spectator.
         your_color: Option<Color>,
+        /// Both sides' remaining time as of the snapshot, or `None` for an
+        /// unlimited game. Skipped from the JSON when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clock: Option<ClockView>,
+        /// The number of half-moves played so far (the next ply to be recorded).
+        ply: u32,
+        /// Whose turn it is, or `None` once the game has finished.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        side_to_move: Option<Color>,
+    },
+    /// A historical action replayed during `?since_ply` catch-up.
+    ///
+    /// Sent zero or more times immediately after the opening
+    /// [`Snapshot`](ServerMessage::Snapshot), one
+    /// per action recorded *after* the requested ply, in ascending `ply` order,
+    /// so a briefly-dropped client can re-apply just the moves it missed instead
+    /// of re-rendering the whole game. Only emitted for perfect-information
+    /// variants; see the module-level "Reconnect & resync" notes.
+    Replay {
+        /// The zero-based half-move index of the replayed action.
+        ply: u32,
+        /// The color of the player who took the action.
+        player: Color,
+        /// The variant-defined action that was applied at this ply.
+        action: Action,
     },
     /// A live update produced by an applied action.
     ///
@@ -192,13 +288,20 @@ impl ServerMessage {
 // Query parameters
 // ---------------------------------------------------------------------------
 
-/// The query string of the WebSocket handshake: `?token=<jwt>`.
+/// The query string of the WebSocket handshake:
+/// `?token=<jwt>[&since_ply=<n>]`.
 #[derive(Debug, Deserialize)]
 pub struct ConnectQuery {
     /// The session JWT, validated exactly like the `Authorization: Bearer`
     /// token of a REST request. Supplied in the query because browsers cannot
     /// set request headers on a WebSocket handshake.
     token: String,
+    /// An optional catch-up cursor: the last ply the reconnecting client had
+    /// already rendered. When present, the server replays the actions recorded
+    /// *after* this ply (perfect-information variants only) right after the
+    /// opening snapshot. Omitted on a first connection.
+    #[serde(default)]
+    since_ply: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -254,8 +357,14 @@ async fn game_socket(
         Role::Spectator
     };
 
-    // 5. Upgrade. From here the connection task owns the socket and the handle.
-    Ok(upgrade.on_upgrade(move |socket| run_connection(socket, handle, role)))
+    // 5. The action-log repo lets a `?since_ply` reconnect replay the moves the
+    //    client missed. Cloned out of the state so the connection task owns it.
+    let action_log = state.action_log().clone();
+    let since_ply = query.since_ply;
+
+    // 6. Upgrade. From here the connection task owns the socket and the handle.
+    Ok(upgrade
+        .on_upgrade(move |socket| run_connection(socket, handle, role, action_log, since_ply)))
 }
 
 // ---------------------------------------------------------------------------
@@ -264,17 +373,26 @@ async fn game_socket(
 
 /// Drives one upgraded socket for its whole lifetime.
 ///
-/// It first sends the opening [`ServerMessage::Snapshot`], then loops over two
-/// concurrent sources with [`tokio::select!`]:
+/// It first sends the opening [`ServerMessage::Snapshot`] (optionally followed
+/// by `?since_ply` catch-up [`ServerMessage::Replay`] frames), then loops over
+/// two concurrent sources with [`tokio::select!`]:
 ///
 /// - **broadcast events** from [`GameHandle::subscribe`], each forwarded as a
 ///   per-player [`ServerMessage::Update`]; and
 /// - **client frames**, dispatched by [`handle_client_message`].
 ///
-/// The task returns — closing the socket — as soon as either side ends: the
-/// client disconnects, the actor stops (its broadcast channel closes), or a
-/// socket write fails.
-async fn run_connection(mut socket: WebSocket, handle: GameHandle, role: Role) {
+/// The connection is purely an observer of the actor: it never drives the
+/// game's lifecycle, so its ending — the client disconnects, the actor stops
+/// (its broadcast channel closes), or a socket write fails — closes the socket
+/// but leaves the game running untouched. A subscriber that lags past the
+/// broadcast buffer is *resynced* with a fresh snapshot rather than dropped.
+async fn run_connection(
+    mut socket: WebSocket,
+    handle: GameHandle,
+    role: Role,
+    action_log: Arc<dyn ActionLogRepo>,
+    since_ply: Option<u32>,
+) {
     // Subscribe *before* taking the snapshot so no event applied between the two
     // can be missed; at worst the client sees a duplicate it can reconcile by
     // status.
@@ -283,6 +401,16 @@ async fn run_connection(mut socket: WebSocket, handle: GameHandle, role: Role) {
     if let Err(error) = send_snapshot(&mut socket, &handle, role).await {
         tracing::debug!(%error, "failed to send game snapshot; closing socket");
         return;
+    }
+
+    // A reconnecting client may ask to be caught up on the moves it missed.
+    if let Some(since_ply) = since_ply {
+        if let Err(error) =
+            send_catch_up(&mut socket, &handle, role, action_log.as_ref(), since_ply).await
+        {
+            tracing::debug!(%error, "failed to send catch-up replay; closing socket");
+            return;
+        }
     }
 
     loop {
@@ -294,9 +422,14 @@ async fn run_connection(mut socket: WebSocket, handle: GameHandle, role: Role) {
                         break;
                     }
                 }
-                // Slow consumer: skip the gap and keep streaming the latest.
+                // Slow consumer: rather than drop the gap (or the client), send a
+                // fresh full snapshot so the client resyncs to the live state,
+                // then resume streaming from the newest events.
                 Err(RecvError::Lagged(skipped)) => {
-                    tracing::debug!(skipped, "ws subscriber lagged; continuing from newest");
+                    tracing::debug!(skipped, "ws subscriber lagged; resyncing with a snapshot");
+                    if send_snapshot(&mut socket, &handle, role).await.is_err() {
+                        break;
+                    }
                 }
                 // The actor stopped; nothing more will ever arrive.
                 Err(RecvError::Closed) => break,
@@ -316,21 +449,118 @@ async fn run_connection(mut socket: WebSocket, handle: GameHandle, role: Role) {
     }
 }
 
-/// Sends the opening snapshot for `role`'s perspective.
+/// Sends the opening (or resync) snapshot for `role`'s perspective.
+///
+/// Combines the connection's own [`PlayerView`] with the game-level
+/// [`GameSnapshot`] read atomically from the actor, so the frame's view,
+/// clocks, ply, and side to move are mutually consistent. If the actor has
+/// stopped, the snapshot degrades gracefully to an empty view and a default
+/// ongoing status rather than failing the connection.
 async fn send_snapshot(
     socket: &mut WebSocket,
     handle: &GameHandle,
     role: Role,
 ) -> Result<(), axum::Error> {
     let view = view_for_role(handle, role).await;
-    let status = handle.status().await.unwrap_or(GameStatus::Ongoing);
-    let snapshot = ServerMessage::Snapshot {
+    let snapshot = handle.snapshot().await.ok();
+    let message = snapshot_message(view, role, snapshot.as_ref());
+    socket.send(message.into_ws_message()).await
+}
+
+/// Builds the [`ServerMessage::Snapshot`] for a connection from its rendered
+/// `view` and the game-level [`GameSnapshot`].
+///
+/// Pure and total: a `None` game snapshot (the actor stopped between the view
+/// read and this call) degrades to an ongoing status with no clock, ply `0`, and
+/// no side to move, so the connection still receives a well-formed frame. Both
+/// the opening snapshot and the lag-resync go through here, so they are
+/// guaranteed identical in shape.
+fn snapshot_message(
+    view: PlayerView,
+    role: Role,
+    snapshot: Option<&GameSnapshot>,
+) -> ServerMessage {
+    ServerMessage::Snapshot {
         protocol_version: PROTOCOL_VERSION,
         view,
-        status,
+        status: snapshot.map_or(GameStatus::Ongoing, |s| s.status.clone()),
         your_color: role.color(),
+        clock: snapshot.and_then(|s| s.clock.as_ref().map(ClockView::from_clock)),
+        ply: snapshot.map_or(0, |s| s.ply),
+        side_to_move: snapshot.and_then(|s| s.side_to_move),
+    }
+}
+
+/// Replays the actions recorded *after* `since_ply` to a reconnecting client.
+///
+/// For a **perfect-information** variant — one where this connection's
+/// [`PlayerView`] is identical to the public spectator view — each missed
+/// action is streamed as a [`ServerMessage::Replay`] frame, in ascending ply
+/// order, so the client can re-apply just the moves it dropped. For a
+/// **hidden-information** variant a raw action payload could reveal an
+/// opponent's secret move, so nothing is replayed: the opening
+/// [`ServerMessage::Snapshot`] (already sent, and rendered for this player's
+/// own view) is the always-correct, leak-free resync.
+///
+/// A failure to read the log is logged and treated as "no catch-up": the client
+/// still has the full snapshot, so the connection proceeds rather than closing.
+async fn send_catch_up(
+    socket: &mut WebSocket,
+    handle: &GameHandle,
+    role: Role,
+    action_log: &dyn ActionLogRepo,
+    since_ply: u32,
+) -> Result<(), axum::Error> {
+    // Only players have a private view to protect; a spectator already sees the
+    // public view, so replay is always safe for them. For a player, replay only
+    // when the variant is perfect-information for this game.
+    if let Role::Player(_) = role {
+        if !is_perfect_information(handle, role).await {
+            tracing::debug!("skipping since_ply replay for a hidden-information variant");
+            return Ok(());
+        }
+    }
+
+    let actions = match action_log.list(handle.game_id()).await {
+        Ok(actions) => actions,
+        Err(error) => {
+            tracing::warn!(%error, "failed to read action log for catch-up; relying on snapshot");
+            return Ok(());
+        }
     };
-    socket.send(snapshot.into_ws_message()).await
+
+    for recorded in actions.into_iter().filter(|a| a.ply > since_ply) {
+        let replay = ServerMessage::Replay {
+            ply: recorded.ply,
+            player: recorded.player,
+            action: recorded.action,
+        };
+        socket.send(replay.into_ws_message()).await?;
+    }
+
+    Ok(())
+}
+
+/// Returns `true` when the game is perfect-information *for this connection*:
+/// the player's own [`PlayerView`] equals the public spectator view, so no
+/// hidden state exists that a raw action replay could leak.
+///
+/// This is the safe, variant-agnostic check the catch-up path uses: it asks the
+/// live session itself rather than hard-coding a list of variants, so a new
+/// hidden-information variant is protected automatically. A spectator is treated
+/// as perfect-information (they already see the public view); a transient actor
+/// error is treated as *not* perfect-information, the conservative default.
+async fn is_perfect_information(handle: &GameHandle, role: Role) -> bool {
+    match role.color() {
+        Some(color) => {
+            match (handle.view_for(color).await, handle.spectator_view().await) {
+                (Ok(player_view), Ok(spectator_view)) => player_view == spectator_view,
+                // If we cannot prove the views are equal, assume they differ.
+                _ => false,
+            }
+        }
+        None => true,
+    }
 }
 
 /// Forwards one broadcast [`GameEvent`] as a per-player [`ServerMessage::Update`].
@@ -447,4 +677,136 @@ fn submit_error_message(error: &GameSessionError) -> String {
         }
     };
     api_error.safe_detail().to_owned()
+}
+
+/// Truncates a remaining-time [`Duration`](std::time::Duration) to whole
+/// milliseconds for the wire, saturating rather than overflowing on an absurdly
+/// large budget. A clock should only ever round *down*, so the sub-millisecond
+/// remainder is dropped.
+fn whole_millis(remaining: std::time::Duration) -> u64 {
+    u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use mcs_core::Outcome;
+
+    use super::*;
+
+    fn sample_snapshot() -> GameSnapshot {
+        GameSnapshot {
+            status: GameStatus::Ongoing,
+            clock: Some(Clock::with_times(
+                Duration::from_millis(120_500),
+                Duration::from_millis(90_000),
+                None,
+            )),
+            ply: 7,
+            side_to_move: Some(Color::Black),
+        }
+    }
+
+    /// The resync/opening builder carries the enriched fields straight through:
+    /// clocks (truncated to whole ms), ply, side to move, and the version.
+    #[test]
+    fn snapshot_message_carries_enriched_fields() {
+        let view = PlayerView::new(serde_json::json!({ "fen": "startpos" }));
+        let snapshot = sample_snapshot();
+        let message = snapshot_message(view.clone(), Role::Player(Color::Black), Some(&snapshot));
+
+        match message {
+            ServerMessage::Snapshot {
+                protocol_version,
+                view: got_view,
+                status,
+                your_color,
+                clock,
+                ply,
+                side_to_move,
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert_eq!(got_view, view);
+                assert_eq!(status, GameStatus::Ongoing);
+                assert_eq!(your_color, Some(Color::Black));
+                assert_eq!(
+                    clock,
+                    Some(ClockView {
+                        white_ms: 120_500,
+                        black_ms: 90_000,
+                    })
+                );
+                assert_eq!(ply, 7);
+                assert_eq!(side_to_move, Some(Color::Black));
+            }
+            other => panic!("expected a snapshot, got {other:?}"),
+        }
+    }
+
+    /// A `None` game snapshot (the actor stopped) still yields a well-formed
+    /// frame: ongoing status, no clock, ply 0, no side to move.
+    #[test]
+    fn snapshot_message_degrades_gracefully_without_a_game_snapshot() {
+        let view = PlayerView::new(serde_json::Value::Null);
+        let message = snapshot_message(view, Role::Spectator, None);
+
+        match message {
+            ServerMessage::Snapshot {
+                status,
+                your_color,
+                clock,
+                ply,
+                side_to_move,
+                ..
+            } => {
+                assert_eq!(status, GameStatus::Ongoing);
+                assert_eq!(your_color, None);
+                assert_eq!(clock, None);
+                assert_eq!(ply, 0);
+                assert_eq!(side_to_move, None);
+            }
+            other => panic!("expected a snapshot, got {other:?}"),
+        }
+    }
+
+    /// A finished game's snapshot reports the outcome and no side to move.
+    #[test]
+    fn snapshot_message_reflects_a_finished_game() {
+        let outcome = Outcome::win(Color::White, mcs_core::EndReason::Checkmate);
+        let snapshot = GameSnapshot {
+            status: GameStatus::Finished(outcome.clone()),
+            clock: None,
+            ply: 42,
+            side_to_move: None,
+        };
+        let view = PlayerView::new(serde_json::Value::Null);
+        let message = snapshot_message(view, Role::Player(Color::White), Some(&snapshot));
+
+        match message {
+            ServerMessage::Snapshot {
+                status,
+                side_to_move,
+                ply,
+                ..
+            } => {
+                assert_eq!(status, GameStatus::Finished(outcome));
+                assert_eq!(side_to_move, None);
+                assert_eq!(ply, 42);
+            }
+            other => panic!("expected a snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clock_view_truncates_to_whole_millis() {
+        let clock = Clock::with_times(
+            Duration::from_micros(1_500), // 1.5 ms -> 1 ms (rounds down)
+            Duration::from_millis(250),
+            None,
+        );
+        let view = ClockView::from_clock(&clock);
+        assert_eq!(view.white_ms, 1);
+        assert_eq!(view.black_ms, 250);
+    }
 }
