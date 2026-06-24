@@ -1162,6 +1162,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcs-rating"
+version = "0.1.0"
+dependencies = [
+ "mcs-domain",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mcs-server"
 version = "0.1.0"
 dependencies = [
