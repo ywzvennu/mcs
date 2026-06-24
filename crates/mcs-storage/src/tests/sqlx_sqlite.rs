@@ -5,16 +5,17 @@
 //! In-memory SQLite needs no filesystem and is torn down when the pool drops,
 //! so the tests are hermetic and fast.
 
-use mcs_core::{Color, EndReason, Outcome, VariantOptions};
+use mcs_core::{Action, Color, EndReason, Outcome, VariantOptions};
 use mcs_domain::{
-    ColorPreference, EvmAddress, Game, GameLifecycle, Rating, Seek, TimeControl, User, UserId,
+    ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Rating, Seek, TimeControl, User,
+    UserId,
 };
 use time::OffsetDateTime;
 
 // The repository methods are invoked through `&dyn Trait` handles returned by
 // the `Repositories` accessors, so the individual repo traits need not be in
 // scope here.
-use crate::{Repositories, SqlxStorage, StorageError};
+use crate::{RecordedAction, Repositories, SqlxStorage, StorageError};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -67,6 +68,19 @@ fn sample_seek(creator: UserId) -> Seek {
         ColorPreference::Random,
         OffsetDateTime::UNIX_EPOCH,
     )
+}
+
+/// Builds a [`RecordedAction`] at `ply` with a distinct JSON payload and clocks,
+/// so a listed action can be checked to round-trip exactly.
+fn sample_action(ply: u32, player: Color) -> RecordedAction {
+    RecordedAction {
+        ply,
+        player,
+        action: Action::new(serde_json::json!({ "move": format!("e{ply}"), "ply": ply })),
+        clock_white_ms: Some(180_000 - u64::from(ply)),
+        clock_black_ms: Some(170_000 - u64::from(ply)),
+        created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(i64::from(ply)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +372,129 @@ async fn game_list_unfinished_excludes_finished_includes_others() {
     assert!(unfinished
         .iter()
         .all(|g| g.lifecycle != GameLifecycle::Finished));
+}
+
+// ---------------------------------------------------------------------------
+// ActionLogRepo
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn action_log_append_list_preserves_order_payload_and_clocks() {
+    let storage = storage().await;
+    let game = GameId::new();
+
+    // Append out of ply order to prove `list` reorders by ply ascending.
+    let a0 = sample_action(0, Color::White);
+    let a1 = sample_action(1, Color::Black);
+    let a2 = sample_action(2, Color::White);
+    storage.actions().append(game, &a2).await.unwrap();
+    storage.actions().append(game, &a0).await.unwrap();
+    storage.actions().append(game, &a1).await.unwrap();
+
+    let listed = storage.actions().list(game).await.unwrap();
+    // Ply-ascending order, with the exact actions and clocks preserved.
+    assert_eq!(listed, vec![a0.clone(), a1, a2]);
+    // The exact `Action` JSON survives the TEXT column round-trip.
+    assert_eq!(
+        listed[0].action.as_value(),
+        &serde_json::json!({ "move": "e0", "ply": 0 })
+    );
+    assert_eq!(listed[0].clock_white_ms, Some(180_000));
+    assert_eq!(listed[0].clock_black_ms, Some(170_000));
+}
+
+#[tokio::test]
+async fn action_log_last_ply_tracks_max_and_empty_is_none() {
+    let storage = storage().await;
+    let game = GameId::new();
+
+    assert_eq!(storage.actions().last_ply(game).await.unwrap(), None);
+
+    storage
+        .actions()
+        .append(game, &sample_action(0, Color::White))
+        .await
+        .unwrap();
+    storage
+        .actions()
+        .append(game, &sample_action(1, Color::Black))
+        .await
+        .unwrap();
+    assert_eq!(storage.actions().last_ply(game).await.unwrap(), Some(1));
+}
+
+#[tokio::test]
+async fn action_log_duplicate_ply_is_conflict() {
+    let storage = storage().await;
+    let game = GameId::new();
+
+    storage
+        .actions()
+        .append(game, &sample_action(0, Color::White))
+        .await
+        .unwrap();
+    let err = storage
+        .actions()
+        .append(game, &sample_action(0, Color::Black))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::Conflict(_)));
+}
+
+#[tokio::test]
+async fn action_log_empty_game_returns_empty_and_none() {
+    let storage = storage().await;
+    let game = GameId::new();
+    assert!(storage.actions().list(game).await.unwrap().is_empty());
+    assert_eq!(storage.actions().last_ply(game).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn action_log_untimed_clocks_round_trip_as_none() {
+    let storage = storage().await;
+    let game = GameId::new();
+    let action = RecordedAction {
+        ply: 0,
+        player: Color::White,
+        action: Action::new(serde_json::json!({ "resign": true })),
+        clock_white_ms: None,
+        clock_black_ms: None,
+        created_at: OffsetDateTime::UNIX_EPOCH,
+    };
+    storage.actions().append(game, &action).await.unwrap();
+
+    let listed = storage.actions().list(game).await.unwrap();
+    assert_eq!(listed, vec![action]);
+}
+
+#[tokio::test]
+async fn action_log_listed_action_round_trips_through_apply_shape() {
+    // Proves a stored action can be fed back into a `GameSession::apply` shape:
+    // its JSON value survives the store/list round-trip unchanged, so the same
+    // bytes the variant produced are the bytes it would receive on replay.
+    let storage = storage().await;
+    let game = GameId::new();
+
+    let original = serde_json::json!({
+        "kind": "move",
+        "from": "e2",
+        "to": "e4",
+        "promotion": serde_json::Value::Null,
+    });
+    let action = RecordedAction {
+        ply: 0,
+        player: Color::White,
+        action: Action::new(original.clone()),
+        clock_white_ms: Some(120_000),
+        clock_black_ms: Some(120_000),
+        created_at: OffsetDateTime::UNIX_EPOCH,
+    };
+    storage.actions().append(game, &action).await.unwrap();
+
+    let listed = storage.actions().list(game).await.unwrap();
+    let replayed: &Action = &listed[0].action;
+    // The value handed to `apply` on replay is byte-for-byte the original.
+    assert_eq!(replayed.as_value(), &original);
 }
 
 // ---------------------------------------------------------------------------
