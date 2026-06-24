@@ -44,7 +44,7 @@ use time::OffsetDateTime;
 use mcs_core::{Color, VariantOptions};
 use mcs_domain::{
     ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Rating, Seek, SeekId, TimeControl,
-    User, UserId,
+    UserId,
 };
 use mcs_game::{Pairing, SubmitOutcome};
 use mcs_storage::ClaimOutcome;
@@ -312,8 +312,17 @@ pub struct LeaderboardResponse {
 /// A user's **public** profile.
 ///
 /// Deliberately a narrow projection of [`User`]: it exposes only the address,
-/// the optional username, and the creation time. No session, nonce, or other
+/// the optional username, the creation time, and the real-time `online` flag
+/// (see [`crate::presence::PresenceTracker`]). No session, nonce, or other
 /// sensitive state is ever included.
+///
+/// # Online flag
+///
+/// `online` is `true` when the user made an authenticated REST or WebSocket
+/// request within the configured TTL on **this** node. In a multi-node
+/// deployment a user may appear offline here while being active on another
+/// node; a Redis-backed [`PresenceTracker`](crate::presence::PresenceTracker)
+/// is the cross-node upgrade path.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProfileDto {
     /// The user's stable identifier.
@@ -325,17 +334,27 @@ pub struct ProfileDto {
     /// When the account was created (RFC 3339, UTC).
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Whether the user is currently online (seen within the configured TTL).
+    pub online: bool,
 }
 
-impl From<User> for ProfileDto {
-    fn from(user: User) -> Self {
-        Self {
-            id: user.id,
-            address: user.address,
-            username: user.username,
-            created_at: user.created_at,
-        }
-    }
+/// Response body for `GET /users/{id}/status`.
+///
+/// Reports whether a user is currently online and when they were last seen.
+/// `online` is derived from the configured TTL (see
+/// [`AppState::online_ttl`](crate::state::AppState::online_ttl)).
+#[derive(Debug, Clone, Serialize)]
+pub struct UserStatusResponse {
+    /// `true` when the user was seen within the online TTL on this node.
+    pub online: bool,
+    /// The most recent instant the user made an authenticated request on this
+    /// node. `null` if this user has never been seen.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub last_seen: Option<OffsetDateTime>,
 }
 
 // ---------------------------------------------------------------------------
@@ -378,8 +397,8 @@ pub fn accept_seek_router() -> Router<AppState> {
     Router::new().route("/seeks/{id}/accept", post(accept_seek))
 }
 
-/// Builds the read sub-router: the seek lobby, game lookups, the game list, and
-/// profiles.
+/// Builds the read sub-router: the seek lobby, game lookups, the game list,
+/// profiles, and the user-status endpoint.
 ///
 /// These endpoints are unauthenticated reads, except `GET /profile`, which
 /// requires a session to identify "the caller".
@@ -390,6 +409,7 @@ pub fn read_router() -> Router<AppState> {
         .route("/games", get(list_games))
         .route("/leaderboard", get(leaderboard))
         .route("/users/{id}", get(get_profile))
+        .route("/users/{id}/status", get(get_user_status))
         .route("/profile", get(my_profile))
 }
 
@@ -724,20 +744,57 @@ async fn leaderboard(
 /// `GET /users/{id}` — the public profile for a user.
 ///
 /// Returns only public fields (see [`ProfileDto`]); a missing user is a **404
-/// Not Found**.
+/// Not Found**. The `online` flag is derived from the node-local presence
+/// tracker and reflects activity on **this** node only.
 async fn get_profile(
     State(state): State<AppState>,
     Path(id): Path<UserId>,
 ) -> ApiResult<Json<ProfileDto>> {
     let user = state.storage().users().get(id).await?;
-    Ok(Json(user.into()))
+    let online = state.presence().is_online(user.id, state.online_ttl());
+    Ok(Json(ProfileDto {
+        id: user.id,
+        address: user.address,
+        username: user.username,
+        created_at: user.created_at,
+        online,
+    }))
+}
+
+/// `GET /users/{id}/status` — the real-time presence status for a user.
+///
+/// Returns `{ "online": bool, "last_seen": Option<rfc3339> }`.
+///
+/// `online` is `true` when the user made an authenticated request within the
+/// configured online TTL on this node. `last_seen` is the RFC 3339 timestamp
+/// of the most recent such request, or `null` if the user has never been seen
+/// on this node.
+async fn get_user_status(
+    State(state): State<AppState>,
+    Path(id): Path<UserId>,
+) -> ApiResult<Json<UserStatusResponse>> {
+    // Verify the user exists so we return 404 for unknown ids rather than just
+    // an "online: false" that could be confused with a valid but offline user.
+    let _user = state.storage().users().get(id).await?;
+    let online = state.presence().is_online(id, state.online_ttl());
+    let last_seen = state.presence().last_seen(id);
+    Ok(Json(UserStatusResponse { online, last_seen }))
 }
 
 /// `GET /profile` — the public profile of the authenticated caller.
 ///
 /// A convenience for "me": the [`AuthUser`] extractor resolves the caller, and
-/// the same public projection is returned.
+/// the same public projection is returned (including the `online` flag, which
+/// will always be `true` here since the request itself stamped the user as
+/// active).
 async fn my_profile(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<ProfileDto>> {
-    let user = state.storage().users().get(user.user_id).await?;
-    Ok(Json(user.into()))
+    let stored = state.storage().users().get(user.user_id).await?;
+    let online = state.presence().is_online(stored.id, state.online_ttl());
+    Ok(Json(ProfileDto {
+        id: stored.id,
+        address: stored.address,
+        username: stored.username,
+        created_at: stored.created_at,
+        online,
+    }))
 }

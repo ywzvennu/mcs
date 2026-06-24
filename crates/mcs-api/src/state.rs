@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 
 use crate::error::ApiError;
 use crate::hub::GameHub;
+use crate::presence::{InProcessPresence, PresenceTracker};
 use crate::rating::RatingUpdateHook;
 
 /// A serializer for the recover-and-insert critical section, keyed by [`GameId`].
@@ -207,6 +208,18 @@ pub struct AppState {
     /// [`RequirePaymentLayer`](mcs_payments::RequirePaymentLayer). Configure it
     /// with [`with_payment`](AppState::with_payment).
     payment_gate: Option<PaymentGate>,
+    /// The player online-presence tracker (#79).
+    ///
+    /// Records the last-seen instant for each user so the API can answer
+    /// `GET /users/{id}/status` and annotate profiles with an `online` flag.
+    /// Defaults to an [`InProcessPresence`] (per-node, in-memory); a
+    /// Redis-backed implementation is the future cross-node upgrade path.
+    /// Configure a non-default tracker via [`with_presence`](AppState::with_presence).
+    presence: Arc<dyn PresenceTracker>,
+    /// How long a user is considered online after their last authenticated
+    /// request. Defaults to [`DEFAULT_ONLINE_TTL`]; override with
+    /// [`with_presence`](AppState::with_presence).
+    online_ttl: Duration,
     /// The cluster-routing setup (#68): the membership registry plus this node's
     /// identity, used by the WebSocket path to decide whether *this* node owns a
     /// game or should redirect the client to the owning node.
@@ -275,6 +288,14 @@ impl std::fmt::Debug for Cluster {
 /// irrelevant single-node (the router never redirects to it).
 const LOCAL_NODE_ID: &str = "local";
 
+/// Default TTL for the online-presence window.
+///
+/// A user is considered online if they have made an authenticated request —
+/// REST or WebSocket — within this window. 30 seconds is the default; a
+/// production deployment can override it via
+/// [`AppState::with_presence`].
+pub const DEFAULT_ONLINE_TTL: Duration = Duration::seconds(30);
+
 impl AppState {
     /// Builds the application state from a single storage handle plus
     /// configuration.
@@ -337,6 +358,10 @@ impl AppState {
             // Payments are off by default: the router behaves exactly as before
             // until a caller opts in via `with_payment`.
             payment_gate: None,
+            // Presence is on by default with an in-process tracker. A multi-node
+            // deployment can swap in a cross-node implementation via `with_presence`.
+            presence: Arc::new(InProcessPresence::new()),
+            online_ttl: DEFAULT_ONLINE_TTL,
             // Single-node by default: a `LocalRegistry` over a synthetic local
             // node, so the WS router computes ownership through the same path a
             // cluster would but always resolves to *this* node — no redirect, no
@@ -387,6 +412,43 @@ impl AppState {
     #[must_use]
     pub fn cluster(&self) -> &Cluster {
         &self.cluster
+    }
+
+    /// Overrides the presence tracker and online TTL, returning the modified
+    /// state (builder style).
+    ///
+    /// The default — installed automatically by [`AppState::new`] — is an
+    /// [`InProcessPresence`] with a 30-second TTL.  Swap it here if you need
+    /// either a shorter TTL (tests) or a cross-node implementation (production
+    /// with Redis).
+    ///
+    /// * `tracker` — the new [`PresenceTracker`] implementation.
+    /// * `ttl` — how long a user is considered online after their last seen
+    ///   request.
+    #[must_use]
+    pub fn with_presence(mut self, tracker: Arc<dyn PresenceTracker>, ttl: Duration) -> Self {
+        self.presence = tracker;
+        self.online_ttl = ttl;
+        self
+    }
+
+    /// Returns the shared presence tracker.
+    ///
+    /// Call [`PresenceTracker::mark_seen`] here after each authenticated
+    /// request to keep the map fresh.
+    #[must_use]
+    pub fn presence(&self) -> &Arc<dyn PresenceTracker> {
+        &self.presence
+    }
+
+    /// Returns the configured online-presence TTL.
+    ///
+    /// A user is considered online when their [`last_seen`](PresenceTracker::last_seen)
+    /// instant is within this window of now. Defaults to
+    /// [`DEFAULT_ONLINE_TTL`].
+    #[must_use]
+    pub fn online_ttl(&self) -> Duration {
+        self.online_ttl
     }
 
     /// Enables the x402 payment gate on game creation, returning the modified
@@ -708,6 +770,8 @@ impl std::fmt::Debug for AppState {
             .field("completion_hook", &"<dyn GameCompletionHook>")
             .field("payment_gate", &self.payment_gate)
             .field("cluster", &self.cluster)
+            .field("presence", &"<dyn PresenceTracker>")
+            .field("online_ttl", &self.online_ttl)
             .finish_non_exhaustive()
     }
 }

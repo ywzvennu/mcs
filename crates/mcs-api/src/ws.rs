@@ -449,6 +449,10 @@ async fn game_socket(
     let claims = verify_session(state.session_config(), &query.token)?;
     let user_id = claims.sub;
 
+    // Mark the connecting user as active so presence tracks WebSocket sessions
+    // in the same way it tracks REST requests (via the AuthUser extractor).
+    state.presence().mark_seen(user_id);
+
     // 3. Cluster routing (#68): does *this* node own the game? Ownership is the
     //    rendezvous owner of the game id over the live membership set. Single-node
     //    the live set is just this node, so this is always true and no redirect is
