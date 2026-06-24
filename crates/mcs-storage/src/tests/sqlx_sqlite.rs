@@ -7,8 +7,8 @@
 
 use mcs_core::{Action, Color, EndReason, Outcome, VariantOptions};
 use mcs_domain::{
-    ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Rating, Seek, TimeControl, User,
-    UserId,
+    Challenge, ChallengeStatus, ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Rating,
+    Seek, TimeControl, User, UserId,
 };
 use time::OffsetDateTime;
 
@@ -68,6 +68,18 @@ fn sample_seek(creator: UserId) -> Seek {
         TimeControl::Unlimited,
         ColorPreference::Random,
         true,
+        OffsetDateTime::UNIX_EPOCH,
+    )
+}
+
+fn sample_challenge(challenger: UserId, challenged: UserId) -> Challenge {
+    Challenge::new(
+        challenger,
+        challenged,
+        "standard".to_owned(),
+        TimeControl::Unlimited,
+        true,
+        ColorPreference::White,
         OffsetDateTime::UNIX_EPOCH,
     )
 }
@@ -592,6 +604,129 @@ async fn seek_list_open() {
     assert_eq!(open.len(), 2);
     assert!(open.iter().any(|s| s.id == a.id));
     assert!(open.iter().any(|s| s.id == c.id));
+}
+
+// ---------------------------------------------------------------------------
+// ChallengeRepo
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn challenge_create_get_round_trip() {
+    let storage = storage().await;
+    let challenge = sample_challenge(UserId::new(), UserId::new());
+
+    storage.challenges().create(&challenge).await.unwrap();
+    let fetched = storage.challenges().get(challenge.id).await.unwrap();
+    assert_eq!(fetched, challenge);
+}
+
+#[tokio::test]
+async fn challenge_get_missing_is_not_found() {
+    let storage = storage().await;
+    let err = storage
+        .challenges()
+        .get(mcs_domain::ChallengeId::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::NotFound));
+}
+
+#[tokio::test]
+async fn challenge_list_incoming_and_outgoing_filter_by_party_and_pending() {
+    let storage = storage().await;
+    let alice = UserId::new();
+    let bob = UserId::new();
+    let carol = UserId::new();
+
+    // Alice → Bob, and Carol → Bob: both incoming for Bob, outgoing for their
+    // respective challengers.
+    let a_to_b = sample_challenge(alice, bob);
+    let c_to_b = sample_challenge(carol, bob);
+    // Alice → Carol: outgoing for Alice, incoming for Carol.
+    let a_to_c = sample_challenge(alice, carol);
+    for c in [&a_to_b, &c_to_b, &a_to_c] {
+        storage.challenges().create(c).await.unwrap();
+    }
+
+    let bob_in = storage.challenges().list_incoming(bob).await.unwrap();
+    assert_eq!(bob_in.len(), 2);
+    assert!(bob_in.iter().all(|c| c.challenged == bob));
+
+    let alice_out = storage.challenges().list_outgoing(alice).await.unwrap();
+    assert_eq!(alice_out.len(), 2);
+    assert!(alice_out.iter().all(|c| c.challenger == alice));
+
+    // Alice has no incoming; Carol has exactly one outgoing.
+    assert!(storage
+        .challenges()
+        .list_incoming(alice)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        storage
+            .challenges()
+            .list_outgoing(carol)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // A non-pending challenge drops out of both listings.
+    let mut declined = a_to_b.clone();
+    declined.decline();
+    storage.challenges().update(&declined).await.unwrap();
+    assert_eq!(
+        storage.challenges().list_incoming(bob).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        storage
+            .challenges()
+            .list_outgoing(alice)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn challenge_update_accept_records_status_and_game() {
+    let storage = storage().await;
+    let mut challenge = sample_challenge(UserId::new(), UserId::new());
+    storage.challenges().create(&challenge).await.unwrap();
+
+    let game = GameId::new();
+    assert!(challenge.accept(game));
+    storage.challenges().update(&challenge).await.unwrap();
+
+    let fetched = storage.challenges().get(challenge.id).await.unwrap();
+    assert_eq!(fetched.status, ChallengeStatus::Accepted);
+    assert_eq!(fetched.game_id, Some(game));
+    assert_eq!(fetched, challenge);
+}
+
+#[tokio::test]
+async fn challenge_update_missing_is_not_found() {
+    let storage = storage().await;
+    let challenge = sample_challenge(UserId::new(), UserId::new());
+    let err = storage.challenges().update(&challenge).await.unwrap_err();
+    assert!(matches!(err, StorageError::NotFound));
+}
+
+#[tokio::test]
+async fn challenge_rated_and_color_round_trip() {
+    let storage = storage().await;
+    let mut casual = sample_challenge(UserId::new(), UserId::new());
+    casual.rated = false;
+    casual.color_preference = ColorPreference::Random;
+    storage.challenges().create(&casual).await.unwrap();
+    let fetched = storage.challenges().get(casual.id).await.unwrap();
+    assert!(!fetched.rated);
+    assert_eq!(fetched.color_preference, ColorPreference::Random);
+    assert_eq!(fetched, casual);
 }
 
 // ---------------------------------------------------------------------------

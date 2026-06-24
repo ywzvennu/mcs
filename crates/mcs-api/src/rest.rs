@@ -22,8 +22,6 @@
 //! sub-router — see the comment on [`seek_router`] — without touching the read
 //! endpoints or the auth/WS routers.
 
-use std::sync::Arc;
-
 use axum::extract::{Path, Query, State};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -35,7 +33,7 @@ use mcs_domain::{
     ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Rating, Seek, SeekId, TimeControl,
     User, UserId,
 };
-use mcs_game::{GameActor, Pairing, SubmitOutcome};
+use mcs_game::{Pairing, SubmitOutcome};
 
 use crate::error::{ApiError, ApiResult};
 use crate::extract::AuthUser;
@@ -360,56 +358,24 @@ async fn create_seek(
 
 /// Creates, persists, spawns, and registers the game for a matched pairing.
 ///
-/// Returns the persisted [`Game`] record (in the [`GameLifecycle::Active`]
-/// state) on success. The session is built from the variant registry; an
-/// unknown variant surfaces as a **400 Bad Request** via the
-/// [`GameError`](mcs_core::GameError) mapping.
+/// A thin adapter over the shared
+/// [`AppState::create_and_spawn_game`](crate::state::AppState::create_and_spawn_game)
+/// helper: it forwards the pairing's players and terms. Seeks do not yet carry
+/// per-game options, so the variant's own defaults
+/// ([`VariantOptions::default`]) are used. Returns the persisted [`Game`]
+/// record (already [`GameLifecycle::Active`]); an unknown variant surfaces as a
+/// **400 Bad Request**.
 async fn create_paired_game(state: &AppState, pairing: Pairing) -> ApiResult<Game> {
-    // Instantiate a fresh session for the agreed variant. The matchmaker only
-    // pairs seeks of the same `variant_id`, so this resolves the one both
-    // players asked for.
-    // The variant options the session is built from. Seeks do not yet carry
-    // per-game options, so this defaults to the variant's own defaults; it is
-    // stored on the record so the game can be re-created on recovery via
-    // `VariantRegistry::new_game(variant_id, &variant_options)`.
-    let variant_options = VariantOptions::default();
-    let session = state
-        .variants()
-        .new_game(&pairing.variant_id, &variant_options)?;
-
-    // Build and persist the durable record. Play starts immediately on pairing,
-    // so the record is created already `Active` rather than `Created`.
-    let mut game = Game::new(
-        pairing.variant_id,
-        variant_options,
-        pairing.white,
-        pairing.black,
-        pairing.time_control.clone(),
-        pairing.rated,
-        OffsetDateTime::now_utc(),
-    );
-    game.lifecycle = GameLifecycle::Active;
-    state.game_repo().create(&game).await?;
-
-    // Spawn the actor over the same backing store and register its handle so the
-    // WebSocket endpoint can find the live game by id. The actor records each
-    // move to the action log and refreshes the live snapshot through the game
-    // repo as play proceeds; the completion hook applies the Glicko-2 rating
-    // update when this game finishes.
-    let repo: Arc<dyn mcs_storage::GameRepo> = state.game_repo().clone();
-    let action_log: Arc<dyn mcs_storage::ActionLogRepo> = state.action_log().clone();
-    let hook = state.completion_hook().clone();
-    let handle = GameActor::spawn(
-        game.id,
-        session,
-        repo,
-        action_log,
-        hook,
-        pairing.time_control,
-    );
-    state.game_hub().insert(game.id, handle);
-
-    Ok(game)
+    state
+        .create_and_spawn_game(
+            pairing.white,
+            pairing.black,
+            &pairing.variant_id,
+            pairing.time_control,
+            pairing.rated,
+            VariantOptions::default(),
+        )
+        .await
 }
 
 /// `DELETE /seeks/{id}` — cancel one of the caller's own open seeks.
