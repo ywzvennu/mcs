@@ -19,7 +19,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use mcs_auth::{generate_nonce, issue_session, verify_siwe};
+use mcs_auth::{generate_nonce, issue_session, nonce_from_message, verify_siwe, ChallengeParams};
 use mcs_domain::{EvmAddress, UserId};
 
 use crate::error::{ApiError, ApiResult};
@@ -141,16 +141,18 @@ async fn nonce(
         .store_nonce(&address, &nonce, expiration)
         .await?;
 
-    let message = build_siwe_message(
-        &cfg.domain,
-        &address,
-        &cfg.uri,
+    let message = ChallengeParams::new(
+        cfg.domain.clone(),
+        address.clone(),
+        cfg.uri.clone(),
         cfg.chain_id,
-        &nonce,
+        nonce.clone(),
         issued_at,
-        &cfg.statement,
-        expiration,
-    )?;
+        Some(cfg.statement.clone()),
+        Some(expiration),
+    )
+    .message()
+    .map_err(|_| ApiError::UnprocessableEntity("invalid SIWE configuration".to_owned()))?;
 
     Ok(Json(NonceResponse {
         message,
@@ -189,7 +191,8 @@ async fn verify(
     // Extract the nonce the wallet actually signed and atomically consume it.
     // This is the single-use enforcement that defeats replay: a captured
     // `(message, signature)` pair fails here the second time.
-    let nonce = nonce_from_message(&body.message)?;
+    let nonce = nonce_from_message(&body.message)
+        .map_err(|_| ApiError::Unauthorized("authentication failed".to_owned()))?;
     let consumed = state
         .storage()
         .sessions()
@@ -210,71 +213,4 @@ async fn verify(
         user_id: user.id,
         address: user.address,
     }))
-}
-
-/// Parses the `Nonce` field out of a SIWE message.
-///
-/// We parse with the same `siwe` crate that `verify_siwe` uses, so the nonce we
-/// consume is exactly the one the wallet signed — there is no way to consume a
-/// different nonce than the one bound into the verified signature.
-fn nonce_from_message(message: &str) -> ApiResult<String> {
-    let parsed: siwe::Message = message
-        .parse()
-        .map_err(|_| ApiError::Unauthorized("authentication failed".to_owned()))?;
-    Ok(parsed.nonce)
-}
-
-/// Renders the canonical EIP-4361 message string for the wallet to sign.
-///
-/// The output is byte-for-byte what [`verify_siwe`] will later parse, so it is
-/// sent to the client verbatim. Field validation (a malformed `domain` or
-/// `uri`) surfaces as **422 Unprocessable Entity**, since those come from the
-/// server's [`SiweConfig`](crate::SiweConfig) rather than the caller — a 422
-/// makes a misconfiguration visible without masquerading as a client error.
-#[allow(clippy::too_many_arguments)]
-fn build_siwe_message(
-    domain: &str,
-    address: &EvmAddress,
-    uri: &str,
-    chain_id: u64,
-    nonce: &str,
-    issued_at: OffsetDateTime,
-    statement: &str,
-    expiration: OffsetDateTime,
-) -> ApiResult<String> {
-    let message = siwe::Message {
-        domain: domain
-            .parse()
-            .map_err(|_| ApiError::UnprocessableEntity("invalid SIWE domain".to_owned()))?,
-        address: address_bytes(address)?,
-        statement: Some(statement.to_owned()),
-        uri: uri
-            .parse()
-            .map_err(|_| ApiError::UnprocessableEntity("invalid SIWE uri".to_owned()))?,
-        version: siwe::Version::V1,
-        chain_id,
-        nonce: nonce.to_owned(),
-        issued_at: issued_at.into(),
-        expiration_time: Some(expiration.into()),
-        not_before: None,
-        request_id: None,
-        resources: vec![],
-    };
-    Ok(message.to_string())
-}
-
-/// Converts a validated [`EvmAddress`] into its raw 20-byte form.
-///
-/// [`EvmAddress`] guarantees a lowercase, `0x`-prefixed, 40-hex-char string, so
-/// this cannot realistically fail; the fallible signature only guards the
-/// invariant rather than panicking.
-fn address_bytes(address: &EvmAddress) -> ApiResult<[u8; 20]> {
-    let hex = address
-        .as_str()
-        .strip_prefix("0x")
-        .ok_or_else(|| ApiError::UnprocessableEntity("invalid address".to_owned()))?;
-    let mut out = [0u8; 20];
-    hex::decode_to_slice(hex, &mut out)
-        .map_err(|_| ApiError::UnprocessableEntity("invalid address".to_owned()))?;
-    Ok(out)
 }

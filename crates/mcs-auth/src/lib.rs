@@ -78,4 +78,4 @@ mod siwe_verify;
 pub use challenge::{generate_nonce, ChallengeParams};
 pub use error::AuthError;
 pub use session::{issue_session, verify_session, Claims, SessionConfig};
-pub use siwe_verify::verify_siwe;
+pub use siwe_verify::{nonce_from_message, verify_siwe};
