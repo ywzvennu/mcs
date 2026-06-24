@@ -671,6 +671,11 @@ impl AppState {
         );
         self.game_hub.insert(game.id, handle);
 
+        // Count the creation (#88). This is the single shared creation path, so
+        // matchmaking pairings, accepted challenges, and live rematches are all
+        // tallied here exactly once.
+        crate::metrics::record_game_created();
+
         // 5. Hand back the persisted record.
         Ok(game)
     }

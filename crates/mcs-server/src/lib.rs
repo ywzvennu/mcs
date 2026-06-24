@@ -25,6 +25,7 @@
 
 pub mod cluster;
 pub mod config;
+pub mod metrics;
 
 use std::sync::Arc;
 
@@ -131,12 +132,29 @@ pub fn build_state(
 /// Assembles the complete application [`Router`] from an [`AppState`].
 ///
 /// The result is the `mcs-api` top-level router (auth, REST, and WebSocket
-/// routes) merged with a `GET /health` endpoint, wrapped in the observability
+/// routes) merged with the operational endpoints, wrapped in the observability
 /// middleware stack: a request-id layer (read-or-generate `x-request-id`), its
 /// propagation to the response, and the HTTP trace layer.
 ///
 /// This takes a fully-built [`AppState`] rather than a [`Config`] so tests can
 /// inject an in-memory backend; see [`build_app`] for the config-driven path.
+///
+/// # Operational endpoints (#88)
+///
+/// Three probe/observability routes are mounted here, outside the API surface so
+/// they are unauthenticated and free of the payment gate:
+///
+/// - `GET /health` — **liveness**: always `200 {"status":"ok"}` while the
+///   process is up; touches no dependency (see [`health`]).
+/// - `GET /ready` — **readiness**: `200 {"status":"ready"}` only when the
+///   database (and, in a cluster, Redis) are reachable, else `503` naming the
+///   failed dependency (see [`mcs_api::ready_router`]).
+/// - `GET /metrics` — **Prometheus** exposition text for the metrics the API
+///   records (HTTP request count/latency, live games, games created, rating
+///   updates, active WebSocket connections; see [`mcs_api::metrics`]).
+///
+/// The Prometheus recorder is installed (once per process) by
+/// [`metrics::handle`] the first time this function runs.
 pub fn router(state: AppState) -> Router {
     let (set_request_id, propagate_request_id) = mcs_observability::request_id_layers();
 
@@ -145,8 +163,13 @@ pub fn router(state: AppState) -> Router {
         .layer(propagate_request_id)
         .layer(mcs_observability::http_trace_layer());
 
+    // Install (once) the Prometheus recorder and mount the scrape endpoint. The
+    // API router's middleware records into this recorder; `/metrics` renders it.
+    let metrics_handle = metrics::handle();
+
     mcs_api::router(state)
         .route("/health", get(health))
+        .merge(metrics::metrics_router(metrics_handle))
         .layer(middleware)
 }
 

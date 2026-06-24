@@ -58,6 +58,26 @@
 //! [`facilitator_url`](PaymentSettings::facilitator_url) at a standards-compliant
 //! x402 facilitator (see [`mcs_payments::FacilitatorVerifier`]); the verifier
 //! delegates `/verify` + `/settle` to it.
+//!
+//! # Operational endpoints (#88)
+//!
+//! Three unauthenticated, un-gated routes serve orchestration and monitoring,
+//! mounted by [`router`](crate::router) outside the API surface:
+//!
+//! | Method & path | Purpose | Body |
+//! |---------------|---------|------|
+//! | `GET /health` | **liveness** — is the process up? | `{"status":"ok"}` (always 200) |
+//! | `GET /ready`  | **readiness** — are dependencies reachable? | `{"status":"ready"}` (200) or `{"status":"unavailable","failed":"…"}` (503) |
+//! | `GET /metrics`| **Prometheus** scrape | `text/plain; version=0.0.4` exposition |
+//!
+//! Liveness touches nothing; readiness verifies the database (a `LIMIT 1` read)
+//! and, when cluster mode is enabled, the Redis-backed membership store, naming
+//! the first unhealthy dependency (`database` or `cluster`) in its 503 body. The
+//! `/metrics` endpoint renders the recorder installed at start-up; the exported
+//! series are `mcs_http_requests_total` and `mcs_http_request_duration_seconds`
+//! (labelled by method, route template, and status), `mcs_games_live`,
+//! `mcs_games_created_total`, `mcs_rating_updates_total`, and
+//! `mcs_ws_connections_active`. See [`mcs_api::metrics`] for the full catalogue.
 
 use std::net::SocketAddr;
 
