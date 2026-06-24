@@ -381,14 +381,23 @@ async fn concurrent_accepts_produce_exactly_one_game() {
         router.clone().oneshot(accept_seek(&bob_token, &seek_id)),
         router.clone().oneshot(accept_seek(&carol_token, &seek_id)),
     );
-    let mut statuses = [bob_resp.unwrap().status(), carol_resp.unwrap().status()];
-    statuses.sort();
+    let statuses = [bob_resp.unwrap().status(), carol_resp.unwrap().status()];
 
-    // Exactly one accept wins (200); the other loses the claim (409).
+    // Exactly one accept wins (200). The loser either raced the atomic claim
+    // (409 Conflict) or read after the seek was already gone (404 Not Found) —
+    // both are correct outcomes; what must never happen is two winners.
+    let winners = statuses.iter().filter(|s| **s == StatusCode::OK).count();
+    let losers = statuses
+        .iter()
+        .filter(|s| matches!(**s, StatusCode::CONFLICT | StatusCode::NOT_FOUND))
+        .count();
     assert_eq!(
-        statuses,
-        [StatusCode::OK, StatusCode::CONFLICT],
-        "exactly one concurrent accept must succeed"
+        winners, 1,
+        "exactly one concurrent accept must succeed; got {statuses:?}"
+    );
+    assert_eq!(
+        losers, 1,
+        "the other accept must lose (409) or find the seek gone (404); got {statuses:?}"
     );
 
     // The seek is gone and the lobby is empty.
