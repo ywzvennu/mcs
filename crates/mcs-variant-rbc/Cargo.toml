@@ -1,0 +1,21 @@
+[package]
+name = "mcs-variant-rbc"
+description = "Reconnaissance Blind Chess variant for the MCS server, backed by rbc-rs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mcs-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `rbc-rs` is not yet published to crates.io, so it is pulled from its public
+# (MIT) source repository, pinned to a specific commit for reproducible builds.
+# Its `serde` feature is on by default and is relied upon for wire types.
+rbc-rs = { git = "https://github.com/ywzvennu/rbc-rs", branch = "main" }
