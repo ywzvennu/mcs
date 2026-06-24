@@ -22,6 +22,10 @@ mcs-game.workspace = true
 # path (the workspace manifest carries no `mcs-rating` entry, and the common
 # rule is that crate PRs do not edit the root manifest).
 mcs-rating = { path = "../mcs-rating", features = ["domain"] }
+# x402 payment middleware used to optionally gate game creation (`POST /seeks`).
+# Referenced by path: `mcs-payments` is not in `[workspace.dependencies]`, and
+# member path deps are allowed (only the root manifest is off-limits).
+mcs-payments = { path = "../mcs-payments" }
 async-trait.workspace = true
 axum.workspace = true
 serde.workspace = true

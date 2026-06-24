@@ -29,6 +29,10 @@ mcs-variant-shakmaty = { path = "../mcs-variant-shakmaty" }
 # observability crate not (yet) listed in `[workspace.dependencies]`, and adding
 # it there would mean editing the root manifest, which this crate must not do.
 mcs-observability = { path = "../mcs-observability" }
+# x402 payment middleware. Referenced by path: not in `[workspace.dependencies]`,
+# and member path deps are allowed (only the root manifest is off-limits). Used
+# to build the optional game-creation payment gate from `[payments]` config.
+mcs-payments = { path = "../mcs-payments" }
 
 axum.workspace = true
 tokio.workspace = true

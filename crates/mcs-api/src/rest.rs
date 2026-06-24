@@ -268,21 +268,29 @@ impl From<User> for ProfileDto {
 // Routers
 // ---------------------------------------------------------------------------
 
-/// Builds the seek sub-router: the write endpoints that create or cancel seeks.
+/// Builds the seek **creation** sub-router: the single `POST /seeks` route.
 ///
-/// # Payment middleware (x402)
+/// # Payment middleware (x402, #45)
 ///
-/// `POST /seeks` is the request that spawns a paid game. It is isolated on this
-/// sub-router precisely so an x402 payment middleware can be attached here —
-/// e.g. `seek_router().layer(x402_layer)` — to gate game creation behind a
-/// settled payment, without affecting the read-only game/profile endpoints or
-/// the auth and WebSocket routers. The cancel route lives here too because it is
-/// the natural inverse of the create route; a payment layer would scope itself
-/// to the `POST` method only.
-pub fn seek_router() -> Router<AppState> {
-    Router::new()
-        .route("/seeks", post(create_seek))
-        .route("/seeks/{id}", delete(cancel_seek))
+/// `POST /seeks` is the request that spawns a paid game, so it is isolated on
+/// its own one-route sub-router precisely so an x402 payment middleware can wrap
+/// *only* it — e.g. `create_seek_router().layer(RequirePaymentLayer::new(..))`.
+/// [`crate::router`] does exactly that when the [`AppState`] carries a
+/// [`PaymentGate`](crate::state::PaymentGate); otherwise this router is merged
+/// in untouched and creation stays free. The cancel route is deliberately kept
+/// out of this router (see [`cancel_seek_router`]) so the gate scopes to game
+/// creation alone.
+pub fn create_seek_router() -> Router<AppState> {
+    Router::new().route("/seeks", post(create_seek))
+}
+
+/// Builds the seek **cancellation** sub-router: the single `DELETE /seeks/{id}`
+/// route.
+///
+/// Kept separate from [`create_seek_router`] so the x402 payment layer (#45)
+/// gates creation only: cancelling one's own open seek is never charged.
+pub fn cancel_seek_router() -> Router<AppState> {
+    Router::new().route("/seeks/{id}", delete(cancel_seek))
 }
 
 /// Builds the read sub-router: game lookups, the game list, and profiles.

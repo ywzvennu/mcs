@@ -29,6 +29,30 @@
 //! | `siwe.chain_id`    | `MCS_SIWE__CHAIN_ID` | `1`                           |
 //! | `siwe.statement`   | `MCS_SIWE__STATEMENT`| `Sign in to MCS.`             |
 //! | `siwe.nonce_ttl_secs` | `MCS_SIWE__NONCE_TTL_SECS` | `600` (10m)        |
+//! | `payments.enabled` | `MCS_PAYMENTS__ENABLED` | `false`                    |
+//! | `payments.scheme`  | `MCS_PAYMENTS__SCHEME`  | `exact`                    |
+//! | `payments.network` | `MCS_PAYMENTS__NETWORK` | `base-sepolia`             |
+//! | `payments.asset`   | `MCS_PAYMENTS__ASSET`   | `0x036C…aB32` (USDC)       |
+//! | `payments.pay_to`  | `MCS_PAYMENTS__PAY_TO`  | *(zero address)*           |
+//! | `payments.max_amount_required` | `MCS_PAYMENTS__MAX_AMOUNT_REQUIRED` | `10000` |
+//! | `payments.description` | `MCS_PAYMENTS__DESCRIPTION` | `Create an MCS game.`  |
+//! | `payments.max_timeout_seconds` | `MCS_PAYMENTS__MAX_TIMEOUT_SECONDS` | `300` |
+//! | `payments.verifier` | `MCS_PAYMENTS__VERIFIER` | `mock`                    |
+//!
+//! # Payments (x402, #45)
+//!
+//! Game creation (`POST /seeks`) can be gated behind an x402 payment. The gate
+//! is **off by default** ([`PaymentSettings::enabled`] = `false`): the server
+//! boots free. When enabled, the composition root builds a
+//! [`PaymentRequirements`](mcs_payments::PaymentRequirements) plus a verifier
+//! and calls [`AppState::with_payment`](mcs_api::AppState::with_payment); the
+//! API then wraps only the creation route in the payment layer. This is the
+//! hook where, per the roadmap, RBC (and other) game creation would be charged.
+//!
+//! The default [`verifier`](PaymentSettings::verifier) is the development
+//! [`MockVerifier`](mcs_payments::MockVerifier), which performs **no on-chain
+//! checks** and must never be used in production. A real deployment supplies a
+//! facilitator-backed verifier; see [`mcs_payments::PaymentVerifier`].
 
 use std::net::SocketAddr;
 
@@ -72,6 +96,8 @@ pub struct Config {
     pub session: SessionSettings,
     /// Sign-In with Ethereum challenge configuration.
     pub siwe: SiweSettings,
+    /// x402 payment gating for game creation (off by default).
+    pub payments: PaymentSettings,
 }
 
 /// Logging configuration.
@@ -143,6 +169,52 @@ pub struct SiweSettings {
     pub nonce_ttl_secs: u64,
 }
 
+/// x402 payment-gate configuration for game creation (#45).
+///
+/// All fields map onto a single
+/// [`PaymentRequirements`](mcs_payments::PaymentRequirements) entry plus a
+/// verifier selector. The gate is **disabled by default** — `enabled = false`
+/// leaves `POST /seeks` free and is the only field that matters until an
+/// operator opts in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaymentSettings {
+    /// Whether to gate game creation behind an x402 payment. `false` by default,
+    /// so the server boots free and behaves exactly as before.
+    pub enabled: bool,
+    /// The x402 scheme advertised to clients. The canonical value is `"exact"`.
+    pub scheme: String,
+    /// The target network (e.g. `"base"`, `"base-sepolia"`).
+    pub network: String,
+    /// The accepted payment-token contract address (e.g. USDC).
+    pub asset: String,
+    /// The on-chain address that must receive the payment.
+    pub pay_to: String,
+    /// The maximum token amount accepted, in the asset's smallest unit (e.g.
+    /// `"10000"` is 0.01 USDC at 6 decimals).
+    pub max_amount_required: String,
+    /// Human-readable description shown to the payer before paying.
+    pub description: String,
+    /// Maximum seconds a signed authorization may stay pending before expiring.
+    pub max_timeout_seconds: u64,
+    /// Which [`PaymentVerifier`](mcs_payments::PaymentVerifier) implementation to
+    /// build. Defaults to the development [`Mock`](VerifierChoice::Mock).
+    pub verifier: VerifierChoice,
+}
+
+/// Selects which payment verifier the server constructs when payments are
+/// [`enabled`](PaymentSettings::enabled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerifierChoice {
+    /// The development [`MockVerifier`](mcs_payments::MockVerifier): accepts any
+    /// well-formed payload whose scheme/network/asset match. **Never use in
+    /// production** — it performs no cryptographic or on-chain checks. This is
+    /// the default so a misconfiguration cannot silently enable real charging.
+    #[default]
+    Mock,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -151,6 +223,26 @@ impl Default for Config {
             log: LogConfig::default(),
             session: SessionSettings::default(),
             siwe: SiweSettings::default(),
+            payments: PaymentSettings::default(),
+        }
+    }
+}
+
+impl Default for PaymentSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scheme: "exact".to_owned(),
+            network: "base-sepolia".to_owned(),
+            // USDC on Base Sepolia (6 decimals) — a sensible testnet default.
+            asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e".to_owned(),
+            // The zero address: a deliberately invalid recipient so an operator
+            // who enables payments without setting `pay_to` notices immediately.
+            pay_to: "0x0000000000000000000000000000000000000000".to_owned(),
+            max_amount_required: "10000".to_owned(),
+            description: "Create an MCS game.".to_owned(),
+            max_timeout_seconds: 300,
+            verifier: VerifierChoice::default(),
         }
     }
 }
@@ -232,6 +324,43 @@ impl Config {
     }
 }
 
+impl PaymentSettings {
+    /// Builds the x402 [`PaymentRequirements`] advertised in `402` bodies from
+    /// these settings.
+    ///
+    /// `resource` is the path the gate protects (`/seeks`); it is echoed back to
+    /// the client so it knows which request the payment unlocks.
+    #[must_use]
+    pub fn requirements(&self, resource: &str) -> mcs_payments::PaymentRequirements {
+        mcs_payments::PaymentRequirements {
+            scheme: self.scheme.clone(),
+            network: self.network.clone(),
+            max_amount_required: self.max_amount_required.clone(),
+            resource: resource.to_owned(),
+            description: self.description.clone(),
+            mime_type: "application/json".to_owned(),
+            pay_to: self.pay_to.clone(),
+            max_timeout_seconds: self.max_timeout_seconds,
+            asset: self.asset.clone(),
+            extra: None,
+        }
+    }
+
+    /// Constructs the shared [`PaymentVerifier`](mcs_payments::PaymentVerifier)
+    /// selected by [`verifier`](PaymentSettings::verifier).
+    ///
+    /// The default [`VerifierChoice::Mock`] returns a
+    /// [`MockVerifier`](mcs_payments::MockVerifier) — development/test only. A
+    /// production deployment would extend [`VerifierChoice`] with a
+    /// facilitator-client variant and return it here.
+    #[must_use]
+    pub fn build_verifier(&self) -> std::sync::Arc<dyn mcs_payments::PaymentVerifier> {
+        match self.verifier {
+            VerifierChoice::Mock => std::sync::Arc::new(mcs_payments::MockVerifier),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +386,24 @@ mod tests {
     fn log_format_choice_maps_to_observability_enum() {
         assert_eq!(LogFormat::from(LogFormatChoice::Pretty), LogFormat::Pretty);
         assert_eq!(LogFormat::from(LogFormatChoice::Json), LogFormat::Json);
+    }
+
+    #[test]
+    fn payments_are_disabled_by_default() {
+        let cfg = Config::default();
+        assert!(!cfg.payments.enabled, "payments must be off by default");
+        assert_eq!(cfg.payments.scheme, "exact");
+        assert_eq!(cfg.payments.verifier, VerifierChoice::Mock);
+    }
+
+    #[test]
+    fn payment_settings_build_matching_requirements() {
+        let cfg = Config::default();
+        let reqs = cfg.payments.requirements("/seeks");
+        assert_eq!(reqs.scheme, cfg.payments.scheme);
+        assert_eq!(reqs.network, cfg.payments.network);
+        assert_eq!(reqs.asset, cfg.payments.asset);
+        assert_eq!(reqs.resource, "/seeks");
+        assert_eq!(reqs.mime_type, "application/json");
     }
 }
