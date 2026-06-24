@@ -1,0 +1,258 @@
+//! In-memory repository implementations used exclusively in tests.
+//!
+//! These structs satisfy all repository traits using `Mutex<HashMap<…>>` so
+//! no real database is needed. They are the reference implementations used to
+//! verify trait object safety and ergonomics.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+use mcs_domain::{EvmAddress, Game, GameId, Seek, SeekId, User, UserId};
+use time::OffsetDateTime;
+
+use crate::{
+    error::{StorageError, StorageResult},
+    game::GameRepo,
+    repositories::Repositories,
+    seek::SeekRepo,
+    session::SessionRepo,
+    user::UserRepo,
+};
+
+// ---------------------------------------------------------------------------
+// MemoryUserRepo
+// ---------------------------------------------------------------------------
+
+/// In-memory [`UserRepo`] backed by a `HashMap`.
+#[derive(Debug, Default)]
+pub(super) struct MemoryUserRepo {
+    by_id: Mutex<HashMap<UserId, User>>,
+}
+
+#[async_trait]
+impl UserRepo for MemoryUserRepo {
+    async fn create(&self, user: &User) -> StorageResult<()> {
+        let mut map = self.by_id.lock().expect("mutex poisoned");
+        if map.contains_key(&user.id) {
+            return Err(StorageError::Conflict(format!(
+                "user id {} already exists",
+                user.id
+            )));
+        }
+        if map.values().any(|u| u.address == user.address) {
+            return Err(StorageError::Conflict(format!(
+                "user address {} already exists",
+                user.address
+            )));
+        }
+        map.insert(user.id, user.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: UserId) -> StorageResult<User> {
+        let map = self.by_id.lock().expect("mutex poisoned");
+        map.get(&id).cloned().ok_or(StorageError::NotFound)
+    }
+
+    async fn find_by_address(&self, addr: &EvmAddress) -> StorageResult<Option<User>> {
+        let map = self.by_id.lock().expect("mutex poisoned");
+        Ok(map.values().find(|u| &u.address == addr).cloned())
+    }
+
+    async fn upsert_by_address(&self, addr: &EvmAddress) -> StorageResult<User> {
+        let mut map = self.by_id.lock().expect("mutex poisoned");
+        if let Some(existing) = map.values().find(|u| &u.address == addr).cloned() {
+            return Ok(existing);
+        }
+        let user = User::new(addr.clone(), None, OffsetDateTime::now_utc());
+        map.insert(user.id, user.clone());
+        Ok(user)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MemoryGameRepo
+// ---------------------------------------------------------------------------
+
+/// In-memory [`GameRepo`] backed by a `HashMap`.
+#[derive(Debug, Default)]
+pub(super) struct MemoryGameRepo {
+    games: Mutex<HashMap<GameId, Game>>,
+}
+
+#[async_trait]
+impl GameRepo for MemoryGameRepo {
+    async fn create(&self, game: &Game) -> StorageResult<()> {
+        let mut map = self.games.lock().expect("mutex poisoned");
+        if map.contains_key(&game.id) {
+            return Err(StorageError::Conflict(format!(
+                "game id {} already exists",
+                game.id
+            )));
+        }
+        map.insert(game.id, game.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: GameId) -> StorageResult<Game> {
+        let map = self.games.lock().expect("mutex poisoned");
+        map.get(&id).cloned().ok_or(StorageError::NotFound)
+    }
+
+    async fn update(&self, game: &Game) -> StorageResult<()> {
+        let mut map = self.games.lock().expect("mutex poisoned");
+        if !map.contains_key(&game.id) {
+            return Err(StorageError::NotFound);
+        }
+        map.insert(game.id, game.clone());
+        Ok(())
+    }
+
+    async fn list_recent(&self, limit: u32) -> StorageResult<Vec<Game>> {
+        let map = self.games.lock().expect("mutex poisoned");
+        let mut games: Vec<Game> = map.values().cloned().collect();
+        // Newest first (by created_at); stable sort for determinism.
+        games.sort_by_key(|g| std::cmp::Reverse(g.created_at));
+        games.truncate(limit as usize);
+        Ok(games)
+    }
+
+    async fn list_for_user(&self, user: UserId, limit: u32) -> StorageResult<Vec<Game>> {
+        let map = self.games.lock().expect("mutex poisoned");
+        let mut games: Vec<Game> = map
+            .values()
+            .filter(|g| g.white == user || g.black == user)
+            .cloned()
+            .collect();
+        games.sort_by_key(|g| std::cmp::Reverse(g.created_at));
+        games.truncate(limit as usize);
+        Ok(games)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MemorySeekRepo
+// ---------------------------------------------------------------------------
+
+/// In-memory [`SeekRepo`] backed by a `HashMap`.
+#[derive(Debug, Default)]
+pub(super) struct MemorySeekRepo {
+    seeks: Mutex<HashMap<SeekId, Seek>>,
+}
+
+#[async_trait]
+impl SeekRepo for MemorySeekRepo {
+    async fn create(&self, seek: &Seek) -> StorageResult<()> {
+        let mut map = self.seeks.lock().expect("mutex poisoned");
+        if map.contains_key(&seek.id) {
+            return Err(StorageError::Conflict(format!(
+                "seek id {} already exists",
+                seek.id
+            )));
+        }
+        map.insert(seek.id, seek.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: SeekId) -> StorageResult<Option<Seek>> {
+        let map = self.seeks.lock().expect("mutex poisoned");
+        Ok(map.get(&id).cloned())
+    }
+
+    async fn remove(&self, id: SeekId) -> StorageResult<()> {
+        let mut map = self.seeks.lock().expect("mutex poisoned");
+        map.remove(&id);
+        Ok(())
+    }
+
+    async fn list_open(&self) -> StorageResult<Vec<Seek>> {
+        let map = self.seeks.lock().expect("mutex poisoned");
+        Ok(map.values().cloned().collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MemorySessionRepo
+// ---------------------------------------------------------------------------
+
+/// A stored nonce entry.
+#[derive(Debug, Clone)]
+struct NonceEntry {
+    expires_at: OffsetDateTime,
+}
+
+/// In-memory [`SessionRepo`] backed by a nested `HashMap`.
+///
+/// Key: `(address_string, nonce_string)` → [`NonceEntry`].
+#[derive(Debug, Default)]
+pub(super) struct MemorySessionRepo {
+    nonces: Mutex<HashMap<(String, String), NonceEntry>>,
+}
+
+#[async_trait]
+impl SessionRepo for MemorySessionRepo {
+    async fn store_nonce(
+        &self,
+        address: &EvmAddress,
+        nonce: &str,
+        expires_at: OffsetDateTime,
+    ) -> StorageResult<()> {
+        let mut map = self.nonces.lock().expect("mutex poisoned");
+        map.insert(
+            (address.to_string(), nonce.to_owned()),
+            NonceEntry { expires_at },
+        );
+        Ok(())
+    }
+
+    async fn consume_nonce(&self, address: &EvmAddress, nonce: &str) -> StorageResult<bool> {
+        let mut map = self.nonces.lock().expect("mutex poisoned");
+        let key = (address.to_string(), nonce.to_owned());
+        match map.get(&key) {
+            None => Ok(false),
+            Some(entry) => {
+                if entry.expires_at < OffsetDateTime::now_utc() {
+                    // Expired: remove the stale entry and reject.
+                    map.remove(&key);
+                    Ok(false)
+                } else {
+                    // Valid and unexpired: atomically consume.
+                    map.remove(&key);
+                    Ok(true)
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InMemoryRepos — aggregate
+// ---------------------------------------------------------------------------
+
+/// A fully in-memory [`Repositories`] implementation for use in tests.
+#[derive(Debug, Default)]
+pub(super) struct InMemoryRepos {
+    users: MemoryUserRepo,
+    games: MemoryGameRepo,
+    seeks: MemorySeekRepo,
+    sessions: MemorySessionRepo,
+}
+
+impl Repositories for InMemoryRepos {
+    fn users(&self) -> &dyn UserRepo {
+        &self.users
+    }
+
+    fn games(&self) -> &dyn GameRepo {
+        &self.games
+    }
+
+    fn seeks(&self) -> &dyn SeekRepo {
+        &self.seeks
+    }
+
+    fn sessions(&self) -> &dyn SessionRepo {
+        &self.sessions
+    }
+}

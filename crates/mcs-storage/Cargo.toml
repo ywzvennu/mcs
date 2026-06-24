@@ -1,0 +1,22 @@
+[package]
+name = "mcs-storage"
+description = "Persistence-agnostic repository traits for the MCS server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mcs-core.workspace = true
+mcs-domain.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
