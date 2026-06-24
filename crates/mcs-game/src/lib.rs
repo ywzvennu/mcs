@@ -83,12 +83,14 @@ mod actor;
 mod clock;
 mod error;
 mod event;
+pub mod matchmaking;
 mod time_source;
 
 pub use actor::{GameActor, GameHandle};
 pub use clock::ClockEngine;
 pub use error::GameSessionError;
 pub use event::GameEvent;
+pub use matchmaking::{Matchmaker, MatchmakingError, Pairing, SubmitOutcome};
 pub use time_source::{SystemTimeSource, TimeSource};
 
 #[cfg(test)]
