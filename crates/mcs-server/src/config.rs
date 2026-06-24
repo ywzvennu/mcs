@@ -13,10 +13,26 @@
 //!
 //! See the committed `config.toml` for an annotated example of every key.
 //!
+//! # Run mode
+//!
+//! The `env` key (environment variable `MCS_ENV`) controls the server's run
+//! mode and gates which validation rules are enforced at startup:
+//!
+//! | `env` value     | `MCS_ENV` value  | Behaviour |
+//! |-----------------|------------------|-----------|
+//! | `development`   | `development`    | Permissive defaults; ephemeral session secret allowed (warning logged). **Default.** |
+//! | `production`    | `production`     | Strict validation: missing/weak secrets and misconfigured payments are fatal errors. |
+//!
+//! Set `env = "production"` in `config.toml` or `MCS_ENV=production` before
+//! deploying to a live environment. The server will refuse to start if any
+//! required production setting is absent or obviously wrong, printing a clear,
+//! actionable error message naming the offending key.
+//!
 //! # Keys and defaults
 //!
 //! | Key                | Env var               | Default                       |
 //! |--------------------|-----------------------|-------------------------------|
+//! | `env`              | `MCS_ENV`             | `development`                 |
 //! | `bind`             | `MCS_BIND`            | `127.0.0.1:8080`              |
 //! | `database_url`     | `MCS_DATABASE_URL`   | `sqlite://mcs.db?mode=rwc`    |
 //! | `log.format`       | `MCS_LOG__FORMAT`    | `pretty`                      |
@@ -184,14 +200,114 @@ const CONFIG_PATH_ENV: &str = "MCS_CONFIG";
 /// The default config file consulted when `MCS_CONFIG` is unset.
 const DEFAULT_CONFIG_FILE: &str = "config.toml";
 
+/// Minimum acceptable byte-length for a production session secret.
+///
+/// 32 bytes (256 bits) matches the HS256 key size and provides adequate entropy
+/// for the HMAC-SHA256 signing algorithm used by the session layer.
+const MIN_SECRET_LEN: usize = 32;
+
+/// Session secrets that literally contain "change-me", "secret", "example",
+/// "dev", or "test" are rejected in production regardless of length.
+const WEAK_SECRET_SUBSTRINGS: &[&str] = &["change-me", "secret", "example", "dev", "test"];
+
+/// The run mode of the server.
+///
+/// Controls which validation rules [`Config::validate`] enforces at startup.
+/// Set via the `env` key in `config.toml` or the `MCS_ENV` environment variable.
+///
+/// # Production hardening
+///
+/// In [`Production`](RunMode::Production) mode the server performs strict
+/// pre-flight validation and **refuses to start** if any required setting is
+/// absent, obviously weak, or dangerously misconfigured. This includes:
+///
+/// - `session.secret` must be set, at least 32 bytes long, and must not contain
+///   well-known placeholder strings such as `"change-me"` or `"secret"`.
+/// - When `payments.enabled` is `true` and `payments.verifier` is `"facilitator"`,
+///   `payments.facilitator_url` must be set and non-empty.
+/// - Basic well-formedness checks (positive TTLs, parseable bind address) apply
+///   in both modes.
+///
+/// In [`Development`](RunMode::Development) mode none of the production-only
+/// checks are enforced and the server will log a warning rather than abort when
+/// using an ephemeral session secret.
+///
+/// # Secret rotation
+///
+/// To rotate `session.secret` without downtime:
+/// 1. Add the new secret to all nodes as `session.secret` (rolling deploy or
+///    coordinated config push).
+/// 2. After all nodes have restarted, any tokens signed with the old secret will
+///    expire naturally at `session.ttl_secs`; no immediate invalidation occurs
+///    because the secret is rotated atomically across nodes.
+/// 3. For immediate invalidation, restart all nodes simultaneously with the new
+///    secret — this will force all existing sessions to re-authenticate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunMode {
+    /// Development mode (the default): convenient defaults, ephemeral session
+    /// secrets allowed, less strict validation. Never use in production.
+    #[default]
+    Development,
+    /// Production mode: strict pre-flight validation. The server refuses to
+    /// start if required secrets are absent/weak or payments are misconfigured.
+    Production,
+}
+
+impl std::fmt::Display for RunMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunMode::Development => f.write_str("development"),
+            RunMode::Production => f.write_str("production"),
+        }
+    }
+}
+
+/// A configuration validation error, naming the offending key and describing
+/// the problem in actionable terms.
+///
+/// Returned by [`Config::validate`] when the configuration is inconsistent or
+/// missing a required value. The [`Display`](std::fmt::Display) output is
+/// designed to be printed directly to the operator.
+#[derive(Debug)]
+pub struct ConfigError {
+    /// The configuration key that is missing or invalid (e.g.
+    /// `session.secret`, `payments.facilitator_url`).
+    pub key: &'static str,
+    /// Human-readable description of the problem and how to fix it.
+    pub message: String,
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "configuration error: {} — {}", self.key, self.message)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
 /// Fully-resolved server configuration.
 ///
 /// Build one with [`Config::load`], which layers defaults, an optional
 /// `config.toml`, and `MCS_`-prefixed environment variables. Every field has a
 /// default, so the type also implements [`Default`] for tests and tooling.
+///
+/// After loading, call [`Config::validate`] to enforce run-mode-appropriate
+/// invariants before the server binds its socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// The run mode of the server.
+    ///
+    /// Set to `"production"` via `env = "production"` in `config.toml` or
+    /// `MCS_ENV=production` in the environment. Defaults to `"development"`.
+    ///
+    /// In production mode [`Config::validate`] enforces strict pre-flight
+    /// checks (required secrets, valid payment configuration, etc.) and the
+    /// server refuses to start if any check fails. In development mode the
+    /// same method only validates basic well-formedness (positive TTLs,
+    /// parseable bind address) and allows convenient insecure defaults.
+    pub env: RunMode,
     /// The socket address the HTTP server binds to.
     pub bind: SocketAddr,
     /// The storage connection string handed to
@@ -663,6 +779,7 @@ impl Default for CorsSettings {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            env: RunMode::default(),
             bind: SocketAddr::from(([127, 0, 0, 1], 8080)),
             database_url: "sqlite://mcs.db?mode=rwc".to_owned(),
             log: LogConfig::default(),
@@ -844,6 +961,187 @@ impl HttpSettings {
 }
 
 impl Config {
+    /// Validates the configuration for the current [`RunMode`].
+    ///
+    /// Call this after [`Config::load`] and before the server binds its socket.
+    /// A failed validation means the operator must fix their configuration;
+    /// the returned [`ConfigError`] names the offending key and explains the
+    /// problem in actionable terms.
+    ///
+    /// # Validation rules — both modes
+    ///
+    /// These checks are enforced in every run mode, including development:
+    ///
+    /// - `session.ttl_secs` must be greater than zero.
+    /// - `siwe.nonce_ttl_secs` must be greater than zero.
+    /// - `http.request_timeout_secs` must be greater than zero.
+    ///
+    /// # Validation rules — production only (`env = "production"`)
+    ///
+    /// The following checks are only enforced when
+    /// [`env`](Config::env) is [`RunMode::Production`]:
+    ///
+    /// - `session.secret` must be set, at least 32 bytes long, and must not
+    ///   contain obvious placeholder strings (`"change-me"`, `"secret"`,
+    ///   `"example"`, `"dev"`, `"test"`).
+    /// - When `payments.enabled = true` and `payments.verifier = "facilitator"`,
+    ///   `payments.facilitator_url` must be set and non-empty.
+    /// - When `payments.enabled = true`, `payments.verifier` must not be `"mock"`:
+    ///   the mock verifier performs no on-chain checks and must never be used in
+    ///   production.
+    /// - `cors.allow_any_origin` must not be `true`: wildcard CORS is a
+    ///   development-only escape hatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(ConfigError)` on the first validation failure encountered,
+    /// naming the offending key and describing the problem.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use mcs_server::Config;
+    ///
+    /// let cfg = Config::load().unwrap();
+    /// if let Err(e) = cfg.validate() {
+    ///     eprintln!("{e}");
+    ///     std::process::exit(1);
+    /// }
+    /// ```
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // ── Both-mode checks (basic well-formedness) ─────────────────────────
+
+        if self.session.ttl_secs == 0 {
+            return Err(ConfigError {
+                key: "session.ttl_secs",
+                message: "must be greater than zero (set MCS_SESSION__TTL_SECS or \
+                          session.ttl_secs in config.toml)"
+                    .to_owned(),
+            });
+        }
+
+        if self.siwe.nonce_ttl_secs == 0 {
+            return Err(ConfigError {
+                key: "siwe.nonce_ttl_secs",
+                message: "must be greater than zero (set MCS_SIWE__NONCE_TTL_SECS or \
+                          siwe.nonce_ttl_secs in config.toml)"
+                    .to_owned(),
+            });
+        }
+
+        if self.http.request_timeout_secs == 0 {
+            return Err(ConfigError {
+                key: "http.request_timeout_secs",
+                message: "must be greater than zero (set MCS_HTTP__REQUEST_TIMEOUT_SECS or \
+                          http.request_timeout_secs in config.toml)"
+                    .to_owned(),
+            });
+        }
+
+        // ── Production-only checks ────────────────────────────────────────────
+        if self.env == RunMode::Production {
+            self.validate_production()?;
+        }
+
+        Ok(())
+    }
+
+    /// Enforces production-only validation rules.
+    ///
+    /// Called by [`validate`](Self::validate) when `env = "production"`. Never
+    /// call directly; use [`validate`](Self::validate) instead so development
+    /// mode skips these checks.
+    fn validate_production(&self) -> Result<(), ConfigError> {
+        // session.secret: required, sufficiently long, not a placeholder.
+        match self.session.secret.as_deref() {
+            None | Some("") => {
+                return Err(ConfigError {
+                    key: "session.secret",
+                    message: format!(
+                        "must be set in production — sessions signed with an ephemeral \
+                         secret are invalidated on every restart. \
+                         Generate a secret with `openssl rand -hex 32` and set it via \
+                         MCS_SESSION__SECRET or session.secret in config.toml. \
+                         Minimum length: {MIN_SECRET_LEN} bytes."
+                    ),
+                });
+            }
+            Some(s) if s.len() < MIN_SECRET_LEN => {
+                return Err(ConfigError {
+                    key: "session.secret",
+                    message: format!(
+                        "is too short ({} bytes); production requires at least {MIN_SECRET_LEN} \
+                         bytes. Generate a strong secret with `openssl rand -hex 32`.",
+                        s.len()
+                    ),
+                });
+            }
+            Some(s) => {
+                let lower = s.to_ascii_lowercase();
+                for placeholder in WEAK_SECRET_SUBSTRINGS {
+                    if lower.contains(placeholder) {
+                        return Err(ConfigError {
+                            key: "session.secret",
+                            message: format!(
+                                "looks like a placeholder (contains {placeholder:?}). \
+                                 Use a high-entropy random value for production. \
+                                 Generate one with `openssl rand -hex 32` and set it via \
+                                 MCS_SESSION__SECRET or session.secret in config.toml."
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        // payments: mock verifier must never be used in production.
+        if self.payments.enabled && self.payments.verifier == VerifierChoice::Mock {
+            return Err(ConfigError {
+                key: "payments.verifier",
+                message: "is \"mock\" but payments.enabled = true in production. \
+                          The mock verifier performs no on-chain checks and must never be \
+                          used in production. Set payments.verifier = \"facilitator\" and \
+                          provide a valid payments.facilitator_url."
+                    .to_owned(),
+            });
+        }
+
+        // payments: facilitator verifier needs a URL.
+        if self.payments.enabled && self.payments.verifier == VerifierChoice::Facilitator {
+            let url_missing = self
+                .payments
+                .facilitator_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .is_none();
+            if url_missing {
+                return Err(ConfigError {
+                    key: "payments.facilitator_url",
+                    message: "is required when payments.enabled = true and \
+                              payments.verifier = \"facilitator\". \
+                              Set MCS_PAYMENTS__FACILITATOR_URL or \
+                              payments.facilitator_url in config.toml."
+                        .to_owned(),
+                });
+            }
+        }
+
+        // cors: allow_any_origin is a dev-only escape hatch.
+        if self.cors.allow_any_origin {
+            return Err(ConfigError {
+                key: "cors.allow_any_origin",
+                message: "must not be true in production. This wildcard CORS setting \
+                          allows any origin to make cross-origin requests and must only \
+                          be used during development. List specific origins in \
+                          cors.allowed_origins instead."
+                    .to_owned(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Loads configuration by layering defaults, an optional `config.toml`, and
     /// `MCS_`-prefixed environment variables (highest precedence).
     ///
@@ -987,6 +1285,423 @@ mod tests {
         assert_eq!(cfg.session.issuer, "mcs");
         assert!(cfg.session.secret.is_none());
         assert_eq!(cfg.siwe.chain_id, 1);
+    }
+
+    // ── RunMode / env key tests (#102) ───────────────────────────────────────
+
+    #[test]
+    fn env_defaults_to_development() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.env,
+            RunMode::Development,
+            "env must default to development"
+        );
+    }
+
+    /// The `env` key parses correctly from TOML.
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn env_key_parses_production_from_toml() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("config.toml", r#"env = "production""#)?;
+            let cfg = Config::load().expect("load config with env = production");
+            assert_eq!(cfg.env, RunMode::Production);
+            Ok(())
+        });
+    }
+
+    /// The `env` key parses `development` explicitly from TOML.
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn env_key_parses_development_from_toml() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("config.toml", r#"env = "development""#)?;
+            let cfg = Config::load().expect("load config with env = development");
+            assert_eq!(cfg.env, RunMode::Development);
+            Ok(())
+        });
+    }
+
+    /// `MCS_ENV` overrides the TOML value.
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn env_key_set_via_env_var() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("MCS_ENV", "production");
+            let cfg = Config::load().expect("load config with MCS_ENV");
+            assert_eq!(cfg.env, RunMode::Production);
+            Ok(())
+        });
+    }
+
+    // ── Config::validate — both-mode (well-formedness) tests ─────────────────
+
+    #[test]
+    fn validate_passes_with_default_config() {
+        let cfg = Config::default();
+        // Default config is development mode: should always pass.
+        assert!(
+            cfg.validate().is_ok(),
+            "default config must pass validation in development mode"
+        );
+    }
+
+    #[test]
+    fn validate_fails_on_zero_session_ttl() {
+        let cfg = Config {
+            session: SessionSettings {
+                ttl_secs: 0,
+                ..SessionSettings::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("zero session ttl must fail validation");
+        assert_eq!(err.key, "session.ttl_secs");
+    }
+
+    #[test]
+    fn validate_fails_on_zero_nonce_ttl() {
+        let cfg = Config {
+            siwe: SiweSettings {
+                nonce_ttl_secs: 0,
+                ..SiweSettings::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("zero nonce ttl must fail validation");
+        assert_eq!(err.key, "siwe.nonce_ttl_secs");
+    }
+
+    #[test]
+    fn validate_fails_on_zero_request_timeout() {
+        let cfg = Config {
+            http: HttpSettings {
+                request_timeout_secs: 0,
+                ..HttpSettings::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("zero request timeout must fail validation");
+        assert_eq!(err.key, "http.request_timeout_secs");
+    }
+
+    // ── Config::validate — production mode tests ──────────────────────────────
+
+    /// Convenience: a strong production secret string used across several tests.
+    fn strong_secret() -> String {
+        "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned()
+    }
+
+    /// A fully valid production config passes.
+    #[test]
+    fn validate_production_valid_config_passes() {
+        let cfg = Config {
+            env: RunMode::Production,
+            session: SessionSettings {
+                secret: Some(strong_secret()),
+                ..SessionSettings::default()
+            },
+            // Payments disabled by default: no extra requirements.
+            ..Config::default()
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "valid production config must pass validation"
+        );
+    }
+
+    /// Production mode with missing session.secret → error naming the key.
+    #[test]
+    fn validate_production_missing_secret_fails() {
+        let cfg = Config {
+            env: RunMode::Production,
+            session: SessionSettings {
+                secret: None,
+                ..SessionSettings::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("missing secret must fail in production");
+        assert_eq!(
+            err.key, "session.secret",
+            "error must name session.secret; got key {:?}, message: {}",
+            err.key, err.message
+        );
+    }
+
+    /// Production mode with an empty session.secret → error naming the key.
+    #[test]
+    fn validate_production_empty_secret_fails() {
+        let cfg = Config {
+            env: RunMode::Production,
+            session: SessionSettings {
+                secret: Some(String::new()),
+                ..SessionSettings::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("empty secret must fail in production");
+        assert_eq!(err.key, "session.secret");
+    }
+
+    /// Production mode with a secret shorter than MIN_SECRET_LEN → error.
+    #[test]
+    fn validate_production_short_secret_fails() {
+        let cfg = Config {
+            env: RunMode::Production,
+            session: SessionSettings {
+                // 16 bytes — below the 32-byte minimum.
+                secret: Some("a1b2c3d4e5f6a1b2".to_owned()),
+                ..SessionSettings::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("short secret must fail in production");
+        assert_eq!(err.key, "session.secret");
+        assert!(
+            err.message.contains("too short"),
+            "error message should mention length; got: {}",
+            err.message
+        );
+    }
+
+    /// A secret that contains a placeholder substring is rejected in production.
+    #[test]
+    fn validate_production_placeholder_secret_fails() {
+        let cfg = Config {
+            env: RunMode::Production,
+            session: SessionSettings {
+                // >= 32 bytes but contains "change-me".
+                secret: Some("change-me-to-a-long-random-string-here".to_owned()),
+                ..SessionSettings::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("placeholder secret must fail in production");
+        assert_eq!(err.key, "session.secret");
+        assert!(
+            err.message.contains("placeholder"),
+            "error must mention placeholder; got: {}",
+            err.message
+        );
+    }
+
+    /// A secret that contains "secret" (case-insensitive) is rejected.
+    #[test]
+    fn validate_production_weak_secret_substring_fails() {
+        let cfg = Config {
+            env: RunMode::Production,
+            session: SessionSettings {
+                secret: Some("my-super-secret-key-that-is-very-long-indeed".to_owned()),
+                ..SessionSettings::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("secret containing 'secret' must fail in production");
+        assert_eq!(err.key, "session.secret");
+    }
+
+    /// Production mode with payments enabled + mock verifier → error.
+    #[test]
+    fn validate_production_payments_enabled_mock_verifier_fails() {
+        let cfg = Config {
+            env: RunMode::Production,
+            session: SessionSettings {
+                secret: Some(strong_secret()),
+                ..SessionSettings::default()
+            },
+            payments: PaymentSettings {
+                enabled: true,
+                verifier: VerifierChoice::Mock,
+                ..PaymentSettings::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("mock verifier + payments in production must fail");
+        assert_eq!(
+            err.key, "payments.verifier",
+            "error must name payments.verifier; got: {:?}",
+            err.key
+        );
+    }
+
+    /// Production mode with payments enabled, facilitator verifier, but no URL → error.
+    #[test]
+    fn validate_production_payments_facilitator_without_url_fails() {
+        let cfg = Config {
+            env: RunMode::Production,
+            session: SessionSettings {
+                secret: Some(strong_secret()),
+                ..SessionSettings::default()
+            },
+            payments: PaymentSettings {
+                enabled: true,
+                verifier: VerifierChoice::Facilitator,
+                facilitator_url: None,
+                ..PaymentSettings::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("facilitator verifier without url must fail in production");
+        assert_eq!(
+            err.key, "payments.facilitator_url",
+            "error must name payments.facilitator_url; got: {:?}",
+            err.key
+        );
+    }
+
+    /// Production mode with payments enabled, facilitator verifier, blank URL → error.
+    #[test]
+    fn validate_production_payments_facilitator_blank_url_fails() {
+        let cfg = Config {
+            env: RunMode::Production,
+            session: SessionSettings {
+                secret: Some(strong_secret()),
+                ..SessionSettings::default()
+            },
+            payments: PaymentSettings {
+                enabled: true,
+                verifier: VerifierChoice::Facilitator,
+                facilitator_url: Some("   ".to_owned()),
+                ..PaymentSettings::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("blank facilitator url must fail in production");
+        assert_eq!(err.key, "payments.facilitator_url");
+    }
+
+    /// Production mode with payments enabled, facilitator verifier, valid URL → ok.
+    #[test]
+    fn validate_production_payments_facilitator_with_url_passes() {
+        let cfg = Config {
+            env: RunMode::Production,
+            session: SessionSettings {
+                secret: Some(strong_secret()),
+                ..SessionSettings::default()
+            },
+            payments: PaymentSettings {
+                enabled: true,
+                verifier: VerifierChoice::Facilitator,
+                facilitator_url: Some("https://facilitator.example.com".to_owned()),
+                ..PaymentSettings::default()
+            },
+            ..Config::default()
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "valid facilitator payment config must pass production validation"
+        );
+    }
+
+    /// Production mode with allow_any_origin = true → error.
+    #[test]
+    fn validate_production_allow_any_origin_fails() {
+        let cfg = Config {
+            env: RunMode::Production,
+            session: SessionSettings {
+                secret: Some(strong_secret()),
+                ..SessionSettings::default()
+            },
+            cors: CorsSettings {
+                allow_any_origin: true,
+                ..CorsSettings::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("allow_any_origin in production must fail");
+        assert_eq!(
+            err.key, "cors.allow_any_origin",
+            "error must name cors.allow_any_origin; got: {:?}",
+            err.key
+        );
+    }
+
+    /// Development mode ignores production-only rules: missing secret is ok.
+    #[test]
+    fn validate_development_missing_secret_passes() {
+        // Default config is already development mode with no secret.
+        let cfg = Config::default();
+        assert!(
+            cfg.validate().is_ok(),
+            "missing secret must be allowed in development mode"
+        );
+    }
+
+    /// Development mode: payments enabled + mock verifier is allowed.
+    #[test]
+    fn validate_development_payments_mock_verifier_passes() {
+        let cfg = Config {
+            payments: PaymentSettings {
+                enabled: true,
+                verifier: VerifierChoice::Mock,
+                ..PaymentSettings::default()
+            },
+            ..Config::default()
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "mock verifier with payments enabled must be allowed in development"
+        );
+    }
+
+    /// Development mode: allow_any_origin is allowed.
+    #[test]
+    fn validate_development_allow_any_origin_passes() {
+        let cfg = Config {
+            cors: CorsSettings {
+                allow_any_origin: true,
+                ..CorsSettings::default()
+            },
+            ..Config::default()
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "allow_any_origin must be allowed in development mode"
+        );
+    }
+
+    /// ConfigError Display output names the key and message.
+    #[test]
+    fn config_error_display_includes_key_and_message() {
+        let err = ConfigError {
+            key: "session.secret",
+            message: "must be set in production".to_owned(),
+        };
+        let display = err.to_string();
+        assert!(
+            display.contains("session.secret"),
+            "display must contain key"
+        );
+        assert!(
+            display.contains("must be set in production"),
+            "display must contain message"
+        );
     }
 
     // ── HttpSettings tests (#99) ─────────────────────────────────────────────
