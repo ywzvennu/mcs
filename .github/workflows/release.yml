@@ -1,0 +1,138 @@
+name: Release
+
+# Publishes versioned container images to GHCR on every version tag.
+#
+# Two image variants are built:
+#   ghcr.io/ywzvennu/mcs-server:<version>           – default SQLite backend
+#   ghcr.io/ywzvennu/mcs-server:<version>-postgres  – Postgres-only backend
+#
+# Multi-arch (linux/amd64 + linux/arm64) is enabled via QEMU + buildx.
+# Build time on GitHub-hosted runners is typically 8-15 min for the two
+# variants; disable the arm64 platform if build minutes are a concern by
+# removing it from the `platforms` matrix.
+#
+# Triggered ONLY by version tags (v*.*.*).  No workflow runs on PRs or
+# branch pushes, so this file never interferes with the `ci.yml` workflow.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# Prevent concurrent releases for the same tag (shouldn't happen, but is
+# safe to guard against).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ywzvennu/mcs-server
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build and push both image variants in a single job.
+  #
+  # Using a matrix would halve wall-clock time but double the cache miss rate on
+  # the first run of each tag.  A single job keeps the dependency-layer cache
+  # warm across both builds and is simpler to reason about.
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    name: Build and push images
+    runs-on: ubuntu-latest
+
+    # Required to write packages (GHCR) and read the repository contents.
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── QEMU + buildx ──────────────────────────────────────────────────────
+      # Set up QEMU so buildx can emulate arm64 on the amd64 runner.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Registry authentication ────────────────────────────────────────────
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Metadata for the SQLite (default) variant ─────────────────────────
+      # Produces tags:
+      #   ghcr.io/ywzvennu/mcs-server:v1.2.3
+      #   ghcr.io/ywzvennu/mcs-server:1.2.3
+      #   ghcr.io/ywzvennu/mcs-server:1.2
+      #   ghcr.io/ywzvennu/mcs-server:1
+      #   ghcr.io/ywzvennu/mcs-server:latest
+      - name: Extract metadata (SQLite variant)
+        id: meta-sqlite
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # ── Metadata for the Postgres variant ─────────────────────────────────
+      # Produces tags with the "-postgres" suffix:
+      #   ghcr.io/ywzvennu/mcs-server:v1.2.3-postgres
+      #   ghcr.io/ywzvennu/mcs-server:1.2.3-postgres
+      #   ghcr.io/ywzvennu/mcs-server:1.2-postgres
+      #   ghcr.io/ywzvennu/mcs-server:1-postgres
+      #   ghcr.io/ywzvennu/mcs-server:latest-postgres
+      - name: Extract metadata (Postgres variant)
+        id: meta-postgres
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}-postgres
+            type=semver,pattern={{major}}.{{minor}}-postgres
+            type=semver,pattern={{major}}-postgres
+            type=raw,value=latest-postgres
+
+      # ── Build and push — SQLite (default) variant ─────────────────────────
+      - name: Build and push (SQLite)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            DB_BACKEND=sqlite
+          tags: ${{ steps.meta-sqlite.outputs.tags }}
+          labels: ${{ steps.meta-sqlite.outputs.labels }}
+          # Reuse the GitHub Actions cache to speed up re-builds.
+          cache-from: type=gha,scope=sqlite
+          cache-to: type=gha,mode=max,scope=sqlite
+
+      # ── Build and push — Postgres variant ─────────────────────────────────
+      # The dependency layers compiled in the SQLite build above are already
+      # in the layer cache, so only the Rust binary itself is recompiled.
+      - name: Build and push (Postgres)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            DB_BACKEND=postgres
+          tags: ${{ steps.meta-postgres.outputs.tags }}
+          labels: ${{ steps.meta-postgres.outputs.labels }}
+          cache-from: type=gha,scope=postgres
+          cache-to: type=gha,mode=max,scope=postgres
