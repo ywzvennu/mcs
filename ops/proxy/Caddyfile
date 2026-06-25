@@ -1,0 +1,77 @@
+# Caddyfile — production reverse proxy for MCS
+#
+# Caddy automatically provisions and renews TLS certificates via ACME (Let's
+# Encrypt by default).  Replace {$MCS_DOMAIN} with your actual domain name, or
+# set the MCS_DOMAIN environment variable before running `docker compose -f
+# docker-compose.prod.yml up`.
+#
+# Game routing note:
+# -----------------
+# WebSocket connections for a specific game must reach the node that owns that
+# game.  MCS nodes return a 421 Misdirected Request when a game belongs to a
+# peer, carrying the owning node's address so the client SDK can reconnect to
+# the right node.
+#
+# A simple round-robin upstream (as configured below) works correctly with
+# well-behaved clients that follow 421 redirects.  For clients that cannot
+# follow redirects, replace `round_robin` with a `header` or `cookie` sticky
+# strategy, or deploy a game-id-aware upstream selector in front of Caddy.
+
+{$MCS_DOMAIN} {
+
+    # --- TLS -----------------------------------------------------------------
+    # Caddy handles ACME automatically.  No manual certificate management.
+    # To use a custom certificate:
+    #   tls /certs/cert.pem /certs/key.pem
+    #
+    # For local/staging testing with a self-signed cert:
+    #   tls internal
+
+    # --- Security headers ----------------------------------------------------
+    # These augment the headers already emitted by mcs-server (X-Frame-Options,
+    # CSP, X-Content-Type-Options, Referrer-Policy, HSTS) with Caddy-level
+    # additions.
+    header {
+        # Tell the upstream to emit HSTS (requires MCS_HTTP__HSTS=true on nodes).
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        # Permissions-Policy: restrict browser features not used by the API.
+        Permissions-Policy "geolocation=(), camera=(), microphone=()"
+        # Remove the Server header to avoid leaking version info.
+        -Server
+    }
+
+    # --- Trusted proxy -------------------------------------------------------
+    # Caddy inserts X-Forwarded-For; the mcs-server nodes must be told to trust
+    # it.  Set MCS_LIMITS__TRUSTED_PROXY_HEADER=x-forwarded-for on each node.
+    # Only do this when the nodes are NOT directly reachable from the internet.
+    trusted_proxies static 0.0.0.0/0
+
+    # --- Upstream load balancing ---------------------------------------------
+    # Round-robin across the two mcs-server nodes.  Caddy will retry a request
+    # on the other node if the primary is down (fail_duration controls the
+    # health-check window).
+    reverse_proxy node-a:8080 node-b:8080 {
+        lb_policy round_robin
+
+        # Active health checks: probe /health every 10 s.  A node is removed
+        # from the pool after 3 consecutive failures and re-added after 2
+        # consecutive successes.
+        health_uri      /health
+        health_interval 10s
+        health_timeout  5s
+
+        # Passive health: mark a backend down for 30 s after a connect failure.
+        fail_duration 30s
+
+        # Forward the real client IP so per-IP rate limiting works correctly.
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP       {remote_host}
+    }
+
+    # --- Logging -------------------------------------------------------------
+    log {
+        output stdout
+        format json
+        level  INFO
+    }
+}

@@ -1,0 +1,249 @@
+# docker-compose.prod.yml — production stack for MCS
+#
+# Topology
+# --------
+#   postgres  – Postgres 16, durable named volume, pg_isready healthcheck.
+#   redis     – Redis 7, in-memory with optional persistence.
+#   node-a    – mcs-server (Postgres backend), cluster node A.
+#   node-b    – mcs-server (Postgres backend), cluster node B.
+#   caddy     – Caddy reverse proxy: automatic TLS, round-robin LB.
+#
+# Prerequisites
+# -------------
+#   1. Copy .env.example to .env and fill in all values:
+#        cp .env.example .env && $EDITOR .env
+#   2. Build or pull the Postgres-backend image:
+#        docker compose -f docker-compose.prod.yml build
+#      Or pull a pre-published image and pin IMAGE_TAG in .env:
+#        MCS_IMAGE=ghcr.io/ywzvennu/mcs-server:1.0.0-postgres
+#   3. Start the stack:
+#        docker compose -f docker-compose.prod.yml up -d
+#
+# Scaling
+# -------
+# To add a third node without modifying this file, replicate the node-a / node-b
+# block (unique MCS_CLUSTER__NODE_ID + MCS_CLUSTER__ADDRESS) and add it to
+# Caddy's upstream list in ops/proxy/Caddyfile.  For zero-downtime deploys,
+# bring up new nodes before stopping old ones; `restart: unless-stopped` keeps
+# individual nodes restartable without affecting the whole stack.
+#
+# Secrets
+# -------
+# All secrets are read from the .env file (or environment).  Never hard-code
+# secrets in this file.  See .env.example for the full list.
+#
+# Validation (no image build required):
+#   docker compose -f docker-compose.prod.yml config
+#
+# Game routing / 421 note:
+# ------------------------
+# mcs-server returns 421 Misdirected Request when a WebSocket game connection
+# reaches a node that does not own that game.  Clients that follow 421 redirects
+# (the MCS client SDK does) work correctly behind a simple round-robin proxy.
+# For clients that cannot follow redirects, configure a sticky-session upstream
+# (see ops/proxy/Caddyfile comments).
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Postgres 16 — shared relational store
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mcs
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: mcs
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mcs -d mcs"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - mcs-internal
+    # Postgres is not exposed on a host port: only the mcs-server nodes on the
+    # internal network can reach it.
+
+  # ---------------------------------------------------------------------------
+  # Redis 7 — cluster membership & heartbeat backend
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Enable persistence so cluster membership survives a Redis restart.
+    # AOF gives per-second durability; adjust appendfsync as needed.
+    command: redis-server --appendonly yes --appendfsync everysec
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - mcs-internal
+
+  # ---------------------------------------------------------------------------
+  # mcs-server node A
+  # ---------------------------------------------------------------------------
+  node-a:
+    image: ${MCS_IMAGE:-ghcr.io/ywzvennu/mcs-server:latest-postgres}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        DB_BACKEND: postgres
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Run-mode: strict production validation at startup.
+      MCS_ENV: "production"
+
+      # Database (shared Postgres instance; migrations apply automatically).
+      MCS_DATABASE_URL: "postgres://mcs:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/mcs"
+      MCS_DATABASE__MAX_CONNECTIONS: "10"
+      MCS_DATABASE__ACQUIRE_TIMEOUT_SECS: "30"
+      MCS_DATABASE__IDLE_TIMEOUT_SECS: "600"
+      MCS_DATABASE__MAX_LIFETIME_SECS: "1800"
+      MCS_DATABASE__STATEMENT_TIMEOUT_SECS: "30"
+
+      # Logging.
+      MCS_LOG__FORMAT: "json"
+      MCS_LOG__LEVEL: "info"
+
+      # Session secret (shared across all nodes).
+      MCS_SESSION__SECRET: "${MCS_SESSION__SECRET:?MCS_SESSION__SECRET must be set in .env}"
+
+      # SIWE / domain.
+      MCS_SIWE__DOMAIN: "${MCS_SIWE__DOMAIN:-localhost}"
+      MCS_SIWE__URI: "${MCS_SIWE__URI:-http://localhost}"
+
+      # CORS.
+      MCS_CORS__ALLOWED_ORIGINS: "${MCS_CORS__ALLOWED_ORIGINS:-}"
+      MCS_CORS__ALLOW_CREDENTIALS: "true"
+
+      # HTTP hardening: HSTS is enabled because Caddy terminates TLS.
+      MCS_HTTP__HSTS: "true"
+
+      # Trust the X-Forwarded-For header inserted by Caddy.
+      MCS_LIMITS__TRUSTED_PROXY_HEADER: "x-forwarded-for"
+
+      # Cluster: enabled with a pinned node ID.
+      MCS_CLUSTER__ENABLED: "true"
+      MCS_CLUSTER__NODE_ID: "node-a"
+      MCS_CLUSTER__ADDRESS: "http://node-a:8080"
+      MCS_CLUSTER__REDIS_URL: "redis://redis:6379"
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - mcs-internal
+    # node-a is NOT exposed on a host port: traffic enters through Caddy only.
+
+  # ---------------------------------------------------------------------------
+  # mcs-server node B
+  # ---------------------------------------------------------------------------
+  node-b:
+    image: ${MCS_IMAGE:-ghcr.io/ywzvennu/mcs-server:latest-postgres}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        DB_BACKEND: postgres
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      MCS_ENV: "production"
+
+      MCS_DATABASE_URL: "postgres://mcs:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/mcs"
+      MCS_DATABASE__MAX_CONNECTIONS: "10"
+      MCS_DATABASE__ACQUIRE_TIMEOUT_SECS: "30"
+      MCS_DATABASE__IDLE_TIMEOUT_SECS: "600"
+      MCS_DATABASE__MAX_LIFETIME_SECS: "1800"
+      MCS_DATABASE__STATEMENT_TIMEOUT_SECS: "30"
+
+      MCS_LOG__FORMAT: "json"
+      MCS_LOG__LEVEL: "info"
+
+      MCS_SESSION__SECRET: "${MCS_SESSION__SECRET:?MCS_SESSION__SECRET must be set in .env}"
+
+      MCS_SIWE__DOMAIN: "${MCS_SIWE__DOMAIN:-localhost}"
+      MCS_SIWE__URI: "${MCS_SIWE__URI:-http://localhost}"
+
+      MCS_CORS__ALLOWED_ORIGINS: "${MCS_CORS__ALLOWED_ORIGINS:-}"
+      MCS_CORS__ALLOW_CREDENTIALS: "true"
+
+      MCS_HTTP__HSTS: "true"
+
+      MCS_LIMITS__TRUSTED_PROXY_HEADER: "x-forwarded-for"
+
+      MCS_CLUSTER__ENABLED: "true"
+      MCS_CLUSTER__NODE_ID: "node-b"
+      MCS_CLUSTER__ADDRESS: "http://node-b:8080"
+      MCS_CLUSTER__REDIS_URL: "redis://redis:6379"
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - mcs-internal
+
+  # ---------------------------------------------------------------------------
+  # Caddy — TLS termination and reverse proxy
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      node-a:
+        condition: service_healthy
+      node-b:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"     # HTTP/3 / QUIC
+    volumes:
+      - ./ops/proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      # Caddy reads MCS_DOMAIN from the environment (used in the Caddyfile).
+      MCS_DOMAIN: "${MCS_DOMAIN:?MCS_DOMAIN must be set in .env}"
+    networks:
+      - mcs-internal
+
+volumes:
+  # Postgres durable storage.
+  postgres-data:
+  # Redis AOF persistence.
+  redis-data:
+  # Caddy TLS certificates and ACME state.
+  caddy-data:
+  # Caddy JSON config cache.
+  caddy-config:
+
+networks:
+  # Internal bridge: only Caddy is exposed to the host network.
+  mcs-internal:
+    driver: bridge
