@@ -612,6 +612,217 @@ fn chess960_full_game_reaches_checkmate() {
     assert!(game.status().is_finished());
 }
 
+// --- Draw claims: threefold repetition and the fifty-move rule ---------------
+
+/// Helper: build a `claim_draw` action payload.
+fn claim_draw() -> Action {
+    Action::from_typed(&StandardAction::ClaimDraw).expect("serializable")
+}
+
+/// One full cycle of the knight shuffle Nf3 Nf6 Ng1 Ng8, which returns both
+/// sides' knights home and reproduces the post-opening-rights position.
+const SHUFFLE_CYCLE: [&str; 4] = ["g1f3", "g8f6", "f3g1", "f6g8"];
+
+#[test]
+fn threefold_repetition_is_claimable_and_draws() {
+    let mut game = StandardGame::new();
+
+    // The starting position counts as occurrence #1. Each full shuffle cycle
+    // returns to it, so after two cycles the position has occurred three times.
+    // Claiming before that point must be rejected as illegal.
+    play_moves(&mut game, &SHUFFLE_CYCLE); // back to start: 2nd occurrence.
+    assert!(
+        !view_of(&game).can_claim_draw,
+        "two occurrences is not yet threefold"
+    );
+    let err = game.apply(Color::White, &claim_draw()).unwrap_err();
+    assert_eq!(err, GameError::IllegalAction);
+
+    play_moves(&mut game, &SHUFFLE_CYCLE); // back to start: 3rd occurrence.
+    assert!(
+        view_of(&game).can_claim_draw,
+        "threefold repetition should be claimable"
+    );
+
+    // The side to move (White) claims the draw; the game ends by repetition.
+    let effect = game.apply(Color::White, &claim_draw()).unwrap();
+    assert!(effect.status.is_finished());
+    assert_eq!(game.outcome(), Some(Outcome::draw(EndReason::Repetition)));
+    let ended: StandardEvent = effect.events[0].to_typed().unwrap();
+    assert!(matches!(ended, StandardEvent::GameEnded { .. }));
+}
+
+#[test]
+fn claim_draw_is_offered_in_legal_actions_only_when_eligible() {
+    let mut game = StandardGame::new();
+    // No claim available at the start.
+    assert!(!game.legal_actions(Color::White).iter().any(|a| matches!(
+        a.to_typed::<StandardAction>().unwrap(),
+        StandardAction::ClaimDraw
+    )));
+
+    play_moves(&mut game, &SHUFFLE_CYCLE);
+    play_moves(&mut game, &SHUFFLE_CYCLE); // threefold reached; White to move.
+
+    // The side to move may claim; the side not to move may not.
+    assert!(game.legal_actions(Color::White).iter().any(|a| matches!(
+        a.to_typed::<StandardAction>().unwrap(),
+        StandardAction::ClaimDraw
+    )));
+    assert!(!game.legal_actions(Color::Black).iter().any(|a| matches!(
+        a.to_typed::<StandardAction>().unwrap(),
+        StandardAction::ClaimDraw
+    )));
+}
+
+#[test]
+fn claiming_out_of_turn_is_rejected() {
+    let mut game = StandardGame::new();
+    play_moves(&mut game, &SHUFFLE_CYCLE);
+    play_moves(&mut game, &SHUFFLE_CYCLE); // threefold; White to move.
+
+    // It is White's turn, so Black may not claim even though it is eligible.
+    let err = game.apply(Color::Black, &claim_draw()).unwrap_err();
+    assert_eq!(err, GameError::NotYourTurn);
+}
+
+#[test]
+fn fivefold_repetition_auto_draws_without_a_claim() {
+    let mut game = StandardGame::new();
+    // Four full shuffle cycles take the starting position to five occurrences.
+    for _ in 0..4 {
+        play_moves(&mut game, &SHUFFLE_CYCLE);
+    }
+    // No claim was submitted, yet the game has drawn automatically.
+    assert!(game.status().is_finished());
+    assert_eq!(game.outcome(), Some(Outcome::draw(EndReason::Repetition)));
+    // Once finished, no claim action is offered.
+    assert!(!view_of(&game).can_claim_draw);
+}
+
+#[test]
+fn fifty_move_rule_is_claimable_at_one_hundred_plies() {
+    // Build a position whose halfmove clock is already 99 plies. A single
+    // reversible move pushes it to 100, making the fifty-move rule claimable.
+    // Pieces are placed so no capture, pawn move, check, or mate intervenes.
+    let mut game = StandardGame::from_fen("4k3/8/8/8/8/8/8/R3K2R w KQ - 99 60").unwrap();
+    // Before the 100th ply, no claim is available.
+    assert!(!view_of(&game).can_claim_draw);
+    let err = game.apply(Color::White, &claim_draw()).unwrap_err();
+    assert_eq!(err, GameError::IllegalAction);
+
+    // A quiet rook move makes the clock reach 100 plies.
+    play_moves(&mut game, &["a1b1"]);
+    assert!(
+        view_of(&game).can_claim_draw,
+        "fifty-move rule should be claimable at 100 plies"
+    );
+    // Cozy-chess would auto-draw at 100, but we treat it as claimable: the game
+    // is still ongoing until a side actually claims.
+    assert_eq!(game.status(), GameStatus::Ongoing);
+
+    // Black (to move) claims the draw under the fifty-move rule.
+    let effect = game.apply(Color::Black, &claim_draw()).unwrap();
+    assert!(effect.status.is_finished());
+    assert_eq!(
+        game.outcome(),
+        Some(Outcome::draw(EndReason::FiftyMoveRule))
+    );
+}
+
+/// Fifty quiet (non-capturing, non-pawn) knight-wandering plies from the
+/// position below, none of which repeats — every resulting position is distinct,
+/// so the only draw they can trigger is the move clock, not repetition. The
+/// sequence was generated by a least-repetition greedy walk of the two knights.
+const SEVENTY_FIVE_MOVE_WALK: [&str; 50] = [
+    "b1d2", "b8a6", "d2b1", "a6b4", "b1d2", "b4a2", "d2b1", "a2c1", "b1d2", "c1e2", "d2b1", "e2g1",
+    "b1d2", "g1f3", "e1d1", "f3e1", "d2b1", "e1c2", "b1d2", "c2a1", "d2b1", "a1b3", "b1d2", "b3c1",
+    "d2b1", "c1a2", "b1d2", "a2c3", "d1c1", "c3b1", "d2f1", "b1d2", "f1h2", "d2b1", "h2f3", "b1d2",
+    "f3e1", "d2b1", "e1c2", "b1d2", "c2a1", "d2b1", "a1b3", "b1d2", "b3d4", "d2b1", "d4e2", "b1d2",
+    "e2g1", "d2b1",
+];
+
+#[test]
+fn seventy_five_move_rule_auto_draws_at_one_hundred_fifty_plies() {
+    // Start at 100 plies (cozy-chess's saturated maximum). Our own unbounded
+    // clock keeps counting past it; after fifty more reversible plies it reaches
+    // 150 and the game auto-draws with no claim. The scripted plies never repeat
+    // a position, so repetition can never fire first: the draw is purely the
+    // seventy-five-move rule.
+    let mut game = StandardGame::from_fen("1n2k3/8/8/8/8/8/8/1N2K3 w - - 100 60").unwrap();
+    // The fifty-move draw is claimable from the outset, but no one claims.
+    assert!(view_of(&game).can_claim_draw);
+
+    let mut player = Color::White;
+    for (ply, uci) in SEVENTY_FIVE_MOVE_WALK.iter().enumerate() {
+        assert_eq!(
+            game.status(),
+            GameStatus::Ongoing,
+            "should still be ongoing before ply {ply}"
+        );
+        game.apply(player, &move_action(uci))
+            .unwrap_or_else(|e| panic!("quiet move {uci} failed at ply {ply}: {e}"));
+        player = player.opposite();
+    }
+
+    // After fifty further reversible plies (clock 100 -> 150), the game has
+    // auto-drawn under the seventy-five-move rule, with no claim submitted.
+    assert!(
+        game.status().is_finished(),
+        "75-move rule should auto-draw by 150 plies; fen: {}",
+        view_of(&game).fen
+    );
+    assert_eq!(
+        game.outcome(),
+        Some(Outcome::draw(EndReason::FiftyMoveRule))
+    );
+}
+
+#[test]
+fn an_irreversible_move_resets_the_fifty_move_counter() {
+    // A pawn move resets the halfmove clock, so the fifty-move rule is no longer
+    // claimable even though it was on the brink (clock 99 -> a pawn push -> 0).
+    let mut game = StandardGame::from_fen("4k3/8/8/8/8/8/P7/4K3 w - - 99 60").unwrap();
+    assert!(
+        !view_of(&game).can_claim_draw,
+        "clock 99 is below the threshold"
+    );
+    play_moves(&mut game, &["a2a4"]); // pawn move resets the clock.
+    assert!(
+        !view_of(&game).can_claim_draw,
+        "a pawn move must reset the fifty-move counter"
+    );
+    assert_eq!(game.status(), GameStatus::Ongoing);
+}
+
+#[test]
+fn chess960_supports_draw_claims() {
+    // The same StandardGame backs Chess960, so threefold claims work there too.
+    let mut game = StandardGame::chess960(518).unwrap();
+    play_moves(&mut game, &SHUFFLE_CYCLE);
+    play_moves(&mut game, &SHUFFLE_CYCLE);
+    assert!(view_of(&game).can_claim_draw);
+    let effect = game.apply(Color::White, &claim_draw()).unwrap();
+    assert!(effect.status.is_finished());
+    assert_eq!(game.outcome(), Some(Outcome::draw(EndReason::Repetition)));
+}
+
+#[test]
+fn claim_draw_payload_round_trips() {
+    let payload = claim_draw();
+    assert_eq!(
+        payload.as_value(),
+        &serde_json::json!({ "type": "claim_draw" })
+    );
+    let json = serde_json::to_string(&payload).unwrap();
+    let back: Action = serde_json::from_str(&json).unwrap();
+    assert_eq!(payload, back);
+    assert_eq!(
+        back.to_typed::<StandardAction>().unwrap(),
+        StandardAction::ClaimDraw
+    );
+}
+
 #[test]
 fn chess960_from_fen_via_factory() {
     let factory = Chess960Variant;
