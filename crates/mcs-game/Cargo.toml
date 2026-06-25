@@ -14,7 +14,13 @@ workspace = true
 [dependencies]
 mcs-core.workspace = true
 mcs-domain.workspace = true
-mcs-storage.workspace = true
+# Only the backend-agnostic repository traits/types are used here, so disable
+# the default `sqlite` backend feature: it must not be force-enabled on the
+# shared `mcs-storage` crate, or it would leak (via Cargo feature unification)
+# into the Postgres-only server build and silently select the SQLite backend.
+# A `path` dep is required because `default-features = false` is ignored when a
+# dependency is inherited via `workspace = true`.
+mcs-storage = { path = "../mcs-storage", default-features = false }
 tokio.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true

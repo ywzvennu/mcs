@@ -12,6 +12,17 @@ FROM rust:1-slim-bookworm AS builder
 
 WORKDIR /build
 
+# Storage backend selected at build time.
+#
+#   sqlite   (default) — single-file backend; the default image.
+#   postgres           — Postgres-only binary, built with
+#                        `--no-default-features --features postgres`.
+#
+# Build the Postgres image with `docker build --build-arg DB_BACKEND=postgres .`
+# (or via the compose `postgres` profile). Any value other than `postgres`
+# falls back to the SQLite default.
+ARG DB_BACKEND=sqlite
+
 # Install native dependencies required by sqlx (OpenSSL / TLS backend)
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends pkg-config libssl-dev && \
@@ -47,7 +58,16 @@ RUN for crate in mcs-api mcs-auth mcs-cluster mcs-core mcs-domain mcs-game \
     mkdir -p crates/mcs-server/src && \
     printf 'fn main() {}\n' > crates/mcs-server/src/main.rs
 
-RUN cargo build --release -p mcs-server 2>&1 | tail -5; true
+# Resolve the cargo feature flags for the selected backend once, into a file the
+# real build also reads, so the dependency-cache layer and the full build always
+# agree on the feature set.
+RUN if [ "$DB_BACKEND" = "postgres" ]; then \
+        echo "--no-default-features --features postgres" > /build/.cargo-backend-flags; \
+    else \
+        echo "" > /build/.cargo-backend-flags; \
+    fi
+
+RUN cargo build --release -p mcs-server $(cat /build/.cargo-backend-flags) 2>&1 | tail -5; true
 
 # --- Full source build -------------------------------------------------------
 # Now overwrite stubs with actual source and do the real compile.
@@ -57,7 +77,7 @@ COPY crates/ crates/
 # manifest timestamp has not changed.
 RUN touch crates/mcs-server/src/main.rs
 
-RUN cargo build --release -p mcs-server
+RUN cargo build --release -p mcs-server $(cat /build/.cargo-backend-flags)
 
 # ---------------------------------------------------------------------------
 # Stage 2 — runtime
@@ -89,7 +109,10 @@ EXPOSE 8080
 # Environment defaults
 #
 #   MCS_BIND            – listen on all interfaces inside the container
-#   MCS_DATABASE_URL    – SQLite file inside the mounted /data volume
+#   MCS_DATABASE_URL    – SQLite file inside the mounted /data volume. A Postgres
+#                         image (DB_BACKEND=postgres) MUST override this with a
+#                         `postgres://…` DSN; the SQLite default below is just a
+#                         placeholder its sqlite-less binary cannot open.
 #   MCS_LOG__FORMAT     – structured JSON is friendlier for log aggregators
 #
 # REQUIRED at runtime (not set here — must be supplied by the operator):

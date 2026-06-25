@@ -15,9 +15,26 @@ workspace = true
 name = "mcs-server"
 path = "src/main.rs"
 
+[features]
+# Select the storage backend at build time. Exactly one should be active; the
+# default is SQLite (single-file, in-memory tests). Building a Postgres-only
+# binary is `--no-default-features --features postgres`, which produces the
+# production Postgres image (see Dockerfile `DB_BACKEND=postgres`).
+default = ["sqlite"]
+sqlite = ["mcs-storage/sqlite"]
+postgres = ["mcs-storage/postgres"]
+
 [dependencies]
 mcs-api.workspace = true
-mcs-storage.workspace = true
+# Referenced by `path` (not `workspace = true`) specifically so we can set
+# `default-features = false`: the root `[workspace.dependencies]` entry does not
+# disable defaults, and Cargo *ignores* a member's `default-features = false`
+# when it inherits via `workspace = true`. A direct path dep lets the backend be
+# chosen by this crate's own `sqlite` / `postgres` features (re-exported above)
+# rather than always pulling in SQLite — so `--no-default-features --features
+# postgres` yields a Postgres-only binary. Member path deps are permitted; only
+# the root manifest is off-limits.
+mcs-storage = { path = "../mcs-storage", default-features = false }
 mcs-core.workspace = true
 mcs-auth.workspace = true
 # Recover in-progress games at startup: `recover_game` rebuilds each unfinished

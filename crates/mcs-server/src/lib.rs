@@ -369,7 +369,9 @@ pub async fn build_app(
     cfg: &Config,
     session_secret: Vec<u8>,
 ) -> anyhow::Result<(Router, Option<ClusterRuntime>)> {
-    let storage = Arc::new(SqlxStorage::connect(&cfg.database_url).await?);
+    let storage = Arc::new(
+        SqlxStorage::connect_with(&cfg.database_url, cfg.database.to_pool_config()).await?,
+    );
     let state = build_state(cfg, storage, session_secret)?;
     recover_games(&state).await?;
     // Wire cluster membership when enabled (no-op otherwise; the state keeps its

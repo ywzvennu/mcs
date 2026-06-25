@@ -70,7 +70,7 @@ pub use revoked_token::RevokedTokenRepo;
 pub use seek::{ClaimOutcome, SeekRepo};
 pub use session::SessionRepo;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-pub use sqlx_store::SqlxStorage;
+pub use sqlx_store::{PoolConfig, SqlxStorage};
 pub use user::UserRepo;
 
 #[cfg(test)]

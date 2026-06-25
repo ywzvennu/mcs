@@ -67,6 +67,60 @@ type DbPool = sqlx::Pool<Backend>;
 /// bounds that the concrete type satisfies for free.
 type DbRow = <Backend as sqlx::Database>::Row;
 
+/// Connection-pool tuning applied when building a [`SqlxStorage`] pool.
+///
+/// These knobs map onto [`sqlx::pool::PoolOptions`] and let an operator size the
+/// pool for a production database (most relevant for Postgres, where many server
+/// nodes share one instance). Build one from your server config and hand it to
+/// [`SqlxStorage::connect_with`].
+///
+/// # Defaults
+///
+/// [`PoolConfig::default`] is conservative and backend-agnostic: 10 max
+/// connections, a 30-second acquire timeout, a 10-minute idle timeout, and no
+/// hard connection lifetime or statement timeout. These suit a single-node
+/// SQLite file as well as a small shared Postgres.
+///
+/// # In-memory SQLite
+///
+/// In-memory SQLite is always pinned to a single connection regardless of
+/// [`max_connections`](Self::max_connections): every SQLite connection gets its
+/// own private in-memory database, so a multi-connection pool would scatter
+/// writes across disjoint databases. [`SqlxStorage::connect_with`] enforces this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolConfig {
+    /// Maximum number of connections the pool may open. Default: `10`.
+    ///
+    /// Pinned to `1` internally for in-memory SQLite (see the type docs).
+    pub max_connections: u32,
+    /// How long [`acquire`](sqlx::Pool::acquire) waits for a free connection
+    /// before returning a timeout error. Default: 30 s.
+    pub acquire_timeout: std::time::Duration,
+    /// Close a connection that has been idle in the pool for at least this long.
+    /// `None` keeps idle connections indefinitely. Default: `Some(10 min)`.
+    pub idle_timeout: Option<std::time::Duration>,
+    /// Close (and replace) any connection older than this, regardless of use.
+    /// Useful behind a load balancer that recycles backend TCP connections.
+    /// `None` (the default) imposes no maximum lifetime.
+    pub max_lifetime: Option<std::time::Duration>,
+    /// Per-statement execution timeout, applied **only on Postgres** by issuing
+    /// `SET statement_timeout` on each new connection. `None` (the default)
+    /// leaves the server's own `statement_timeout` in force. Ignored on SQLite.
+    pub statement_timeout: Option<std::time::Duration>,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 10,
+            acquire_timeout: std::time::Duration::from_secs(30),
+            idle_timeout: Some(std::time::Duration::from_secs(10 * 60)),
+            max_lifetime: None,
+            statement_timeout: None,
+        }
+    }
+}
+
 /// Embedded migrator pointing at `crates/mcs-storage/migrations`.
 ///
 /// `sqlx::migrate!` reads the SQL files at compile time (a pure file read — it
@@ -365,19 +419,62 @@ impl SqlxStorage {
     /// - [`StorageError::Backend`] if the pool cannot be established or a
     ///   migration fails to apply.
     pub async fn connect(database_url: &str) -> StorageResult<Self> {
-        // In-memory SQLite gives every *connection* its own private database, so
-        // a multi-connection pool would scatter writes across disjoint DBs and
-        // reads would non-deterministically miss them. Pin in-memory SQLite to a
-        // single connection so all access shares one coherent database. File
-        // SQLite and Postgres keep the default pool sizing.
-        let pool = if database_url.contains(":memory:") {
-            sqlx::pool::PoolOptions::<Backend>::new()
-                .max_connections(1)
-                .connect(database_url)
-                .await?
+        Self::connect_with(database_url, PoolConfig::default()).await
+    }
+
+    /// Connects to `database_url` with explicit pool tuning, building the pool
+    /// from `pool` and running migrations.
+    ///
+    /// The [`PoolConfig`] knobs (max connections, acquire/idle/lifetime
+    /// timeouts, and a Postgres-only `statement_timeout`) are applied to the
+    /// [`sqlx::pool::PoolOptions`] before connecting. In-memory SQLite is always
+    /// pinned to a single connection regardless of
+    /// [`max_connections`](PoolConfig::max_connections) — every in-memory SQLite
+    /// connection has its own private database, so a multi-connection pool would
+    /// scatter writes across disjoint databases and reads would
+    /// non-deterministically miss them.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::Backend`] if the pool cannot be established or a
+    ///   migration fails to apply.
+    pub async fn connect_with(database_url: &str, pool: PoolConfig) -> StorageResult<Self> {
+        // In-memory SQLite must use exactly one connection (see method docs);
+        // every other backend/URL honours the configured maximum.
+        let is_memory_sqlite = database_url.contains(":memory:");
+        let max_connections = if is_memory_sqlite {
+            1
         } else {
-            DbPool::connect(database_url).await?
+            pool.max_connections.max(1)
         };
+
+        let options = sqlx::pool::PoolOptions::<Backend>::new()
+            .max_connections(max_connections)
+            .acquire_timeout(pool.acquire_timeout)
+            .idle_timeout(pool.idle_timeout)
+            .max_lifetime(pool.max_lifetime);
+
+        // `statement_timeout` is a Postgres server setting; apply it per
+        // connection via `SET`. On SQLite the option is silently ignored: there
+        // is no equivalent server-side statement timeout, and `is_memory_sqlite`
+        // would never be Postgres anyway.
+        #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
+        let options = match pool.statement_timeout {
+            Some(timeout) => {
+                let millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+                options.after_connect(move |conn, _meta| {
+                    Box::pin(async move {
+                        use sqlx::Executor;
+                        conn.execute(format!("SET statement_timeout = {millis}").as_str())
+                            .await?;
+                        Ok(())
+                    })
+                })
+            }
+            None => options,
+        };
+
+        let pool = options.connect(database_url).await?;
         MIGRATOR
             .run(&pool)
             .await
@@ -994,5 +1091,58 @@ impl RatingRepo for SqlxStorage {
                 Ok((user_id, rating))
             })
             .collect()
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod pool_config_tests {
+    use super::*;
+
+    #[test]
+    fn pool_config_default_is_conservative() {
+        let cfg = PoolConfig::default();
+        assert_eq!(cfg.max_connections, 10);
+        assert_eq!(cfg.acquire_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(
+            cfg.idle_timeout,
+            Some(std::time::Duration::from_secs(10 * 60))
+        );
+        assert_eq!(cfg.max_lifetime, None);
+        assert_eq!(cfg.statement_timeout, None);
+    }
+
+    /// In-memory SQLite is pinned to a single connection even when the config
+    /// asks for many, so all access shares one coherent database.
+    #[tokio::test]
+    async fn connect_with_pins_in_memory_sqlite_to_single_connection() {
+        let cfg = PoolConfig {
+            max_connections: 32,
+            ..PoolConfig::default()
+        };
+        let storage = SqlxStorage::connect_with("sqlite::memory:", cfg)
+            .await
+            .expect("connect in-memory sqlite with a large max_connections");
+        // A multi-connection in-memory pool would give each acquire a private
+        // empty database; with the single-connection pin both acquires see the
+        // same migrated schema, so this size reflects the enforced cap.
+        assert_eq!(storage.pool().options().get_max_connections(), 1);
+    }
+
+    /// A non-memory configuration honours the requested maximum.
+    #[tokio::test]
+    async fn connect_with_honours_max_connections_for_file_sqlite() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mcs_pool_{}.db", uuid::Uuid::new_v4().simple()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let cfg = PoolConfig {
+            max_connections: 4,
+            ..PoolConfig::default()
+        };
+        let storage = SqlxStorage::connect_with(&url, cfg)
+            .await
+            .expect("connect file sqlite with a configured pool");
+        assert_eq!(storage.pool().options().get_max_connections(), 4);
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
     }
 }

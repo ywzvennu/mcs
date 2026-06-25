@@ -70,6 +70,14 @@ All variables are prefixed `MCS_`. Nested config keys use `__` as a separator
 | `MCS_DATABASE_URL`  | `sqlite:///data/mcs.db?mode=rwc`    | Storage connection string (SQLite or Postgres).  |
 | `MCS_CONFIG`        | `config.toml`                       | Path to an optional TOML config file.            |
 
+### Database pool (`MCS_DATABASE__*`)
+
+See [Connection-pool tuning](#connection-pool-tuning-database) for the full
+table. Keys: `MCS_DATABASE__MAX_CONNECTIONS` (10),
+`MCS_DATABASE__ACQUIRE_TIMEOUT_SECS` (30), `MCS_DATABASE__IDLE_TIMEOUT_SECS`
+(600), `MCS_DATABASE__MAX_LIFETIME_SECS` (0 = none), and
+`MCS_DATABASE__STATEMENT_TIMEOUT_SECS` (0 = unset, Postgres only).
+
 ### Logging (`MCS_LOG__*`)
 
 | Variable           | Default | Description                                                  |
@@ -168,23 +176,100 @@ cookie) is a simpler but less precise alternative.
 ## Postgres
 
 The default storage backend is SQLite, which is convenient for development and
-single-node deployments but is not designed for multiple concurrent writers.
+single-node deployments but is not designed for multiple concurrent writers. A
+shared **Postgres** instance is the recommended backend for production and for
+cluster deployments: it gives all nodes a consistent view of seeks, users, and
+game records without per-node data partitioning.
 
-Postgres support is tracked separately and requires building with the `postgres`
-storage feature flag. Once available, replace the `MCS_DATABASE_URL` value with
-a Postgres DSN:
+### Building the Postgres image
 
+The storage backend is a compile-time choice. The default image bundles the
+SQLite driver; pass `DB_BACKEND=postgres` to build a Postgres-only binary
+(`cargo build --release -p mcs-server --no-default-features --features postgres`):
+
+```sh
+docker build --build-arg DB_BACKEND=postgres -t mcs-server:postgres .
 ```
-MCS_DATABASE_URL=postgres://user:password@db-host:5432/mcs
+
+The same selection is available to a direct `cargo` build:
+
+```sh
+cargo build -p mcs-server --no-default-features --features postgres
 ```
 
-A shared Postgres instance is the recommended backend for cluster deployments
-because it gives all nodes a consistent view of seeks, users, and game records
-without per-node data partitioning.
+### Running against Postgres
 
-> **Note:** Postgres deployment is **not** included in this PR. It is tracked
-> separately and will be addressed once the `postgres` storage feature is
-> complete.
+Point `MCS_DATABASE_URL` at a Postgres DSN and run the Postgres image:
+
+```sh
+docker run --rm \
+  -p 8080:8080 \
+  -e MCS_DATABASE_URL="postgres://user:password@db-host:5432/mcs" \
+  -e MCS_SESSION__SECRET="$(openssl rand -hex 32)" \
+  mcs-server:postgres
+```
+
+**Migrations apply automatically on startup.** The server runs the embedded
+migrations against the target database before serving traffic, so a fresh
+database needs no manual schema step. This works the same way against a managed
+Postgres (Amazon RDS, Cloud SQL, Neon, Supabase, etc.): create an empty
+database, grant the connecting role `CREATE`/`USAGE` on its schema, and set
+`MCS_DATABASE_URL` to the provider's DSN (append `?sslmode=require` when the
+provider mandates TLS).
+
+### Compose profile
+
+`docker-compose.yml` ships a `postgres` profile that brings up a `postgres:16`
+service (with a `pg_isready` healthcheck) plus a single `mcs-pg` server built
+with `DB_BACKEND=postgres`:
+
+```sh
+docker compose --profile postgres up --build
+```
+
+| Service     | Host port | Role                                   |
+|-------------|-----------|----------------------------------------|
+| `postgres`  | (internal)| Shared Postgres 16 database            |
+| `mcs-pg`    | 8083      | mcs-server (Postgres backend)          |
+
+The `mcs-pg` service waits for the database to pass its healthcheck, then runs
+migrations and starts serving on host port 8083. The default (no-profile) stack
+(`redis`, `node-a`, `node-b`) is unaffected and still starts with a plain
+`docker compose up`. Validate the profile without building with
+`docker compose --profile postgres config`.
+
+To grow the profile into a multi-node Postgres cluster, add more server services
+pointing at the same `MCS_DATABASE_URL` and a shared Redis (`MCS_CLUSTER__*`, see
+[Cluster](#cluster-horizontal-scaling)) — Postgres removes the per-node SQLite
+data-ownership constraint.
+
+### Connection-pool tuning (`[database]`)
+
+The `[database]` config section (env prefix `MCS_DATABASE__`) sizes the storage
+connection pool. It matters most for Postgres, where several nodes share one
+instance, but applies to every backend. Optional timeouts are in whole seconds;
+`0` disables that bound.
+
+| Variable                                | Default      | Description                                                                 |
+|-----------------------------------------|--------------|-----------------------------------------------------------------------------|
+| `MCS_DATABASE__MAX_CONNECTIONS`         | `10`         | Max pool connections. Keep `nodes x this` under the server's `max_connections`. In-memory SQLite is always pinned to 1. |
+| `MCS_DATABASE__ACQUIRE_TIMEOUT_SECS`    | `30`         | How long `acquire` waits for a free connection before erroring.             |
+| `MCS_DATABASE__IDLE_TIMEOUT_SECS`       | `600`        | Close a connection idle in the pool this long. `0` = keep indefinitely.     |
+| `MCS_DATABASE__MAX_LIFETIME_SECS`       | `0` (none)   | Recycle any connection older than this. `0` = no maximum lifetime. Useful behind a load balancer that drops idle backend TCP connections. |
+| `MCS_DATABASE__STATEMENT_TIMEOUT_SECS`  | `0` (unset)  | **Postgres only**: per-statement timeout via `SET statement_timeout`. `0` leaves it unset. Ignored on SQLite. |
+
+### Backups and point-in-time recovery (PITR)
+
+Postgres is the system of record for all durable game state, so back it up:
+
+- **Logical dumps** — schedule `pg_dump`/`pg_dumpall` (or `pg_basebackup` for a
+  physical base) and ship the artifacts off-host. The compose profile stores the
+  database in the `postgres-data` named volume; a `docker compose exec postgres
+  pg_dump -U mcs mcs` captures a consistent snapshot.
+- **PITR** — for production, enable WAL archiving (`archive_mode = on`,
+  `archive_command`/`archive_library`) so you can restore to any point in time,
+  or rely on the equivalent automated-backup + PITR feature of your managed
+  Postgres. Test restores periodically; an untested backup is not a backup.
 
 ---
 
@@ -195,7 +280,10 @@ without per-node data partitioning.
 | `/data`       | SQLite database file (`mcs.db`).   |
 
 Mount a named Docker volume (or a host directory) at `/data` to persist game
-state across container restarts.
+state across container restarts. With the Postgres backend the server keeps no
+local state, so the `/data` volume is unused; durability comes from Postgres
+instead (the compose `postgres` profile persists it in the `postgres-data`
+named volume).
 
 ---
 
