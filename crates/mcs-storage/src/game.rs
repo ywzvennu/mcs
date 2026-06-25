@@ -67,6 +67,26 @@ pub trait GameRepo: Send + Sync {
     /// - [`StorageError::Backend`] on driver-level failures.
     async fn list_for_user(&self, user: UserId, limit: u32) -> StorageResult<Vec<Game>>;
 
+    /// Returns every [`GameLifecycle::Finished`][mcs_domain::GameLifecycle::Finished]
+    /// game in which `user` played either colour, ordered by `created_at`
+    /// (oldest first).
+    ///
+    /// This is the aggregation source for per-player statistics (win/loss/draw
+    /// tallies and performance ratings): the caller walks the full finished
+    /// history and folds it into per-`(variant, time_class)` totals in
+    /// application code.
+    ///
+    /// Unlike [`list_for_user`](GameRepo::list_for_user) the result is
+    /// **unbounded** — every finished game counts towards the player's record,
+    /// so none may be dropped. A very active player therefore returns many rows;
+    /// a denormalised, incrementally-maintained stats cache is the future
+    /// optimisation when this read becomes hot.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::Backend`] on driver-level failures.
+    async fn finished_games_for_user(&self, user: UserId) -> StorageResult<Vec<Game>>;
+
     /// Returns all games whose lifecycle is not
     /// [`GameLifecycle::Finished`][mcs_domain::GameLifecycle::Finished] —
     /// i.e. games still `Created` or `Active` — ordered by `created_at`

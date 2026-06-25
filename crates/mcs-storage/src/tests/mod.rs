@@ -330,6 +330,56 @@ async fn game_repo_list_unfinished_excludes_finished() {
     assert!(!ids.contains(&finished.id));
 }
 
+#[tokio::test]
+async fn game_repo_finished_games_for_user_filters_by_lifecycle_and_player() {
+    let repo = MemoryGameRepo::default();
+    let alice = UserId::new();
+    let bob = UserId::new();
+    let carol = UserId::new();
+
+    // Two finished games involving alice (one each colour), an unfinished game
+    // involving alice, and a finished game that does not involve her.
+    let mut alice_white = sample_game(alice, bob);
+    alice_white.created_at = OffsetDateTime::UNIX_EPOCH;
+    alice_white.finish(
+        Outcome::win(Color::White, EndReason::Checkmate),
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10),
+    );
+    repo.create(&alice_white).await.unwrap();
+
+    let mut alice_black = sample_game(bob, alice);
+    alice_black.created_at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1);
+    alice_black.finish(
+        Outcome::draw(EndReason::Other("agreement".into())),
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(11),
+    );
+    repo.create(&alice_black).await.unwrap();
+
+    // Unfinished game with alice — must be excluded.
+    repo.create(&sample_game(alice, carol)).await.unwrap();
+
+    // Finished game without alice — must be excluded.
+    let mut other = sample_game(bob, carol);
+    other.finish(
+        Outcome::win(Color::Black, EndReason::Resignation),
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(12),
+    );
+    repo.create(&other).await.unwrap();
+
+    let finished = repo.finished_games_for_user(alice).await.unwrap();
+    let ids: Vec<GameId> = finished.iter().map(|g| g.id).collect();
+    assert_eq!(finished.len(), 2);
+    // Oldest first.
+    assert_eq!(ids, vec![alice_white.id, alice_black.id]);
+
+    // A user with no finished games yields an empty list.
+    assert!(repo
+        .finished_games_for_user(UserId::new())
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // ActionLogRepo tests
 // ---------------------------------------------------------------------------

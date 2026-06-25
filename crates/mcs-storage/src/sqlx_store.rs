@@ -736,6 +736,23 @@ impl GameRepo for SqlxStorage {
         rows.iter().map(game_from_row).collect()
     }
 
+    async fn finished_games_for_user(&self, user: UserId) -> StorageResult<Vec<Game>> {
+        // Every finished game the user played either colour, oldest first.
+        // Unbounded by design: each game counts towards the player's record, so
+        // none may be dropped (see the trait doc on the future stats cache).
+        let uid = user.to_string();
+        let rows = sqlx::query(&format!(
+            "{GAME_SELECT} WHERE lifecycle = $1 AND (white = $2 OR black = $3) \
+             ORDER BY created_at"
+        ))
+        .bind(encode_lifecycle(GameLifecycle::Finished))
+        .bind(&uid)
+        .bind(&uid)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(game_from_row).collect()
+    }
+
     async fn list_unfinished(&self) -> StorageResult<Vec<Game>> {
         // Anything not yet `finished` is unfinished — `created` and `active`
         // games. Ordering by `created_at` (oldest first) gives recovery a
