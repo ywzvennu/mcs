@@ -25,6 +25,7 @@ use super::harness::{connect_test_storage, TestStorage};
 // the `Repositories` accessors, so the individual repo traits need not be in
 // scope here.
 use crate::{RecordedAction, Repositories, StorageError};
+use mcs_payments::{PaymentRecord, PaymentStoreError};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1115,6 +1116,71 @@ async fn challenge_purge_resolved_removes_old_declined_and_canceled_only() {
         storage.challenges().get(old_canceled.id).await,
         Err(StorageError::NotFound)
     ));
+}
+
+// ---------------------------------------------------------------------------
+// PaymentStore — x402 settled-payment idempotency (#108)
+// ---------------------------------------------------------------------------
+
+fn sample_payment(key: &str) -> PaymentRecord {
+    PaymentRecord {
+        idempotency_key: key.to_owned(),
+        payer: "0xPayer".to_owned(),
+        amount: "10000".to_owned(),
+        asset: "0xUSDC".to_owned(),
+        network: "base-sepolia".to_owned(),
+        transaction: Some("0xhash".to_owned()),
+        resource: "/seeks".to_owned(),
+        created_at: OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
+#[tokio::test]
+async fn payment_record_then_find_round_trip() {
+    let storage = storage().await;
+    let key = "exact:base-sepolia:0xabc";
+
+    assert!(storage.payments().find(key).await.unwrap().is_none());
+
+    let record = sample_payment(key);
+    storage.payments().record(&record).await.unwrap();
+
+    let found = storage
+        .payments()
+        .find(key)
+        .await
+        .unwrap()
+        .expect("record must exist after recording");
+    assert_eq!(found, record);
+}
+
+#[tokio::test]
+async fn payment_duplicate_key_is_conflict() {
+    let storage = storage().await;
+    let record = sample_payment("exact:base-sepolia:dup");
+    storage.payments().record(&record).await.unwrap();
+
+    // The PK on `idempotency_key` makes a second insert the "already recorded"
+    // conflict the middleware falls back on.
+    let err = storage.payments().record(&record).await.unwrap_err();
+    assert!(matches!(err, PaymentStoreError::Conflict));
+}
+
+#[tokio::test]
+async fn payment_without_transaction_round_trips_as_none() {
+    let storage = storage().await;
+    let mut record = sample_payment("exact:base-sepolia:notx");
+    record.transaction = None;
+    storage.payments().record(&record).await.unwrap();
+
+    let found = storage
+        .payments()
+        .find(&record.idempotency_key)
+        .await
+        .unwrap()
+        .expect("record must exist");
+    assert!(found.transaction.is_none());
+    assert_eq!(found, record);
 }
 
 // ---------------------------------------------------------------------------

@@ -23,6 +23,7 @@
 //! | [`session`]      | [`SessionRepo`] trait |
 //! | [`revoked_token`]| [`RevokedTokenRepo`] trait |
 //! | [`rating`]       | [`RatingRepo`] trait |
+//! | [`payment`]      | [`PaymentStore`] re-export (x402 idempotency, #108) |
 //! | [`repositories`] | [`Repositories`] aggregate trait |
 //! | [`sqlx_store`]   | [`SqlxStorage`] sqlx-backed implementation |
 //!
@@ -51,6 +52,7 @@ pub mod action_log;
 pub mod challenge;
 pub mod error;
 pub mod game;
+pub mod payment;
 pub mod rating;
 pub mod repositories;
 pub mod revoked_token;
@@ -64,6 +66,7 @@ pub use action_log::{ActionLogRepo, RecordedAction};
 pub use challenge::ChallengeRepo;
 pub use error::{StorageError, StorageResult};
 pub use game::GameRepo;
+pub use payment::{PaymentRecord, PaymentStore, PaymentStoreError};
 pub use rating::RatingRepo;
 pub use repositories::Repositories;
 pub use revoked_token::RevokedTokenRepo;

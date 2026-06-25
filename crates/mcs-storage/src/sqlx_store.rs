@@ -33,6 +33,7 @@ use mcs_domain::{
     Challenge, ChallengeId, ChallengeStatus, ColorPreference, EvmAddress, Game, GameId,
     GameLifecycle, Rating, Seek, SeekId, User, UserId,
 };
+use mcs_payments::{PaymentRecord, PaymentStore, PaymentStoreError};
 use sqlx::Row;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -536,6 +537,10 @@ impl Repositories for SqlxStorage {
     }
 
     fn ratings(&self) -> &dyn RatingRepo {
+        self
+    }
+
+    fn payments(&self) -> &dyn PaymentStore {
         self
     }
 }
@@ -1129,6 +1134,81 @@ impl RatingRepo for SqlxStorage {
                 Ok((user_id, rating))
             })
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PaymentStore — x402 settled-payment idempotency (#108)
+// ---------------------------------------------------------------------------
+
+/// Reconstructs a [`PaymentRecord`] from a `payments` row.
+fn payment_from_row(row: &DbRow) -> Result<PaymentRecord, StorageError> {
+    Ok(PaymentRecord {
+        idempotency_key: row.try_get::<String, _>("idempotency_key")?,
+        payer: row.try_get::<String, _>("payer")?,
+        amount: row.try_get::<String, _>("amount")?,
+        asset: row.try_get::<String, _>("asset")?,
+        network: row.try_get::<String, _>("network")?,
+        transaction: row.try_get::<Option<String>, _>("transaction_ref")?,
+        resource: row.try_get::<String, _>("resource")?,
+        created_at: decode_time(&row.try_get::<String, _>("created_at")?)?,
+    })
+}
+
+/// Maps a [`StorageError`] arising inside [`PaymentStore`] onto the payment
+/// crate's own error type: a uniqueness conflict on `idempotency_key` becomes
+/// [`PaymentStoreError::Conflict`] (the "already recorded" signal), everything
+/// else a [`PaymentStoreError::Backend`].
+fn to_store_error(err: StorageError) -> PaymentStoreError {
+    match err {
+        StorageError::Conflict(_) => PaymentStoreError::Conflict,
+        other => PaymentStoreError::Backend(other.to_string()),
+    }
+}
+
+#[async_trait]
+impl PaymentStore for SqlxStorage {
+    async fn find(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<PaymentRecord>, PaymentStoreError> {
+        let row = sqlx::query(
+            "SELECT idempotency_key, payer, amount, asset, network, transaction_ref, resource, \
+             created_at FROM payments WHERE idempotency_key = $1",
+        )
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_error(e.into()))?;
+        row.map(|r| payment_from_row(&r))
+            .transpose()
+            .map_err(to_store_error)
+    }
+
+    async fn record(&self, record: &PaymentRecord) -> Result<(), PaymentStoreError> {
+        // The PRIMARY KEY on `idempotency_key` is the idempotency guarantee: a
+        // duplicate INSERT violates it and surfaces as `StorageError::Conflict`,
+        // which `to_store_error` maps to `PaymentStoreError::Conflict` — the
+        // "already recorded" signal the middleware falls back on.
+        let created_at = encode_time(record.created_at).map_err(to_store_error)?;
+        sqlx::query(
+            "INSERT INTO payments \
+             (idempotency_key, payer, amount, asset, network, transaction_ref, resource, \
+              created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&record.idempotency_key)
+        .bind(&record.payer)
+        .bind(&record.amount)
+        .bind(&record.asset)
+        .bind(&record.network)
+        .bind(record.transaction.as_deref())
+        .bind(&record.resource)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_error(e.into()))?;
+        Ok(())
     }
 }
 

@@ -25,6 +25,11 @@ postgres = ["sqlx/postgres"]
 [dependencies]
 mcs-core.workspace = true
 mcs-domain.workspace = true
+# x402 payment idempotency (#108): `SqlxStorage` implements `mcs_payments::
+# PaymentStore` so settled payments persist and paid actions are idempotent.
+# Referenced by path: `mcs-payments` is not in `[workspace.dependencies]`, and
+# member path deps are allowed (only the root manifest is off-limits).
+mcs-payments = { path = "../mcs-payments" }
 async-trait.workspace = true
 thiserror.workspace = true
 time.workspace = true

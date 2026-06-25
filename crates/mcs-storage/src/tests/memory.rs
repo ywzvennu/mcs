@@ -14,6 +14,8 @@ use mcs_domain::{
 };
 use time::OffsetDateTime;
 
+use mcs_payments::{PaymentRecord, PaymentStore, PaymentStoreError};
+
 use crate::{
     action_log::{ActionLogRepo, RecordedAction},
     challenge::ChallengeRepo,
@@ -470,6 +472,38 @@ impl RatingRepo for MemoryRatingRepo {
 }
 
 // ---------------------------------------------------------------------------
+// MemoryPaymentStore — x402 settled-payment idempotency (#108)
+// ---------------------------------------------------------------------------
+
+/// In-memory [`PaymentStore`] backed by a `HashMap` keyed on `idempotency_key`.
+#[derive(Debug, Default)]
+pub(super) struct MemoryPaymentStore {
+    records: Mutex<HashMap<String, PaymentRecord>>,
+}
+
+#[async_trait]
+impl PaymentStore for MemoryPaymentStore {
+    async fn find(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<PaymentRecord>, PaymentStoreError> {
+        let map = self.records.lock().expect("mutex poisoned");
+        Ok(map.get(idempotency_key).cloned())
+    }
+
+    async fn record(&self, record: &PaymentRecord) -> Result<(), PaymentStoreError> {
+        let mut map = self.records.lock().expect("mutex poisoned");
+        // Unique on `idempotency_key`: a second record is the "already recorded"
+        // conflict the middleware falls back on.
+        if map.contains_key(&record.idempotency_key) {
+            return Err(PaymentStoreError::Conflict);
+        }
+        map.insert(record.idempotency_key.clone(), record.clone());
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // InMemoryRepos — aggregate
 // ---------------------------------------------------------------------------
 
@@ -484,6 +518,7 @@ pub(super) struct InMemoryRepos {
     sessions: MemorySessionRepo,
     revoked_tokens: MemoryRevokedTokenRepo,
     ratings: MemoryRatingRepo,
+    payments: MemoryPaymentStore,
 }
 
 impl Repositories for InMemoryRepos {
@@ -517,5 +552,9 @@ impl Repositories for InMemoryRepos {
 
     fn ratings(&self) -> &dyn RatingRepo {
         &self.ratings
+    }
+
+    fn payments(&self) -> &dyn PaymentStore {
+        &self.payments
     }
 }

@@ -153,6 +153,10 @@ pub fn router(state: AppState) -> Router {
         Some(gate) => rest::create_seek_router().layer(RequirePaymentLayer::new(
             gate.requirements().to_vec(),
             Arc::clone(gate.verifier()),
+            // Inject the settled-payment store so a duplicated paid request is
+            // served from the prior settlement (idempotent — no second charge,
+            // no second settle) and each settlement persists (#108).
+            Arc::clone(state.payment_store()),
         )),
         None => rest::create_seek_router(),
     };
