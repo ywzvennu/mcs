@@ -1,8 +1,8 @@
 //! Aggregate repository handle.
 
 use crate::{
-    ActionLogRepo, ChallengeRepo, GameRepo, RatingRepo, RevokedTokenRepo, SeekRepo, SessionRepo,
-    UserRepo,
+    ActionLogRepo, ChallengeRepo, GameRepo, PaymentStore, RatingRepo, RevokedTokenRepo, SeekRepo,
+    SessionRepo, UserRepo,
 };
 
 /// A single handle that exposes all repository traits.
@@ -57,4 +57,7 @@ pub trait Repositories: Send + Sync {
 
     /// Returns the rating repository.
     fn ratings(&self) -> &dyn RatingRepo;
+
+    /// Returns the settled-payment store (x402 idempotency, #108).
+    fn payments(&self) -> &dyn PaymentStore;
 }

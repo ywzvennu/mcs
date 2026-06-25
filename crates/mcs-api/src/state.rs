@@ -13,7 +13,7 @@ use mcs_cluster::{LocalRegistry, NodeInfo, NodeRegistry};
 use mcs_core::{VariantOptions, VariantRegistry};
 use mcs_domain::{Game, GameId, GameLifecycle, TimeControl, UserId};
 use mcs_game::{recover_game, GameActor, GameCompletionHook, GameHandle, Matchmaker};
-use mcs_payments::{PaymentRequirements, PaymentVerifier};
+use mcs_payments::{PaymentRequirements, PaymentStore, PaymentVerifier};
 use mcs_storage::error::StorageError;
 use mcs_storage::{ActionLogRepo, GameRepo, RatingRepo, Repositories, SeekRepo, UserRepo};
 use time::{Duration, OffsetDateTime};
@@ -233,6 +233,15 @@ pub struct AppState {
     /// [`RequirePaymentLayer`](mcs_payments::RequirePaymentLayer). Configure it
     /// with [`with_payment`](AppState::with_payment).
     payment_gate: Option<PaymentGate>,
+    /// The settled-payment store backing x402 idempotency (#108).
+    ///
+    /// Derived from the same concrete backing store as every other repository
+    /// handle, so persisted payments share the one database. Injected into the
+    /// [`RequirePaymentLayer`](mcs_payments::RequirePaymentLayer) by
+    /// [`crate::router`] when the gate is active, so a duplicated paid request is
+    /// served from the prior settlement (no second charge). Held unconditionally
+    /// (even when the gate is off) so the wiring needs no `Option` juggling.
+    payment_store: Arc<dyn PaymentStore>,
     /// The player online-presence tracker (#79).
     ///
     /// Records the last-seen instant for each user so the API can answer
@@ -352,8 +361,9 @@ impl AppState {
     ///
     /// `storage` is taken as a concrete `Arc<S>` whose type implements every
     /// repository trait the API needs ([`Repositories`] for the existing
-    /// handlers, plus [`SeekRepo`] for the matchmaker and [`GameRepo`] for actor
-    /// spawning). The trait-object handles are derived internally by cloning the
+    /// handlers, plus [`SeekRepo`] for the matchmaker, [`GameRepo`] for actor
+    /// spawning, and [`PaymentStore`](mcs_payments::PaymentStore) for x402
+    /// idempotency). The trait-object handles are derived internally by cloning the
     /// same `Arc` and coercing it independently, so all of them share one
     /// backing store — exactly the property the live-game path relies on, where
     /// the API reads through `Arc<dyn Repositories>` and an actor persists
@@ -378,7 +388,14 @@ impl AppState {
         siwe_config: SiweConfig,
     ) -> Self
     where
-        S: Repositories + GameRepo + SeekRepo + UserRepo + RatingRepo + ActionLogRepo + 'static,
+        S: Repositories
+            + GameRepo
+            + SeekRepo
+            + UserRepo
+            + RatingRepo
+            + ActionLogRepo
+            + PaymentStore
+            + 'static,
     {
         // Coerce the one concrete `Arc<S>` into each trait object the layers
         // need. Every coercion shares the same allocation, so all handles read
@@ -387,6 +404,7 @@ impl AppState {
         let seek_repo: Arc<dyn SeekRepo> = storage.clone();
         let rating_repo: Arc<dyn RatingRepo> = storage.clone();
         let action_log: Arc<dyn ActionLogRepo> = storage.clone();
+        let payment_store: Arc<dyn PaymentStore> = storage.clone();
         let game_repo: Arc<dyn GameRepo> = storage;
 
         // Abuse-protection limits (#100): start from the defaults; the server
@@ -420,6 +438,7 @@ impl AppState {
             // Payments are off by default: the router behaves exactly as before
             // until a caller opts in via `with_payment`.
             payment_gate: None,
+            payment_store,
             // Presence is on by default with an in-process tracker. A multi-node
             // deployment can swap in a cross-node implementation via `with_presence`.
             presence: Arc::new(InProcessPresence::new()),
@@ -664,6 +683,17 @@ impl AppState {
     #[must_use]
     pub fn payment_gate(&self) -> Option<&PaymentGate> {
         self.payment_gate.as_ref()
+    }
+
+    /// Returns the settled-payment store backing x402 idempotency (#108).
+    ///
+    /// [`crate::router`] injects this into the
+    /// [`RequirePaymentLayer`](mcs_payments::RequirePaymentLayer) so a duplicated
+    /// paid request is served from the prior settlement instead of being charged
+    /// again.
+    #[must_use]
+    pub fn payment_store(&self) -> &Arc<dyn PaymentStore> {
+        &self.payment_store
     }
 
     /// Returns the shared storage handle.

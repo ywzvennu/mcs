@@ -24,9 +24,10 @@ use mcs_core::{Action, Color, EndReason, Outcome, VariantOptions};
 use mcs_domain::{
     ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Seek, TimeControl, User, UserId,
 };
+use mcs_payments::{PaymentRecord, PaymentStore, PaymentStoreError};
 use memory::{
-    InMemoryRepos, MemoryActionLogRepo, MemoryChallengeRepo, MemoryGameRepo, MemoryRatingRepo,
-    MemoryRevokedTokenRepo, MemorySeekRepo, MemorySessionRepo, MemoryUserRepo,
+    InMemoryRepos, MemoryActionLogRepo, MemoryChallengeRepo, MemoryGameRepo, MemoryPaymentStore,
+    MemoryRatingRepo, MemoryRevokedTokenRepo, MemorySeekRepo, MemorySessionRepo, MemoryUserRepo,
 };
 use time::OffsetDateTime;
 
@@ -89,6 +90,65 @@ fn sample_action(ply: u32, player: Color) -> RecordedAction {
         clock_black_ms: Some(170_000 - u64::from(ply)),
         created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(i64::from(ply)),
     }
+}
+
+/// Builds a [`PaymentRecord`] under `key` for the payment-store tests.
+fn sample_payment(key: &str) -> PaymentRecord {
+    PaymentRecord {
+        idempotency_key: key.to_owned(),
+        payer: "0xPayer".to_owned(),
+        amount: "10000".to_owned(),
+        asset: "0xUSDC".to_owned(),
+        network: "base-sepolia".to_owned(),
+        transaction: Some("0xhash".to_owned()),
+        resource: "/seeks".to_owned(),
+        created_at: OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PaymentStore tests (x402 idempotency, #108)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn payment_store_record_then_find() {
+    let store = MemoryPaymentStore::default();
+    // Missing before recording.
+    assert!(store
+        .find("exact:base-sepolia:0x1")
+        .await
+        .unwrap()
+        .is_none());
+
+    let record = sample_payment("exact:base-sepolia:0x1");
+    store.record(&record).await.unwrap();
+
+    let found = store
+        .find("exact:base-sepolia:0x1")
+        .await
+        .unwrap()
+        .expect("record must exist after recording");
+    assert_eq!(found, record);
+}
+
+#[tokio::test]
+async fn payment_store_duplicate_key_is_conflict() {
+    let store = MemoryPaymentStore::default();
+    let record = sample_payment("exact:base-sepolia:dup");
+    store.record(&record).await.unwrap();
+
+    // A second record under the same idempotency key is "already recorded".
+    let err = store.record(&record).await.unwrap_err();
+    assert!(matches!(err, PaymentStoreError::Conflict));
+}
+
+#[tokio::test]
+async fn payment_store_distinct_keys_coexist() {
+    let store = MemoryPaymentStore::default();
+    store.record(&sample_payment("k-a")).await.unwrap();
+    store.record(&sample_payment("k-b")).await.unwrap();
+    assert!(store.find("k-a").await.unwrap().is_some());
+    assert!(store.find("k-b").await.unwrap().is_some());
 }
 
 // ---------------------------------------------------------------------------

@@ -42,15 +42,18 @@
 //!     extra: None,
 //! };
 //! let verifier = Arc::new(MockVerifier);
+//! // `store: Arc<dyn PaymentStore>` makes the gate idempotent (#108): a replayed
+//! // `X-PAYMENT` is served from the recorded settlement, never charged twice.
 //! let app = Router::new()
 //!     .route("/premium", get(handler))
-//!     .layer(RequirePaymentLayer::new(vec![reqs], verifier));
+//!     .layer(RequirePaymentLayer::new(vec![reqs], verifier, store));
 //! ```
 
 pub mod error;
 #[cfg(feature = "facilitator")]
 pub mod facilitator;
 pub mod middleware;
+pub mod store;
 pub mod types;
 pub mod verifier;
 
@@ -58,6 +61,7 @@ pub use error::PaymentError;
 #[cfg(feature = "facilitator")]
 pub use facilitator::FacilitatorVerifier;
 pub use middleware::{RequirePaymentLayer, X_PAYMENT, X_PAYMENT_RESPONSE};
+pub use store::{idempotency_key, PaymentRecord, PaymentStore, PaymentStoreError};
 pub use types::{
     PaymentPayload, PaymentRequiredResponse, PaymentRequirements, Settlement, SettlementResponse,
 };

@@ -17,8 +17,10 @@
 //! handler's auth extractor: an unpaid request gets `402` regardless of auth,
 //! and a paid request still needs a valid session. The tests assert both edges.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
@@ -29,9 +31,31 @@ use mcs_api::{router, AppState, SiweConfig};
 use mcs_auth::{issue_session, SessionConfig};
 use mcs_core::VariantRegistry;
 use mcs_domain::User;
-use mcs_payments::{MockVerifier, PaymentPayload, PaymentRequirements, X_PAYMENT};
+use mcs_payments::{
+    MockVerifier, PaymentError, PaymentPayload, PaymentRequirements, PaymentVerifier, Settlement,
+    X_PAYMENT,
+};
 use mcs_storage::SqlxStorage;
 use mcs_variant_standard::{register, STANDARD_VARIANT_ID};
+
+/// A [`PaymentVerifier`] wrapping [`MockVerifier`] that counts verify+settle
+/// invocations, so an idempotent replay can be shown not to re-settle.
+struct CountingVerifier {
+    inner: MockVerifier,
+    settles: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl PaymentVerifier for CountingVerifier {
+    async fn verify(
+        &self,
+        payload: &PaymentPayload,
+        reqs: &PaymentRequirements,
+    ) -> Result<Settlement, PaymentError> {
+        self.settles.fetch_add(1, Ordering::SeqCst);
+        self.inner.verify(payload, reqs).await
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Test wiring
@@ -117,12 +141,21 @@ fn seek_body() -> Value {
 }
 
 /// A valid mock `X-PAYMENT` header value matching [`test_requirements`].
+///
+/// The exact/EIP-3009 inner payload carries a single-use authorization `nonce`,
+/// so its idempotency key (#108) is derived from that nonce.
 fn valid_payment_header() -> String {
+    payment_header_with_nonce("0xdeadbeef")
+}
+
+/// Builds an exact-scheme `X-PAYMENT` header carrying the given authorization
+/// `nonce`, so distinct nonces map to distinct idempotency keys.
+fn payment_header_with_nonce(nonce: &str) -> String {
     PaymentPayload {
         x402_version: 1,
         scheme: "exact".into(),
         network: "base-sepolia".into(),
-        payload: json!({ "from": "0xPayer", "authorization": "0xdeadbeef" }),
+        payload: json!({ "from": "0xPayer", "authorization": { "nonce": nonce } }),
     }
     .to_header()
     .unwrap()
@@ -294,4 +327,104 @@ async fn payments_enabled_read_endpoints_stay_free() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency (#108): a duplicated paid request settles + charges only once.
+// ---------------------------------------------------------------------------
+
+/// Posts an authenticated `POST /seeks` carrying `payment_header`, returning the
+/// response status. A fresh router is built per call from the same `state`, so
+/// the shared payment store and verifier persist across requests.
+async fn post_seek_with_payment(state: &AppState, token: &str, payment_header: &str) -> StatusCode {
+    router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/seeks")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .header(X_PAYMENT, payment_header)
+                .body(Body::from(seek_body().to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn duplicate_paid_request_settles_and_charges_once() {
+    let settles = Arc::new(AtomicUsize::new(0));
+    let verifier = Arc::new(CountingVerifier {
+        inner: MockVerifier,
+        settles: Arc::clone(&settles),
+    });
+    let state = base_state()
+        .await
+        .with_payment(test_requirements(), verifier);
+    let alice = create_user(&state, "0x1111111111111111111111111111111111111111").await;
+    let token = token_for(&state, &alice);
+
+    let header = valid_payment_header();
+
+    // Two identical paid requests (same X-PAYMENT) — both succeed.
+    assert_eq!(
+        post_seek_with_payment(&state, &token, &header).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_seek_with_payment(&state, &token, &header).await,
+        StatusCode::OK
+    );
+
+    // Verified + settled exactly ONCE across the two identical requests: the
+    // replay was served from the recorded settlement (no second charge).
+    assert_eq!(settles.load(Ordering::SeqCst), 1, "settle must run once");
+
+    // Exactly ONE payment record persisted under the idempotency key.
+    let key = mcs_payments::idempotency_key(&PaymentPayload {
+        x402_version: 1,
+        scheme: "exact".into(),
+        network: "base-sepolia".into(),
+        payload: json!({ "from": "0xPayer", "authorization": { "nonce": "0xdeadbeef" } }),
+    });
+    assert!(
+        state.payment_store().find(&key).await.unwrap().is_some(),
+        "the settlement must be persisted"
+    );
+
+    // Both seeks were queued (the handler ran each time, idempotently).
+    assert_eq!(state.matchmaker().open_seeks().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn distinct_payment_settles_again() {
+    let settles = Arc::new(AtomicUsize::new(0));
+    let verifier = Arc::new(CountingVerifier {
+        inner: MockVerifier,
+        settles: Arc::clone(&settles),
+    });
+    let state = base_state()
+        .await
+        .with_payment(test_requirements(), verifier);
+    let alice = create_user(&state, "0x1111111111111111111111111111111111111111").await;
+    let token = token_for(&state, &alice);
+
+    // Two DIFFERENT payments (distinct nonces) ⇒ two settlements, two records.
+    assert_eq!(
+        post_seek_with_payment(&state, &token, &payment_header_with_nonce("0xnonce-a")).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_seek_with_payment(&state, &token, &payment_header_with_nonce("0xnonce-b")).await,
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        settles.load(Ordering::SeqCst),
+        2,
+        "distinct payments settle"
+    );
+    assert_eq!(state.matchmaker().open_seeks().await.unwrap().len(), 2);
 }

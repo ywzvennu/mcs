@@ -29,6 +29,14 @@ tower.workspace = true
 # base64 encoding/decoding for the X-PAYMENT header value.
 base64 = "0.22"
 
+# SHA-256 for the content-hash fallback of the idempotency key (#108).
+sha2 = "0.10"
+
+# Timestamps on persisted `PaymentRecord`s. The `serde` derive on `PaymentRecord`
+# needs the `serde` feature; `formatting`/`parsing` cover the RFC 3339 round-trip
+# the storage backend performs. Matches the workspace `time` feature set.
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+
 # HTTP client for the optional facilitator-backed verifier. Pulled in only under
 # the `facilitator` feature; rustls (no system OpenSSL) keeps the build portable.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
