@@ -16,7 +16,7 @@
 use mcs_core::{Action, Color, EndReason, Outcome, VariantOptions};
 use mcs_domain::{
     Challenge, ChallengeStatus, ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Rating,
-    Seek, TimeControl, User, UserId,
+    RatingHistoryEntry, Seek, TimeControl, User, UserId,
 };
 use time::OffsetDateTime;
 
@@ -1004,6 +1004,248 @@ async fn rating_leaderboard_empty_variant_returns_empty() {
         .await
         .unwrap();
     assert!(board.is_empty());
+}
+
+#[tokio::test]
+async fn rating_list_for_user_returns_all_variants() {
+    let storage = storage().await;
+    let user = UserId::new();
+    let other = UserId::new();
+
+    storage
+        .ratings()
+        .upsert(user, "standard", &Rating::default())
+        .await
+        .unwrap();
+    storage
+        .ratings()
+        .upsert(
+            user,
+            "chess960",
+            &Rating {
+                value: 1620.0,
+                deviation: 110.0,
+                volatility: 0.05,
+            },
+        )
+        .await
+        .unwrap();
+    // A different user's rating must not appear.
+    storage
+        .ratings()
+        .upsert(other, "standard", &Rating::default())
+        .await
+        .unwrap();
+
+    let ratings = storage.ratings().list_for_user(user).await.unwrap();
+    assert_eq!(ratings.len(), 2);
+    // The sqlx impl orders by variant_id ascending.
+    assert_eq!(ratings[0].0, "chess960");
+    assert_eq!(ratings[1].0, "standard");
+
+    assert!(storage
+        .ratings()
+        .list_for_user(UserId::new())
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// UserRepo::set_username — SQLite/Postgres integration tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn set_username_sets_changes_and_clears_via_reassign() {
+    let storage = storage().await;
+    let user = User::new(address("uname"), None, OffsetDateTime::UNIX_EPOCH);
+    storage.users().create(&user).await.unwrap();
+
+    storage
+        .users()
+        .set_username(user.id, "alice")
+        .await
+        .unwrap();
+    assert_eq!(
+        storage
+            .users()
+            .get(user.id)
+            .await
+            .unwrap()
+            .username
+            .as_deref(),
+        Some("alice")
+    );
+
+    // Change to a new name.
+    storage.users().set_username(user.id, "bob").await.unwrap();
+    assert_eq!(
+        storage
+            .users()
+            .get(user.id)
+            .await
+            .unwrap()
+            .username
+            .as_deref(),
+        Some("bob")
+    );
+
+    // Re-assign the same name in a different casing: a no-op success, since it
+    // only collides with the user's own row.
+    storage.users().set_username(user.id, "BOB").await.unwrap();
+    assert_eq!(
+        storage
+            .users()
+            .get(user.id)
+            .await
+            .unwrap()
+            .username
+            .as_deref(),
+        Some("BOB")
+    );
+}
+
+#[tokio::test]
+async fn set_username_case_insensitive_uniqueness_conflict() {
+    let storage = storage().await;
+    let alice = User::new(address("alice_u"), None, OffsetDateTime::UNIX_EPOCH);
+    let bob = User::new(address("bob_u"), None, OffsetDateTime::UNIX_EPOCH);
+    storage.users().create(&alice).await.unwrap();
+    storage.users().create(&bob).await.unwrap();
+
+    storage
+        .users()
+        .set_username(alice.id, "Carol")
+        .await
+        .unwrap();
+    // Bob requests the same name in a different casing.
+    let err = storage
+        .users()
+        .set_username(bob.id, "carol")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::Conflict(_)));
+}
+
+#[tokio::test]
+async fn set_username_unknown_user_is_not_found() {
+    let storage = storage().await;
+    let err = storage
+        .users()
+        .set_username(UserId::new(), "ghost")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::NotFound));
+}
+
+// ---------------------------------------------------------------------------
+// RatingHistoryRepo — SQLite/Postgres integration tests
+// ---------------------------------------------------------------------------
+
+fn history_entry(user: UserId, variant: &str, value: f64, secs: i64) -> RatingHistoryEntry {
+    RatingHistoryEntry {
+        user_id: user,
+        variant_id: variant.to_owned(),
+        value,
+        deviation: 100.0,
+        game_id: GameId::new(),
+        created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs),
+    }
+}
+
+#[tokio::test]
+async fn rating_history_record_and_list_most_recent_first() {
+    let storage = storage().await;
+    let user = UserId::new();
+
+    storage
+        .rating_history()
+        .record(&history_entry(user, "standard", 1500.0, 0))
+        .await
+        .unwrap();
+    storage
+        .rating_history()
+        .record(&history_entry(user, "standard", 1520.0, 10))
+        .await
+        .unwrap();
+    storage
+        .rating_history()
+        .record(&history_entry(user, "standard", 1490.0, 20))
+        .await
+        .unwrap();
+
+    let listed = storage
+        .rating_history()
+        .list(user, "standard", 10)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 3);
+    // Most-recent-first.
+    assert_eq!(listed[0].value, 1490.0);
+    assert_eq!(listed[1].value, 1520.0);
+    assert_eq!(listed[2].value, 1500.0);
+
+    // The limit truncates after ordering.
+    let limited = storage
+        .rating_history()
+        .list(user, "standard", 2)
+        .await
+        .unwrap();
+    assert_eq!(limited.len(), 2);
+    assert_eq!(limited[0].value, 1490.0);
+}
+
+#[tokio::test]
+async fn rating_history_round_trips_entry_fields() {
+    let storage = storage().await;
+    let entry = history_entry(UserId::new(), "standard", 1612.5, 42);
+    storage.rating_history().record(&entry).await.unwrap();
+
+    let listed = storage
+        .rating_history()
+        .list(entry.user_id, "standard", 10)
+        .await
+        .unwrap();
+    assert_eq!(listed, vec![entry]);
+}
+
+#[tokio::test]
+async fn rating_history_scoped_per_user_and_variant() {
+    let storage = storage().await;
+    let user = UserId::new();
+    let other = UserId::new();
+
+    storage
+        .rating_history()
+        .record(&history_entry(user, "standard", 1500.0, 0))
+        .await
+        .unwrap();
+    storage
+        .rating_history()
+        .record(&history_entry(user, "chess960", 1600.0, 0))
+        .await
+        .unwrap();
+    storage
+        .rating_history()
+        .record(&history_entry(other, "standard", 1400.0, 0))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        storage
+            .rating_history()
+            .list(user, "standard", 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(storage
+        .rating_history()
+        .list(user, "atomic", 10)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 // ---------------------------------------------------------------------------

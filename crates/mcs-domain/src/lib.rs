@@ -41,7 +41,7 @@ pub use error::DomainError;
 pub use evm_address::EvmAddress;
 pub use game::{Game, GameLifecycle};
 pub use ids::{ChallengeId, GameId, SeekId, UserId};
-pub use rating::Rating;
+pub use rating::{Rating, RatingHistoryEntry};
 pub use seek::{ColorPreference, Seek};
 pub use time_control::TimeControl;
 pub use user::User;

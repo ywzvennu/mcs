@@ -15,7 +15,9 @@ use mcs_domain::{Game, GameId, GameLifecycle, TimeControl, UserId};
 use mcs_game::{recover_game, GameActor, GameCompletionHook, GameHandle, Matchmaker};
 use mcs_payments::{PaymentRequirements, PaymentStore, PaymentVerifier};
 use mcs_storage::error::StorageError;
-use mcs_storage::{ActionLogRepo, GameRepo, RatingRepo, Repositories, SeekRepo, UserRepo};
+use mcs_storage::{
+    ActionLogRepo, GameRepo, RatingHistoryRepo, RatingRepo, Repositories, SeekRepo, UserRepo,
+};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::Mutex;
 
@@ -404,6 +406,7 @@ impl AppState {
             + SeekRepo
             + UserRepo
             + RatingRepo
+            + RatingHistoryRepo
             + ActionLogRepo
             + PaymentStore
             + 'static,
@@ -414,6 +417,7 @@ impl AppState {
         let repositories: Arc<dyn Repositories> = storage.clone();
         let seek_repo: Arc<dyn SeekRepo> = storage.clone();
         let rating_repo: Arc<dyn RatingRepo> = storage.clone();
+        let rating_history_repo: Arc<dyn RatingHistoryRepo> = storage.clone();
         let action_log: Arc<dyn ActionLogRepo> = storage.clone();
         let payment_store: Arc<dyn PaymentStore> = storage.clone();
         let game_repo: Arc<dyn GameRepo> = storage;
@@ -428,7 +432,8 @@ impl AppState {
         // store. Holding it as the abstract trait keeps `mcs-game` decoupled. It
         // is wrapped in a `LiveGameCountingHook` so the same "game finished"
         // signal that updates ratings also frees both players' live-game slots.
-        let rating_hook: Arc<dyn GameCompletionHook> = Arc::new(RatingUpdateHook::new(rating_repo));
+        let rating_hook: Arc<dyn GameCompletionHook> =
+            Arc::new(RatingUpdateHook::new(rating_repo, rating_history_repo));
         let completion_hook: Arc<dyn GameCompletionHook> = Arc::new(LiveGameCountingHook::new(
             live_games.clone(),
             Arc::clone(&rating_hook),

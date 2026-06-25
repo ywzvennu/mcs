@@ -58,4 +58,24 @@ pub trait UserRepo: Send + Sync {
     ///
     /// - [`StorageError::Backend`] on driver-level failures.
     async fn upsert_by_address(&self, addr: &EvmAddress) -> StorageResult<User>;
+
+    /// Sets (or changes) the display `name` of the user identified by `user`,
+    /// enforcing **case-insensitive** uniqueness across all users.
+    ///
+    /// Two usernames that differ only by case (e.g. `"Alice"` and `"alice"`)
+    /// are treated as the same name: assigning one while the other is taken by a
+    /// **different** user is a [`StorageError::Conflict`]. Re-assigning a user
+    /// the name they already hold (in any casing) is allowed and is a no-op
+    /// success.
+    ///
+    /// The supplied `name` is stored verbatim (its original casing is
+    /// preserved); only the *comparison* is case-insensitive.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::NotFound`] if no user with `user` exists.
+    /// - [`StorageError::Conflict`] if a different user already holds `name`
+    ///   (compared case-insensitively).
+    /// - [`StorageError::Backend`] on driver-level failures.
+    async fn set_username(&self, user: UserId, name: &str) -> StorageResult<()>;
 }

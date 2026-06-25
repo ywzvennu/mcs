@@ -41,7 +41,10 @@
 //! | `GET /games/{id}/pgn`     | PGN export for board-style variants ([`history`]) |
 //! | `GET /leaderboard`        | top-rated players for a variant ([`rest`]) |
 //! | `GET /users/{id}`         | a user's public profile ([`rest`]) |
+//! | `GET /users/{id}/ratings` | a user's per-variant ratings ([`rest`]) |
+//! | `GET /users/{id}/rating-history` | a user's rating trail for a variant ([`rest`]) |
 //! | `GET /profile`            | the authenticated caller's profile ([`rest`]) |
+//! | `PUT /profile`            | edit the authenticated caller's username ([`rest`]) |
 //!
 //! The WebSocket layer (#15, [`ws`]) streams a live game over a single socket,
 //! authenticating with the session JWT passed as a `?token=` query parameter and
@@ -107,7 +110,8 @@ pub use ready::ready_router;
 pub use rest::{
     CancelSeekResponse, CreateSeekRequest, CreateSeekResponse, GameDto, GameListResponse,
     LeaderboardEntry, LeaderboardQuery, LeaderboardResponse, ProfileDto, RatingDto,
-    UserStatusResponse,
+    RatingHistoryEntryDto, RatingHistoryQuery, RatingHistoryResponse, UpdateProfileRequest,
+    UserRatingDto, UserRatingsResponse, UserStatusResponse,
 };
 pub use state::{AppState, Cluster, PaymentGate, SiweConfig, DEFAULT_ONLINE_TTL};
 pub use table::{TableChannel, TableEvent, TableHub};

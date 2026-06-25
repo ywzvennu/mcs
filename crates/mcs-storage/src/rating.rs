@@ -54,4 +54,17 @@ pub trait RatingRepo: Send + Sync {
         variant_id: &str,
         limit: u32,
     ) -> StorageResult<Vec<(UserId, Rating)>>;
+
+    /// Returns every variant rating `user` holds, as `(variant_id, rating)`
+    /// pairs.
+    ///
+    /// A player with no rating row in any variant yields an empty `Vec` — that
+    /// is the normal state for a freshly registered user who has not yet played
+    /// a rated game. The returned order is unspecified; callers that need a
+    /// stable order should sort by `variant_id`.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::Backend`] on driver-level failures.
+    async fn list_for_user(&self, user: UserId) -> StorageResult<Vec<(String, Rating)>>;
 }
