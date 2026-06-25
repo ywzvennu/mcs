@@ -322,6 +322,7 @@ pub async fn recover_games(state: &AppState) -> anyhow::Result<usize> {
             state.action_log().clone(),
             state.game_repo().clone(),
             state.completion_hook().clone(),
+            state.event_bus().clone(),
         )
         .await
         {
@@ -397,10 +398,13 @@ pub async fn build_app(
     }
 
     let state = build_state(cfg, storage, session_secret)?;
-    recover_games(&state).await?;
-    // Wire cluster membership when enabled (no-op otherwise; the state keeps its
-    // single-node local registry and no Redis connection is opened).
+    // Wire cluster membership (and, in cluster mode, the cross-node spectator
+    // event bus) *before* recovering games, so each eagerly recovered actor is
+    // handed the same bus the rest of the deployment uses (#109). A no-op when
+    // clustering is off: the state keeps its single-node local registry and
+    // in-process bus, and no Redis connection is opened.
     let (state, cluster) = cluster::setup(cfg, state).await?;
+    recover_games(&state).await?;
     // Build the CORS layer from config and apply it to the assembled router so
     // browser clients receive the correct CORS headers. With the default (empty)
     // allowed_origins the layer is effectively a no-op for cross-origin requests.

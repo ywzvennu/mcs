@@ -96,6 +96,8 @@ tower = { workspace = true }
 tower-http.workspace = true
 # Parse the JSON body of `/variants` in smoke tests.
 serde_json.workspace = true
+# Drive the event-bus subscription stream in the Redis spectator-broadcast test.
+tokio-stream = { workspace = true }
 # `figment::Jail` for isolated config-loading tests (the `test` feature gates it).
 figment = { workspace = true, features = ["test"] }
 # The readiness 503 test breaks the DB by dropping a table on the live pool

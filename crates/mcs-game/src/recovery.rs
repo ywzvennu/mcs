@@ -25,6 +25,7 @@
 
 use std::sync::Arc;
 
+use mcs_cluster::EventBus;
 use mcs_core::VariantRegistry;
 use mcs_domain::Game;
 use mcs_storage::{ActionLogRepo, GameRepo};
@@ -84,9 +85,12 @@ pub enum RecoveryError {
 /// (so downtime is not charged to either player — see
 /// [`GameActor::spawn_resumed`](crate::GameActor::spawn_resumed)).
 ///
-/// `repo` and `hook` are handed to the spawned actor exactly as a freshly
-/// created game would receive them: the actor refreshes the live snapshot and
-/// persists the final result through `repo`, and runs `hook` once on game end.
+/// `repo`, `hook`, and `bus` are handed to the spawned actor exactly as a
+/// freshly created game would receive them: the actor refreshes the live
+/// snapshot and persists the final result through `repo`, runs `hook` once on
+/// game end, and publishes spectator-safe frames to `bus` (the cross-node event
+/// bus, #109) as play resumes — so a spectator can watch a recovered game from
+/// any node.
 ///
 /// # Errors
 ///
@@ -100,6 +104,7 @@ pub async fn recover_game(
     action_log: Arc<dyn ActionLogRepo>,
     repo: Arc<dyn GameRepo>,
     hook: Arc<dyn GameCompletionHook>,
+    bus: Arc<dyn EventBus>,
 ) -> Result<GameHandle, RecoveryError> {
     // 1. Recreate a fresh session of the game's variant, configured exactly as
     //    it was first created.
@@ -136,6 +141,7 @@ pub async fn recover_game(
         game.time_control.clone(),
         game.ply,
         clock_remaining,
+        bus,
     );
 
     Ok(handle)

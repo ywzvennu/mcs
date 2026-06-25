@@ -142,11 +142,37 @@
 //!   [`AppState::get_or_recover`]. This *is* the failover path: when a node dies,
 //!   its games rehash to survivors, and a survivor revives each one the first
 //!   time a client connects — there is no migration step.
-//! - **Another node owns it** → the handler does **not** upgrade. It answers with
-//!   **421 Misdirected Request** and a small JSON body naming the owner and the
-//!   exact WebSocket URL to reconnect to (the original `token`/`since_ply` query
-//!   is preserved), plus a `Location` header. A smart load balancer can route by
-//!   game id and never hit this; a plain client simply reconnects to the URL.
+//! - **Another node owns it** → the decision depends on the connection's role:
+//!   - a **player** is **not** upgraded. The handler answers with **421
+//!     Misdirected Request** and a small JSON body naming the owner and the exact
+//!     WebSocket URL to reconnect to (the original `token`/`since_ply` query is
+//!     preserved), plus a `Location` header. A smart load balancer can route by
+//!     game id and never hit this; a plain client simply reconnects to the URL.
+//!   - a **spectator** is served **locally, with no redirect** (#109). Spectating
+//!     is read-only, so this node does not need the live actor: it builds the
+//!     opening snapshot from a **read-only durable reconstruction** (the action
+//!     log replayed into a transient session, whose spectator view is read — no
+//!     live actor is inserted here) and then subscribes to the game's
+//!     `game:{id}:spectator` topic on the cross-node [`EventBus`](mcs_cluster::EventBus),
+//!     streaming each published spectator frame to the client.
+//!
+//! ## Spectator broadcast: at-least-once / ordering caveats (#109)
+//!
+//! The spectator event bus is **best-effort, at-most-once** (like the underlying
+//! `tokio::broadcast` and Redis pub/sub). Every published frame is a *full*
+//! spectator snapshot, which makes that acceptable:
+//!
+//! - A watcher that connects after a move still bootstraps from the durable
+//!   reconstruction, so it never starts behind.
+//! - A lagged subscriber may **skip** intermediate frames; because each frame is
+//!   a complete snapshot, the next delivered frame fully resynchronises it — the
+//!   client is never left with a partial position.
+//! - Frames a subscriber actually observes arrive in per-game order.
+//!
+//! The frame carries the public **spectator view**, never a player view, so a
+//! hidden-information variant (RBC) stays redacted while ongoing and only reveals
+//! the full game once finished — a watcher on any node can never see a player's
+//! secret state.
 //!
 //! ## Failover model & limits
 //!
@@ -164,14 +190,17 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
+use tokio_stream::StreamExt;
 
 use std::sync::Arc;
 
 use mcs_auth::verify_session;
 use mcs_cluster::NodeInfo;
 use mcs_core::{Action, Color, GameStatus, PlayerView};
-use mcs_domain::{Clock, Game, GameId};
-use mcs_game::{GameEvent, GameHandle, GameSessionError, GameSnapshot};
+use mcs_domain::{Clock, Game, GameId, UserId};
+use mcs_game::{
+    spectator_topic, GameEvent, GameHandle, GameSessionError, GameSnapshot, SpectatorFrame,
+};
 use mcs_storage::ActionLogRepo;
 
 use crate::challenges::rematch_colors;
@@ -645,42 +674,10 @@ async fn game_socket(
     // in the same way it tracks REST requests (via the AuthUser extractor).
     state.presence().mark_seen(user_id);
 
-    // 3. Cluster routing (#68): does *this* node own the game? Ownership is the
-    //    rendezvous owner of the game id over the live membership set. Single-node
-    //    the live set is just this node, so this is always true and no redirect is
-    //    ever emitted — byte-for-byte the pre-cluster behaviour. If another node
-    //    owns it, redirect (do NOT upgrade), preserving the original query.
-    let cluster = state.cluster();
-    let nodes = cluster.registry().live_nodes().await.map_err(|error| {
-        tracing::error!(%game_id, %error, "failed to read cluster membership");
-        ApiError::Internal(format!("failed to read cluster membership: {error}"))
-    })?;
-    if let Some(owner) = mcs_cluster::owner(&game_id.to_string(), &nodes) {
-        if owner.id != cluster.this_node().id {
-            tracing::debug!(%game_id, owner = %owner.id, "redirecting WS to the owning node");
-            return Ok(redirect_to_owner(
-                owner,
-                game_id,
-                raw_query.as_deref().unwrap_or(""),
-            ));
-        }
-    }
-    // An empty live set (no owner resolvable) cannot happen with the local
-    // default, and for a real registry it means membership is momentarily empty;
-    // we fall through and serve locally rather than reject, since this node is, by
-    // construction, a live member able to recover the game from the durable log.
-
-    // 4. Resolve the live actor, reviving it from the durable log if this node
-    //    has no in-memory handle for it (a cold node, or a game evicted after a
-    //    restart). An unknown or already-finished game has no live actor and is
-    //    a 404 just as before.
-    let handle = state
-        .get_or_recover(game_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("no live game: {game_id}")))?;
-
-    // 5. Resolve the caller's role from the persisted game record. A user who is
-    //    neither player connects as a spectator.
+    // 3. Resolve the caller's role from the persisted game record. A user who is
+    //    neither player connects as a spectator. Resolved *before* the routing
+    //    decision because a spectator is served on any node (it does not redirect),
+    //    while a player follows the owner-routing path (#109).
     let game = state.storage().games().get(game_id).await?;
     let role = if game.white == user_id {
         Role::Player(Color::White)
@@ -689,6 +686,61 @@ async fn game_socket(
     } else {
         Role::Spectator
     };
+
+    // 4. Cluster routing (#68 + #109): does *this* node own the game? Ownership is
+    //    the rendezvous owner of the game id over the live membership set.
+    //    Single-node the live set is just this node, so this is always true and
+    //    no redirect is ever emitted — byte-for-byte the pre-cluster behaviour.
+    //
+    //    When another node owns the game the two roles diverge:
+    //    - a **player** is redirected to the owner (do NOT upgrade), since the
+    //      live actor that accepts their moves lives only there; while
+    //    - a **spectator** is *not* redirected. Spectating is read-only, so this
+    //      node serves it locally from a durable, read-only reconstruction plus
+    //      the cross-node spectator event bus — see `run_spectator_connection`.
+    let cluster = state.cluster();
+    let nodes = cluster.registry().live_nodes().await.map_err(|error| {
+        tracing::error!(%game_id, %error, "failed to read cluster membership");
+        ApiError::Internal(format!("failed to read cluster membership: {error}"))
+    })?;
+    let this_node_owns = match mcs_cluster::owner(&game_id.to_string(), &nodes) {
+        Some(owner) if owner.id != cluster.this_node().id => {
+            if let Role::Player(_) = role {
+                tracing::debug!(%game_id, owner = %owner.id, "redirecting player WS to the owning node");
+                return Ok(redirect_to_owner(
+                    owner,
+                    game_id,
+                    raw_query.as_deref().unwrap_or(""),
+                ));
+            }
+            // A spectator on a non-owner node: served locally via the bus.
+            false
+        }
+        // This node owns the game, or the live set is momentarily empty (which
+        // cannot happen with the local default; for a real registry we still
+        // serve locally, since this node is a live member able to recover the
+        // game from the durable log).
+        _ => true,
+    };
+
+    // 4b. Spectator on a node that does NOT own the game (cluster only): serve it
+    //     from a durable read-only snapshot plus a subscription to the game's
+    //     spectator topic on the event bus, without inserting a live actor here
+    //     and without redirecting (#109). Players never reach this branch (they
+    //     were redirected above); single-node this branch is never taken because
+    //     this node always owns the game.
+    if matches!(role, Role::Spectator) && !this_node_owns {
+        return serve_remote_spectator(state, game_id, game, upgrade, user_id).await;
+    }
+
+    // 5. This node owns the game (the only single-node path). Resolve the live
+    //    actor, reviving it from the durable log if this node has no in-memory
+    //    handle for it (a cold node, or a game evicted after a restart). An
+    //    unknown or already-finished game has no live actor and is a 404 as before.
+    let handle = state
+        .get_or_recover(game_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("no live game: {game_id}")))?;
 
     // 6. The action-log repo lets a `?since_ply` reconnect replay the moves the
     //    client missed. Cloned out of the state so the connection task owns it.
@@ -741,6 +793,209 @@ async fn game_socket(
             conn_guard,
         })
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Cross-node spectator serving (#109)
+// ---------------------------------------------------------------------------
+
+/// Serves a **spectator** of a game this node does *not* own, without a redirect.
+///
+/// Spectating is read-only, so a watcher does not need the live actor (which
+/// lives on the owning node). Instead this node:
+///
+/// 1. reserves a per-node WS connection slot and upgrades the socket;
+/// 2. sends an opening [`ServerMessage::Snapshot`] built from a **read-only**
+///    durable reconstruction — the action log replayed into a *transient*
+///    session whose [`spectator_view`](mcs_core::GameSession::spectator_view) is
+///    read; no live actor is inserted into this node's hub; and
+/// 3. subscribes to the game's spectator topic on the shared event bus and
+///    streams each published [`SpectatorFrame`] as a fresh
+///    [`ServerMessage::Snapshot`].
+///
+/// Every published frame is a *full* spectator snapshot, so a watcher that
+/// misses the bootstrap or skips a lagged frame still resynchronises on the next
+/// one. Players never reach here (they were redirected to the owner); single-node
+/// this is never reached because this node always owns the game.
+async fn serve_remote_spectator(
+    state: AppState,
+    game_id: GameId,
+    game: Game,
+    upgrade: WebSocketUpgrade,
+    user_id: UserId,
+) -> Result<Response, ApiError> {
+    // Connection cap (#100), per node, exactly as the owner path reserves it.
+    let conn_guard = state.ws_connections().try_open(user_id).ok_or_else(|| {
+        tracing::debug!(%user_id, "rejecting spectator WS upgrade: connection cap reached");
+        ApiError::TooManyRequests("websocket connection limit reached".to_owned())
+    })?;
+
+    let upgrade = upgrade
+        .max_message_size(state.ws_max_message_bytes())
+        .protocols([MCS_PROTOCOL]);
+
+    Ok(upgrade.on_upgrade(move |socket| {
+        run_spectator_connection(socket, state, game_id, game, conn_guard)
+    }))
+}
+
+/// Drives one read-only spectator socket for a game served off the owning node.
+///
+/// Sends an opening snapshot from a durable reconstruction, then forwards every
+/// [`SpectatorFrame`] published on the game's bus topic as a
+/// [`ServerMessage::Snapshot`]. The task ends when the client disconnects, a
+/// socket write fails, or the bus stream closes; it never drives the game.
+async fn run_spectator_connection(
+    mut socket: WebSocket,
+    state: AppState,
+    game_id: GameId,
+    game: Game,
+    conn_guard: crate::limits::WsConnectionGuard,
+) {
+    // Hold the cap reservation and the active-connections gauge for the whole
+    // task, released on every exit path by their `Drop`s.
+    let _conn_guard = conn_guard;
+    let _ws_guard = WsConnectionGuard::open();
+
+    // Subscribe *before* the bootstrap snapshot so no frame published between the
+    // two is missed; a duplicate frame is harmless (each is a full snapshot).
+    let mut frames = match state.event_bus().subscribe(&spectator_topic(game_id)).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::warn!(%game_id, %error, "failed to subscribe spectator to the event bus");
+            return;
+        }
+    };
+
+    // Bootstrap: a read-only spectator snapshot from the durable log. A failure
+    // here is logged and the connection still proceeds — the first bus frame is
+    // itself a full snapshot, so the watcher resynchronises on it.
+    match spectator_snapshot_from_log(&state, &game).await {
+        Ok(message) => {
+            if socket.send(message.into_ws_message()).await.is_err() {
+                return;
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%game_id, %error, "failed to build spectator bootstrap snapshot");
+        }
+    }
+
+    loop {
+        tokio::select! {
+            // A spectator frame published by the owner node (or this node's local
+            // bus). Each is forwarded as a full snapshot.
+            frame = frames.next() => match frame {
+                Some(bytes) => match SpectatorFrame::from_bytes(&bytes) {
+                    Ok(frame) => {
+                        let message = spectator_frame_message(frame);
+                        if socket.send(message.into_ws_message()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        // A malformed frame is skipped, not fatal: the next full
+                        // frame resynchronises the watcher.
+                        tracing::warn!(%game_id, %error, "skipping a malformed spectator frame");
+                    }
+                },
+                // The bus stream ended (every publisher gone / backend dropped).
+                None => break,
+            },
+
+            // Frames from the client. A spectator may only observe; a submit is
+            // rejected without closing, and a Close ends the task.
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(Message::Text(_))) => {
+                    let reply = ServerMessage::error("spectators cannot submit actions".to_owned());
+                    if socket.send(reply.into_ws_message()).await.is_err() {
+                        break;
+                    }
+                }
+                // Binary frames and pings need no spectator-side action.
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+}
+
+/// Builds the opening [`ServerMessage::Snapshot`] for a remote spectator from a
+/// **read-only** durable reconstruction of the game.
+///
+/// It instantiates a transient [`GameSession`](mcs_core::GameSession) of the
+/// game's variant, replays the recorded action log into it, and reads the
+/// public [`spectator_view`](mcs_core::GameSession::spectator_view) — so a
+/// hidden-information variant is redacted exactly as it is for a local spectator.
+/// No live actor is inserted into this node's hub; the session is discarded once
+/// the snapshot is built.
+///
+/// # Errors
+///
+/// Returns [`ApiError::Internal`] if the variant cannot be instantiated, the log
+/// cannot be read, or a recorded action is rejected on replay (a divergent log).
+async fn spectator_snapshot_from_log(
+    state: &AppState,
+    game: &Game,
+) -> Result<ServerMessage, ApiError> {
+    let mut session = state
+        .variants()
+        .new_game(&game.variant_id, &game.variant_options)
+        .map_err(|error| {
+            ApiError::Internal(format!("cannot rebuild spectator session: {error}"))
+        })?;
+
+    let recorded = state.action_log().list(game.id).await?;
+    let ply = u32::try_from(recorded.len()).unwrap_or(u32::MAX);
+    for action in &recorded {
+        session
+            .apply(action.player, &action.action)
+            .map_err(|error| {
+                ApiError::Internal(format!(
+                    "spectator replay diverged at ply {}: {error}",
+                    action.ply
+                ))
+            })?;
+    }
+
+    // The durable game snapshot carries the live clocks (if any); pair it with
+    // the reconstructed public view, ply, and status for the opening frame.
+    let clock = match (game.clock_white_ms, game.clock_black_ms) {
+        (Some(white), Some(black)) => Some(ClockView {
+            white_ms: white,
+            black_ms: black,
+        }),
+        _ => None,
+    };
+
+    Ok(ServerMessage::Snapshot {
+        protocol_version: PROTOCOL_VERSION,
+        view: session.spectator_view(),
+        status: session.status(),
+        your_color: None,
+        clock,
+        ply,
+        side_to_move: (!session.status().is_finished()).then(|| session.to_move()),
+    })
+}
+
+/// Renders a received [`SpectatorFrame`] as a [`ServerMessage::Snapshot`].
+///
+/// A spectator frame is a full public snapshot, so it maps onto the snapshot
+/// frame (not an `Update`): the watcher always has the complete current position
+/// and resynchronises even after a skipped frame. `your_color` is always `None`
+/// (a spectator plays no side); `side_to_move` is omitted because the frame
+/// carries the full public position the client renders from directly.
+fn spectator_frame_message(frame: SpectatorFrame) -> ServerMessage {
+    ServerMessage::Snapshot {
+        protocol_version: PROTOCOL_VERSION,
+        view: frame.view,
+        status: frame.status,
+        your_color: None,
+        clock: frame.clock.as_ref().map(ClockView::from_clock),
+        ply: frame.ply,
+        side_to_move: None,
+    }
 }
 
 /// The fully-resolved inputs handed to [`run_connection`] once the handshake has
