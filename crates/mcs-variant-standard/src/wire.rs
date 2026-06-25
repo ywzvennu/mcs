@@ -36,6 +36,11 @@ use serde::{Deserialize, Serialize};
 ///   ```json
 ///   { "type": "decline_draw" }
 ///   ```
+/// - Claim a draw by threefold repetition or the fifty-move rule, on your turn,
+///   when the position is eligible (see [`StandardView::can_claim_draw`]):
+///   ```json
+///   { "type": "claim_draw" }
+///   ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StandardAction {
@@ -52,6 +57,14 @@ pub enum StandardAction {
     AcceptDraw,
     /// Decline a draw the opponent has offered.
     DeclineDraw,
+    /// Claim a draw under the threefold-repetition or fifty-move rule.
+    ///
+    /// Legal only for the side to move, and only when the current position is
+    /// claim-eligible (the same position has occurred three or more times, or
+    /// the halfmove clock has reached 100 plies). Otherwise it is rejected as an
+    /// illegal action. The fivefold-repetition and seventy-five-move rules draw
+    /// the game automatically and need no claim.
+    ClaimDraw,
 }
 
 /// What a player (or spectator) is permitted to observe about a game.
@@ -72,7 +85,8 @@ pub enum StandardAction {
 ///   "legal_moves_uci": ["a2a3", "a2a4", "b1a3", "..."],
 ///   "status": "ongoing",
 ///   "check": false,
-///   "draw_offer": null
+///   "draw_offer": null,
+///   "can_claim_draw": false
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +106,11 @@ pub struct StandardView {
     /// `None` if no offer is pending. The opponent of this color may answer it
     /// with [`StandardAction::AcceptDraw`] or [`StandardAction::DeclineDraw`].
     pub draw_offer: Option<Color>,
+    /// Whether the side to move may currently claim a draw with
+    /// [`StandardAction::ClaimDraw`] — true when the current position has
+    /// repeated three or more times (threefold) or the halfmove clock has
+    /// reached 100 plies (the fifty-move rule).
+    pub can_claim_draw: bool,
 }
 
 /// An event emitted by an action, for broadcasting to observers.

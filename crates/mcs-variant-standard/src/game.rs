@@ -25,6 +25,23 @@ pub(crate) const VARIANT_ID: &str = "standard";
 /// Re-exported publicly as [`crate::CHESS960_VARIANT_ID`].
 pub(crate) const CHESS960_VARIANT_ID: &str = "chess960";
 
+/// Number of half-moves (plies) without a pawn move or capture at which a draw
+/// becomes *claimable* under the fifty-move rule (50 full moves = 100 plies).
+const FIFTY_MOVE_CLAIM_PLIES: u32 = 100;
+
+/// Number of half-moves without a pawn move or capture at which the game is
+/// *automatically* drawn under FIDE's seventy-five-move rule (75 full moves =
+/// 150 plies). No claim is required.
+const SEVENTY_FIVE_MOVE_PLIES: u32 = 150;
+
+/// Number of times a position must repeat for a draw to become *claimable*
+/// under the threefold-repetition rule.
+const THREEFOLD_REPETITIONS: usize = 3;
+
+/// Number of times a position must repeat for the game to be *automatically*
+/// drawn under FIDE's fivefold-repetition rule. No claim is required.
+const FIVEFOLD_REPETITIONS: usize = 5;
+
 /// How castling moves are spelled in the UCI strings that cross the wire.
 ///
 /// `cozy-chess` always represents castling internally as *king-captures-own-rook*
@@ -62,12 +79,27 @@ pub struct StandardGame {
     castling_uci: CastlingUci,
     /// The color with an outstanding, unanswered draw offer, if any.
     draw_offer: Option<Color>,
+    /// The FIDE position key (cozy-chess [`Board::hash`]) of every position that
+    /// has occurred, including the starting position. The hash captures piece
+    /// placement, side to move, castling rights, and the en-passant square —
+    /// exactly the FIDE notion of position identity for repetition — but not the
+    /// move counters. A position is repeated `n` times when its key appears `n`
+    /// times in this history.
+    position_history: Vec<u64>,
+    /// Our own half-move (ply) clock for the fifty/seventy-five-move rules.
+    ///
+    /// cozy-chess tracks a halfmove clock too, but it *saturates at 100* (it can
+    /// never report 150), and its [`Board::status`] auto-draws at 100 — which is
+    /// the *claim* threshold here, not an automatic one. So we keep an
+    /// independent, unbounded counter: reset to 0 on a pawn move or capture (the
+    /// irreversible moves), incremented otherwise.
+    halfmove_clock: u32,
     /// The recorded outcome once the game has finished. `None` while ongoing.
     ///
     /// Board-driven endings (checkmate, stalemate, insufficient material) can
-    /// always be re-derived from `board`, but resignation and draw-agreement
-    /// endings cannot, so the outcome is stored explicitly the moment the game
-    /// ends for any reason.
+    /// always be re-derived from `board`, but resignation, draw-agreement, and
+    /// claimed draws cannot, so the outcome is stored explicitly the moment the
+    /// game ends for any reason.
     outcome: Option<Outcome>,
 }
 
@@ -145,12 +177,49 @@ impl StandardGame {
 
     /// Internal constructor shared by every entry point.
     fn from_board(board: Board, variant_id: &'static str, castling_uci: CastlingUci) -> Self {
+        // Seed the position history with the starting position and the halfmove
+        // clock from the board, so games resumed from a FEN inherit the right
+        // counters (cozy-chess accepts halfmove clocks up to 100).
+        let position_history = vec![board.hash()];
+        let halfmove_clock = u32::from(board.halfmove_clock());
         Self {
             board,
             variant_id,
             castling_uci,
             draw_offer: None,
+            position_history,
+            halfmove_clock,
             outcome: None,
+        }
+    }
+
+    /// How many times the *current* position has occurred so far, by FIDE
+    /// position identity (the cozy-chess hash).
+    fn repetition_count(&self) -> usize {
+        let current = self.board.hash();
+        self.position_history
+            .iter()
+            .filter(|&&key| key == current)
+            .count()
+    }
+
+    /// Which kind of draw, if any, the side to move may currently *claim*.
+    ///
+    /// A draw is claimable when the current position has occurred three or more
+    /// times (threefold repetition) or the halfmove clock has reached 100 plies
+    /// (the fifty-move rule). Threefold is checked first, matching the order a
+    /// player would typically invoke. Returns `None` when no claim is available
+    /// or the game is already over.
+    fn claimable_draw(&self) -> Option<EndReason> {
+        if self.outcome.is_some() {
+            return None;
+        }
+        if self.repetition_count() >= THREEFOLD_REPETITIONS {
+            Some(EndReason::Repetition)
+        } else if self.halfmove_clock >= FIFTY_MOVE_CLAIM_PLIES {
+            Some(EndReason::FiftyMoveRule)
+        } else {
+            None
         }
     }
 
@@ -228,17 +297,25 @@ impl StandardGame {
             status: self.status(),
             check: self.is_check(),
             draw_offer: self.draw_offer,
+            can_claim_draw: self.claimable_draw().is_some(),
         }
     }
 
-    /// Derives the board-driven outcome of the current position, if the game has
-    /// reached an automatic termination (checkmate, stalemate, insufficient
-    /// material, or the fifty-move rule).
+    /// Derives the *automatic* outcome of the current position, if the game has
+    /// reached a forced termination: checkmate, stalemate, insufficient material,
+    /// fivefold repetition, or the seventy-five-move rule.
     ///
     /// [`Board::status`] reports `Won` only when the side to move has no legal
     /// moves *and* is in check — i.e. it has just been checkmated — so the winner
-    /// is always the side that did not just move. A `Drawn` status from
-    /// cozy-chess is stalemate (no moves, not in check) or the fifty-move rule.
+    /// is always the side that did not just move. A `Drawn` status with no legal
+    /// moves is stalemate.
+    ///
+    /// The fifty-move and threefold-repetition rules are **claimable**, not
+    /// automatic, and so are deliberately *not* terminated here (cozy-chess's own
+    /// `Drawn`-at-100-plies result is therefore ignored while legal moves remain
+    /// — that case only makes a draw claimable, handled by [`Self::claimable_draw`]).
+    /// Their forced FIDE counterparts — fivefold repetition and the
+    /// seventy-five-move rule — *are* automatic and are detected here.
     ///
     /// cozy-chess does **not** itself terminate on insufficient material, so we
     /// detect dead positions explicitly and report them as a draw, matching FIDE
@@ -250,22 +327,34 @@ impl StandardGame {
                 let winner = Self::from_cc_color(!self.board.side_to_move());
                 Some(Outcome::win(winner, EndReason::Checkmate))
             }
-            BoardStatus::Drawn => {
-                let reason = if self.board.halfmove_clock() >= 100 {
-                    EndReason::FiftyMoveRule
-                } else {
-                    // The only other `Drawn` cause cozy-chess reports is a side
-                    // to move with no legal moves and not in check: stalemate.
-                    EndReason::Stalemate
-                };
-                Some(Outcome::draw(reason))
+            // A `Drawn` status with no legal moves is stalemate; a `Drawn` status
+            // with moves still available is the clamped fifty-move-rule case,
+            // which is only claimable (handled elsewhere), not automatic.
+            BoardStatus::Drawn if self.no_legal_moves() => {
+                Some(Outcome::draw(EndReason::Stalemate))
             }
-            BoardStatus::Ongoing => {
-                // cozy-chess keeps dead positions `Ongoing`; terminate them here.
-                self.is_insufficient_material()
-                    .then(|| Outcome::draw(EndReason::InsufficientMaterial))
+            _ => {
+                // Forced (un-claimed) automatic draws take precedence over the
+                // claimable ones, then dead positions.
+                if self.halfmove_clock >= SEVENTY_FIVE_MOVE_PLIES {
+                    Some(Outcome::draw(EndReason::FiftyMoveRule))
+                } else if self.repetition_count() >= FIVEFOLD_REPETITIONS {
+                    Some(Outcome::draw(EndReason::Repetition))
+                } else if self.is_insufficient_material() {
+                    // cozy-chess keeps dead positions `Ongoing`; terminate here.
+                    Some(Outcome::draw(EndReason::InsufficientMaterial))
+                } else {
+                    None
+                }
             }
         }
+    }
+
+    /// Whether the side to move has no legal moves in the current position.
+    fn no_legal_moves(&self) -> bool {
+        // `generate_moves` returns `true` only if the closure short-circuited,
+        // which happens as soon as the first move is produced.
+        !self.board.generate_moves(|_| true)
     }
 
     /// Whether the position is a dead draw by insufficient mating material.
@@ -325,6 +414,19 @@ impl StandardGame {
         let played_uci = self.render_uci(mv);
         // The move was validated as legal above, so this cannot fail.
         self.board.play(mv);
+
+        // Update our own halfmove clock. cozy-chess resets *its* clock to 0 on
+        // an irreversible move (pawn move or capture) and increments it
+        // otherwise, so mirror that decision — but keep our own unbounded count,
+        // since the board's saturates at 100.
+        if self.board.halfmove_clock() == 0 {
+            self.halfmove_clock = 0;
+        } else {
+            self.halfmove_clock += 1;
+        }
+
+        // Record the new position for repetition counting.
+        self.position_history.push(self.board.hash());
 
         // A move always supersedes any pending draw offer.
         self.draw_offer = None;
@@ -397,6 +499,11 @@ impl GameSession for StandardGame {
             for uci in self.legal_moves_uci() {
                 actions.push(serialize(&StandardAction::Move { uci }));
             }
+            // ...and may claim a draw if the position is currently eligible
+            // (threefold repetition or the fifty-move rule).
+            if self.claimable_draw().is_some() {
+                actions.push(serialize(&StandardAction::ClaimDraw));
+            }
         }
 
         // Resignation is always available to either player.
@@ -455,6 +562,17 @@ impl GameSession for StandardGame {
                     self.finish(Outcome::draw(EndReason::DrawAgreement))
                 } else {
                     Err(GameError::IllegalAction)
+                }
+            }
+            StandardAction::ClaimDraw => {
+                // A draw claim stands in for a move, so only the side to move
+                // may claim, and only when the position is actually eligible.
+                if self.to_move() != player {
+                    return Err(GameError::NotYourTurn);
+                }
+                match self.claimable_draw() {
+                    Some(reason) => self.finish(Outcome::draw(reason)),
+                    None => Err(GameError::IllegalAction),
                 }
             }
             StandardAction::DeclineDraw => {
