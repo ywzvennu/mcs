@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use mcs_core::{Action, Color};
 use mcs_domain::{
     Challenge, ChallengeId, ChallengeStatus, ColorPreference, EvmAddress, Game, GameId,
-    GameLifecycle, Rating, Seek, SeekId, User, UserId,
+    GameLifecycle, Rating, RatingHistoryEntry, Seek, SeekId, User, UserId,
 };
 use mcs_payments::{PaymentRecord, PaymentStore, PaymentStoreError};
 use sqlx::Row;
@@ -41,8 +41,8 @@ use time::OffsetDateTime;
 use crate::{
     action_log::{ActionLogRepo, RecordedAction},
     error::{StorageError, StorageResult},
-    ChallengeRepo, ClaimOutcome, GameRepo, RatingRepo, Repositories, RevokedTokenRepo, SeekRepo,
-    SessionRepo, UserRepo,
+    ChallengeRepo, ClaimOutcome, GameRepo, RatingHistoryRepo, RatingRepo, Repositories,
+    RevokedTokenRepo, SeekRepo, SessionRepo, UserRepo,
 };
 
 // ---------------------------------------------------------------------------
@@ -540,6 +540,10 @@ impl Repositories for SqlxStorage {
         self
     }
 
+    fn rating_history(&self) -> &dyn RatingHistoryRepo {
+        self
+    }
+
     fn payments(&self) -> &dyn PaymentStore {
         self
     }
@@ -599,6 +603,32 @@ impl UserRepo for SqlxStorage {
                 .ok_or_else(|| StorageError::Backend("upsert race left no row".to_owned())),
             Err(e) => Err(e),
         }
+    }
+
+    async fn set_username(&self, user: UserId, name: &str) -> StorageResult<()> {
+        // Case-insensitive uniqueness is enforced by the `LOWER(username)`
+        // unique index from migration 0010: an UPDATE that would collide with a
+        // *different* user's name (in any casing) trips the index and surfaces as
+        // `StorageError::Conflict`. Re-assigning the user the same name they
+        // already hold updates their own row, so it does not collide.
+        let affected = sqlx::query("UPDATE users SET username = $1 WHERE id = $2")
+            .bind(name)
+            .bind(user.to_string())
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+
+        if affected == 0 {
+            // No row matched the id: either the user does not exist, or the
+            // UPDATE was a no-op because the stored name is byte-for-byte equal.
+            // Distinguish the two by checking existence, so a re-assignment of an
+            // unchanged name is a success rather than a spurious NotFound.
+            return match UserRepo::get(self, user).await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            };
+        }
+        Ok(())
     }
 }
 
@@ -1134,6 +1164,85 @@ impl RatingRepo for SqlxStorage {
                 Ok((user_id, rating))
             })
             .collect()
+    }
+
+    async fn list_for_user(&self, user: UserId) -> StorageResult<Vec<(String, Rating)>> {
+        let rows = sqlx::query(
+            "SELECT variant_id, value, deviation, volatility FROM ratings \
+             WHERE user_id = $1 \
+             ORDER BY variant_id",
+        )
+        .bind(user.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter()
+            .map(|row| {
+                let variant_id = row.try_get::<String, _>("variant_id")?;
+                let rating = rating_from_row(row)?;
+                Ok((variant_id, rating))
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RatingHistoryRepo
+// ---------------------------------------------------------------------------
+
+/// Reconstructs a [`RatingHistoryEntry`] from a `rating_history` row.
+fn rating_history_from_row(row: &DbRow) -> Result<RatingHistoryEntry, StorageError> {
+    Ok(RatingHistoryEntry {
+        user_id: decode_id::<UserId>(&row.try_get::<String, _>("user_id")?)?,
+        variant_id: row.try_get::<String, _>("variant_id")?,
+        value: row.try_get::<f64, _>("value")?,
+        deviation: row.try_get::<f64, _>("deviation")?,
+        game_id: decode_id::<GameId>(&row.try_get::<String, _>("game_id")?)?,
+        created_at: decode_time(&row.try_get::<String, _>("created_at")?)?,
+    })
+}
+
+#[async_trait]
+impl RatingHistoryRepo for SqlxStorage {
+    async fn record(&self, entry: &RatingHistoryEntry) -> StorageResult<()> {
+        sqlx::query(
+            "INSERT INTO rating_history \
+             (user_id, variant_id, value, deviation, game_id, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(entry.user_id.to_string())
+        .bind(&entry.variant_id)
+        .bind(entry.value)
+        .bind(entry.deviation)
+        .bind(entry.game_id.to_string())
+        .bind(encode_time(entry.created_at)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list(
+        &self,
+        user: UserId,
+        variant_id: &str,
+        limit: u32,
+    ) -> StorageResult<Vec<RatingHistoryEntry>> {
+        // Most-recent-first. RFC 3339 timestamps sort lexicographically in
+        // chronological order, so `ORDER BY created_at DESC` is correct on both
+        // SQLite and Postgres.
+        let rows = sqlx::query(
+            "SELECT user_id, variant_id, value, deviation, game_id, created_at \
+             FROM rating_history \
+             WHERE user_id = $1 AND variant_id = $2 \
+             ORDER BY created_at DESC \
+             LIMIT $3",
+        )
+        .bind(user.to_string())
+        .bind(variant_id)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(rating_history_from_row).collect()
     }
 }
 

@@ -14,7 +14,10 @@
 //! | `GET /games/{id}`         | no   | Fetch a single game record by id. |
 //! | `GET /games`              | no   | List the most recently created games. |
 //! | `GET /users/{id}`         | no   | Public profile for a user. |
+//! | `GET /users/{id}/ratings` | no   | A user's per-variant ratings. |
+//! | `GET /users/{id}/rating-history` | no | A user's rating trail for a variant. |
 //! | `GET /profile`            | yes  | Public profile for the authenticated caller. |
+//! | `PUT /profile`            | yes  | Edit the authenticated caller's username. |
 //!
 //! # Seek lobby (#77)
 //!
@@ -66,6 +69,31 @@ const DEFAULT_LEADERBOARD_LIMIT: u32 = 20;
 /// The largest leaderboard page `GET /leaderboard` will honour, clamping larger
 /// requests.
 const MAX_LEADERBOARD_LIMIT: u32 = 200;
+
+/// The minimum length of a username (inclusive).
+const USERNAME_MIN_LEN: usize = 3;
+
+/// The maximum length of a username (inclusive).
+const USERNAME_MAX_LEN: usize = 20;
+
+/// The default number of entries `GET /users/{id}/rating-history` returns when
+/// no `limit` is supplied.
+const DEFAULT_HISTORY_LIMIT: u32 = 50;
+
+/// The largest rating-history page that endpoint will honour, clamping larger
+/// requests.
+const MAX_HISTORY_LIMIT: u32 = 200;
+
+/// The Glicko-style rating-deviation threshold above which a rating is reported
+/// as **provisional**.
+///
+/// A freshly registered player starts at the Glicko-2 seed deviation of `350`
+/// and it shrinks as games are recorded. A deviation still above this threshold
+/// means too few rated games are on record for the rating to be considered
+/// reliable, so it is flagged provisional. `110` is a common Glicko-style cutoff
+/// (a player needs a handful of rated games before their deviation drops under
+/// it).
+const PROVISIONAL_DEVIATION_THRESHOLD: f64 = 110.0;
 
 // ---------------------------------------------------------------------------
 // Request / response DTOs
@@ -357,6 +385,100 @@ pub struct UserStatusResponse {
     pub last_seen: Option<OffsetDateTime>,
 }
 
+/// Request body for `PUT /profile`: the new display name for the caller.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateProfileRequest {
+    /// The desired username. Validated for length (3–20) and an
+    /// `[A-Za-z0-9_-]` character set; uniqueness is enforced case-insensitively
+    /// by the store.
+    pub username: String,
+}
+
+/// One variant's rating in the per-user ratings listing.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserRatingDto {
+    /// The variant this rating is for (e.g. `"standard"`).
+    pub variant_id: String,
+    /// The Glicko-2 rating itself.
+    pub rating: RatingDto,
+    /// Whether the rating is **provisional** — its deviation is still above the
+    /// [`PROVISIONAL_DEVIATION_THRESHOLD`], so too few rated games are on record
+    /// for it to be considered reliable.
+    pub provisional: bool,
+}
+
+/// Response body for `GET /users/{id}/ratings`.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserRatingsResponse {
+    /// The user these ratings belong to.
+    pub user_id: UserId,
+    /// One entry per variant the user has a rating in, ordered by variant id.
+    pub ratings: Vec<UserRatingDto>,
+}
+
+/// Query parameters for `GET /users/{id}/rating-history`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RatingHistoryQuery {
+    /// The variant whose history to return (e.g. `"standard"`). Required.
+    pub variant: String,
+    /// Maximum number of snapshots to return. Clamped to [`MAX_HISTORY_LIMIT`];
+    /// defaults to [`DEFAULT_HISTORY_LIMIT`] when absent.
+    pub limit: Option<u32>,
+}
+
+/// One snapshot in a user's rating history.
+#[derive(Debug, Clone, Serialize)]
+pub struct RatingHistoryEntryDto {
+    /// The rating value after the game was scored.
+    pub value: f64,
+    /// The rating deviation after the game was scored.
+    pub deviation: f64,
+    /// The game that produced this snapshot.
+    pub game_id: GameId,
+    /// When the snapshot was recorded (RFC 3339, UTC).
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Response body for `GET /users/{id}/rating-history`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RatingHistoryResponse {
+    /// The user this history belongs to.
+    pub user_id: UserId,
+    /// The variant the history is for, echoed back from the request.
+    pub variant_id: String,
+    /// The snapshots, most-recent-first.
+    pub entries: Vec<RatingHistoryEntryDto>,
+}
+
+/// Validates a requested username, returning the trimmed value on success.
+///
+/// The rules: 3–20 characters, each one of `[A-Za-z0-9_-]`. A violation is a
+/// **422 Unprocessable Entity** so a client can correct its input.
+fn validate_username(raw: &str) -> ApiResult<&str> {
+    let name = raw.trim();
+    let len = name.chars().count();
+    if !(USERNAME_MIN_LEN..=USERNAME_MAX_LEN).contains(&len) {
+        return Err(ApiError::UnprocessableEntity(format!(
+            "username must be between {USERNAME_MIN_LEN} and {USERNAME_MAX_LEN} characters"
+        )));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(ApiError::UnprocessableEntity(
+            "username may contain only letters, digits, '_' and '-'".to_owned(),
+        ));
+    }
+    Ok(name)
+}
+
+/// Reports whether a rating is provisional given its deviation.
+fn is_provisional(deviation: f64) -> bool {
+    deviation > PROVISIONAL_DEVIATION_THRESHOLD
+}
+
 // ---------------------------------------------------------------------------
 // Routers
 // ---------------------------------------------------------------------------
@@ -410,7 +532,9 @@ pub fn read_router() -> Router<AppState> {
         .route("/leaderboard", get(leaderboard))
         .route("/users/{id}", get(get_profile))
         .route("/users/{id}/status", get(get_user_status))
-        .route("/profile", get(my_profile))
+        .route("/users/{id}/ratings", get(get_user_ratings))
+        .route("/users/{id}/rating-history", get(get_user_rating_history))
+        .route("/profile", get(my_profile).put(update_profile))
 }
 
 // ---------------------------------------------------------------------------
@@ -796,5 +920,110 @@ async fn my_profile(State(state): State<AppState>, user: AuthUser) -> ApiResult<
         username: stored.username,
         created_at: stored.created_at,
         online,
+    }))
+}
+
+/// `PUT /profile` — set or change the authenticated caller's username.
+///
+/// The body is `{ "username": "<name>" }`. The name is validated for length
+/// (3–20 characters) and an `[A-Za-z0-9_-]` character set; a violation is a
+/// **422 Unprocessable Entity**. Uniqueness is enforced **case-insensitively**
+/// by the store: a name already held by another user (in any casing) is a
+/// **409 Conflict**. On success the updated [`ProfileDto`] is returned.
+async fn update_profile(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<UpdateProfileRequest>,
+) -> ApiResult<Json<ProfileDto>> {
+    let name = validate_username(&body.username)?;
+
+    // The store maps a case-insensitive clash to `StorageError::Conflict`, which
+    // the standard `From` conversion turns into `ApiError::Conflict` (409).
+    state
+        .storage()
+        .users()
+        .set_username(user.user_id, name)
+        .await?;
+
+    let stored = state.storage().users().get(user.user_id).await?;
+    let online = state.presence().is_online(stored.id, state.online_ttl());
+    Ok(Json(ProfileDto {
+        id: stored.id,
+        address: stored.address,
+        username: stored.username,
+        created_at: stored.created_at,
+        online,
+    }))
+}
+
+/// `GET /users/{id}/ratings` — every variant rating the user holds.
+///
+/// Returns `{ user_id, ratings: [{ variant_id, rating, provisional }] }`, where
+/// `provisional` is `true` when the rating's deviation is still above the
+/// [`PROVISIONAL_DEVIATION_THRESHOLD`]. A user with no rated games yields an
+/// empty `ratings` list. A missing user is a **404 Not Found**.
+async fn get_user_ratings(
+    State(state): State<AppState>,
+    Path(id): Path<UserId>,
+) -> ApiResult<Json<UserRatingsResponse>> {
+    // Confirm the user exists so an unknown id is a clean 404 rather than an
+    // empty list that could be confused with a rated-but-empty account.
+    let _user = state.storage().users().get(id).await?;
+
+    let ratings = state.storage().ratings().list_for_user(id).await?;
+    let ratings = ratings
+        .into_iter()
+        .map(|(variant_id, rating)| UserRatingDto {
+            provisional: is_provisional(rating.deviation),
+            variant_id,
+            rating: rating.into(),
+        })
+        .collect();
+
+    Ok(Json(UserRatingsResponse {
+        user_id: id,
+        ratings,
+    }))
+}
+
+/// `GET /users/{id}/rating-history?variant=&limit=` — a user's rating trail for
+/// a variant, most-recent-first.
+///
+/// `limit` is clamped to [`MAX_HISTORY_LIMIT`] and defaults to
+/// [`DEFAULT_HISTORY_LIMIT`]. A missing user is a **404 Not Found**; a variant
+/// the user has no history in yields an empty list.
+async fn get_user_rating_history(
+    State(state): State<AppState>,
+    Path(id): Path<UserId>,
+    Query(query): Query<RatingHistoryQuery>,
+) -> ApiResult<Json<RatingHistoryResponse>> {
+    // Confirm the user exists so an unknown id is a clean 404.
+    let _user = state.storage().users().get(id).await?;
+
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .min(MAX_HISTORY_LIMIT);
+
+    let history = state
+        .storage()
+        .rating_history()
+        .list(id, &query.variant, limit)
+        .await?;
+
+    let entries = history
+        .into_iter()
+        .map(|e| RatingHistoryEntryDto {
+            value: e.value,
+            deviation: e.deviation,
+            game_id: e.game_id,
+            created_at: e.created_at,
+        })
+        .collect();
+
+    Ok(Json(RatingHistoryResponse {
+        user_id: id,
+        variant_id: query.variant,
+        entries,
     }))
 }

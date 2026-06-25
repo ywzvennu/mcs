@@ -14,11 +14,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use time::OffsetDateTime;
+
 use mcs_core::{Color, Outcome};
-use mcs_domain::{Game, Rating, UserId};
+use mcs_domain::{Game, Rating, RatingHistoryEntry, UserId};
 use mcs_game::GameCompletionHook;
 use mcs_rating::{update_single, Glicko2Rating, Score, DEFAULT_TAU};
-use mcs_storage::RatingRepo;
+use mcs_storage::{RatingHistoryRepo, RatingRepo};
 
 /// A [`GameCompletionHook`] that applies a Glicko-2 rating update to both
 /// players when a game finishes.
@@ -34,6 +36,8 @@ use mcs_storage::RatingRepo;
 /// 2. Computes the Glicko-2 update for each player against the other, using the
 ///    opponent's *pre-game* rating (so the pairing is symmetric).
 /// 3. Persists both new ratings via [`RatingRepo::upsert`].
+/// 4. Appends a [`RatingHistoryEntry`] snapshot for each player via
+///    [`RatingHistoryRepo::record`], so a rated game leaves two new history rows.
 ///
 /// # Robustness
 ///
@@ -49,13 +53,45 @@ use mcs_storage::RatingRepo;
 #[derive(Clone)]
 pub struct RatingUpdateHook {
     ratings: Arc<dyn RatingRepo>,
+    history: Arc<dyn RatingHistoryRepo>,
 }
 
 impl RatingUpdateHook {
-    /// Builds a hook that reads and writes ratings through `ratings`.
+    /// Builds a hook that reads and writes ratings through `ratings` and appends
+    /// a per-player snapshot to `history` after each rated game.
     #[must_use]
-    pub fn new(ratings: Arc<dyn RatingRepo>) -> Self {
-        Self { ratings }
+    pub fn new(ratings: Arc<dyn RatingRepo>, history: Arc<dyn RatingHistoryRepo>) -> Self {
+        Self { ratings, history }
+    }
+
+    /// Appends a rating-history snapshot for `user` in `variant_id` after their
+    /// new rating has been persisted. A failure is logged and swallowed — the
+    /// durable current rating is already written, and the history log is a
+    /// best-effort audit trail whose loss must never disturb the game.
+    async fn record_history(
+        &self,
+        user: UserId,
+        variant_id: &str,
+        rating: &Rating,
+        game_id: mcs_domain::GameId,
+        now: OffsetDateTime,
+    ) {
+        let entry = RatingHistoryEntry {
+            user_id: user,
+            variant_id: variant_id.to_owned(),
+            value: rating.value,
+            deviation: rating.deviation,
+            game_id,
+            created_at: now,
+        };
+        if let Err(error) = self.history.record(&entry).await {
+            tracing::error!(
+                %user,
+                variant_id,
+                %error,
+                "failed to append rating-history snapshot",
+            );
+        }
     }
 
     /// Loads `user`'s current rating for `variant_id`, falling back to the
@@ -84,6 +120,7 @@ impl std::fmt::Debug for RatingUpdateHook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RatingUpdateHook")
             .field("ratings", &"<dyn RatingRepo>")
+            .field("history", &"<dyn RatingHistoryRepo>")
             .finish()
     }
 }
@@ -134,32 +171,50 @@ impl GameCompletionHook for RatingUpdateHook {
         let black_post: Rating =
             update_single(black_pre, white_pre, black_score, DEFAULT_TAU).into();
 
+        // A single timestamp for both snapshots, so the two rows a rated game
+        // appends share one recorded instant.
+        let now = OffsetDateTime::now_utc();
+
         // Persist both. A write failure is logged but not retried here; the
         // durable game record is already the source of truth and a follow-up
-        // reconciliation could replay it.
-        if let Err(error) = self
+        // reconciliation could replay it. A history snapshot is appended only
+        // after the player's new rating was durably written, so the log never
+        // records a rating the current-rating row does not also reflect.
+        match self
             .ratings
             .upsert(game.white, variant_id, &white_post)
             .await
         {
-            tracing::error!(
-                user = %game.white,
-                variant_id,
-                %error,
-                "failed to persist updated rating for White",
-            );
+            Ok(()) => {
+                self.record_history(game.white, variant_id, &white_post, game.id, now)
+                    .await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    user = %game.white,
+                    variant_id,
+                    %error,
+                    "failed to persist updated rating for White",
+                );
+            }
         }
-        if let Err(error) = self
+        match self
             .ratings
             .upsert(game.black, variant_id, &black_post)
             .await
         {
-            tracing::error!(
-                user = %game.black,
-                variant_id,
-                %error,
-                "failed to persist updated rating for Black",
-            );
+            Ok(()) => {
+                self.record_history(game.black, variant_id, &black_post, game.id, now)
+                    .await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    user = %game.black,
+                    variant_id,
+                    %error,
+                    "failed to persist updated rating for Black",
+                );
+            }
         }
 
         // Count the rating update (#88): one per finished *rated* game that

@@ -27,16 +27,18 @@ use mcs_domain::{
 use mcs_payments::{PaymentRecord, PaymentStore, PaymentStoreError};
 use memory::{
     InMemoryRepos, MemoryActionLogRepo, MemoryChallengeRepo, MemoryGameRepo, MemoryPaymentStore,
-    MemoryRatingRepo, MemoryRevokedTokenRepo, MemorySeekRepo, MemorySessionRepo, MemoryUserRepo,
+    MemoryRatingHistoryRepo, MemoryRatingRepo, MemoryRevokedTokenRepo, MemorySeekRepo,
+    MemorySessionRepo, MemoryUserRepo,
 };
 use time::OffsetDateTime;
 
 use mcs_domain::Rating;
 
 use crate::{
-    ActionLogRepo, ChallengeRepo, GameRepo, RatingRepo, RecordedAction, Repositories,
-    RevokedTokenRepo, SeekRepo, SessionRepo, StorageError, UserRepo,
+    ActionLogRepo, ChallengeRepo, GameRepo, RatingHistoryRepo, RatingRepo, RecordedAction,
+    Repositories, RevokedTokenRepo, SeekRepo, SessionRepo, StorageError, UserRepo,
 };
+use mcs_domain::RatingHistoryEntry;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -804,6 +806,175 @@ async fn rating_repo_leaderboard_variant_isolation() {
     // A different variant must not appear in the leaderboard.
     let board = repo.leaderboard("chess960", 10).await.unwrap();
     assert!(board.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// UserRepo::set_username
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn set_username_sets_and_changes() {
+    let repo = MemoryUserRepo::default();
+    let user = User::new(sample_address(), None, OffsetDateTime::UNIX_EPOCH);
+    repo.create(&user).await.unwrap();
+
+    repo.set_username(user.id, "alice").await.unwrap();
+    assert_eq!(
+        repo.get(user.id).await.unwrap().username.as_deref(),
+        Some("alice")
+    );
+
+    // Changing to a new name overwrites.
+    repo.set_username(user.id, "bob").await.unwrap();
+    assert_eq!(
+        repo.get(user.id).await.unwrap().username.as_deref(),
+        Some("bob")
+    );
+
+    // Re-assigning the same name (any casing) is a no-op success, not a conflict.
+    repo.set_username(user.id, "BOB").await.unwrap();
+    assert_eq!(
+        repo.get(user.id).await.unwrap().username.as_deref(),
+        Some("BOB")
+    );
+}
+
+#[tokio::test]
+async fn set_username_case_insensitive_conflict() {
+    let repo = MemoryUserRepo::default();
+    let alice = User::new(
+        "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap(),
+        None,
+        OffsetDateTime::UNIX_EPOCH,
+    );
+    let bob = User::new(
+        "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap(),
+        None,
+        OffsetDateTime::UNIX_EPOCH,
+    );
+    repo.create(&alice).await.unwrap();
+    repo.create(&bob).await.unwrap();
+
+    repo.set_username(alice.id, "Carol").await.unwrap();
+    // Bob wants the same name in a different casing: a conflict.
+    let err = repo.set_username(bob.id, "carol").await.unwrap_err();
+    assert!(matches!(err, StorageError::Conflict(_)));
+}
+
+#[tokio::test]
+async fn set_username_unknown_user_is_not_found() {
+    let repo = MemoryUserRepo::default();
+    let err = repo.set_username(UserId::new(), "ghost").await.unwrap_err();
+    assert!(matches!(err, StorageError::NotFound));
+}
+
+// ---------------------------------------------------------------------------
+// RatingRepo::list_for_user
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rating_list_for_user_returns_all_variants() {
+    let repo = MemoryRatingRepo::default();
+    let user = UserId::new();
+    let other = UserId::new();
+
+    repo.upsert(user, "standard", &Rating::default())
+        .await
+        .unwrap();
+    repo.upsert(
+        user,
+        "chess960",
+        &Rating {
+            value: 1600.0,
+            deviation: 120.0,
+            volatility: 0.05,
+        },
+    )
+    .await
+    .unwrap();
+    // A different user's rating must not leak in.
+    repo.upsert(other, "standard", &Rating::default())
+        .await
+        .unwrap();
+
+    let ratings = repo.list_for_user(user).await.unwrap();
+    assert_eq!(ratings.len(), 2);
+    let variants: Vec<&str> = ratings.iter().map(|(v, _)| v.as_str()).collect();
+    assert!(variants.contains(&"standard"));
+    assert!(variants.contains(&"chess960"));
+
+    // A user with no ratings yields an empty list.
+    assert!(repo.list_for_user(UserId::new()).await.unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// RatingHistoryRepo
+// ---------------------------------------------------------------------------
+
+fn history_entry(user: UserId, variant: &str, value: f64, secs: i64) -> RatingHistoryEntry {
+    RatingHistoryEntry {
+        user_id: user,
+        variant_id: variant.to_owned(),
+        value,
+        deviation: 100.0,
+        game_id: GameId::new(),
+        created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs),
+    }
+}
+
+#[tokio::test]
+async fn rating_history_record_and_list_most_recent_first() {
+    let repo = MemoryRatingHistoryRepo::default();
+    let user = UserId::new();
+
+    repo.record(&history_entry(user, "standard", 1500.0, 0))
+        .await
+        .unwrap();
+    repo.record(&history_entry(user, "standard", 1520.0, 10))
+        .await
+        .unwrap();
+    repo.record(&history_entry(user, "standard", 1490.0, 20))
+        .await
+        .unwrap();
+
+    let listed = repo.list(user, "standard", 10).await.unwrap();
+    assert_eq!(listed.len(), 3);
+    // Most-recent-first by created_at.
+    assert_eq!(listed[0].value, 1490.0);
+    assert_eq!(listed[1].value, 1520.0);
+    assert_eq!(listed[2].value, 1500.0);
+
+    // The limit truncates after ordering.
+    let limited = repo.list(user, "standard", 2).await.unwrap();
+    assert_eq!(limited.len(), 2);
+    assert_eq!(limited[0].value, 1490.0);
+}
+
+#[tokio::test]
+async fn rating_history_is_scoped_per_user_and_variant() {
+    let repo = MemoryRatingHistoryRepo::default();
+    let user = UserId::new();
+    let other = UserId::new();
+
+    repo.record(&history_entry(user, "standard", 1500.0, 0))
+        .await
+        .unwrap();
+    repo.record(&history_entry(user, "chess960", 1600.0, 0))
+        .await
+        .unwrap();
+    repo.record(&history_entry(other, "standard", 1400.0, 0))
+        .await
+        .unwrap();
+
+    assert_eq!(repo.list(user, "standard", 10).await.unwrap().len(), 1);
+    assert_eq!(repo.list(user, "chess960", 10).await.unwrap().len(), 1);
+    assert_eq!(repo.list(other, "standard", 10).await.unwrap().len(), 1);
+    // An empty (user, variant) combination yields no rows.
+    assert!(repo.list(user, "atomic", 10).await.unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------------------

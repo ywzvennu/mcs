@@ -9,8 +9,8 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use mcs_domain::{
-    Challenge, ChallengeId, ChallengeStatus, EvmAddress, Game, GameId, GameLifecycle, Rating, Seek,
-    SeekId, User, UserId,
+    Challenge, ChallengeId, ChallengeStatus, EvmAddress, Game, GameId, GameLifecycle, Rating,
+    RatingHistoryEntry, Seek, SeekId, User, UserId,
 };
 use time::OffsetDateTime;
 
@@ -22,6 +22,7 @@ use crate::{
     error::{StorageError, StorageResult},
     game::GameRepo,
     rating::RatingRepo,
+    rating_history::RatingHistoryRepo,
     repositories::Repositories,
     revoked_token::RevokedTokenRepo,
     seek::SeekRepo,
@@ -78,6 +79,32 @@ impl UserRepo for MemoryUserRepo {
         let user = User::new(addr.clone(), None, OffsetDateTime::now_utc());
         map.insert(user.id, user.clone());
         Ok(user)
+    }
+
+    async fn set_username(&self, user: UserId, name: &str) -> StorageResult<()> {
+        let mut map = self.by_id.lock().expect("mutex poisoned");
+        // Case-insensitive uniqueness: a different user already holding `name`
+        // (compared without regard to case) is a conflict.
+        let lowered = name.to_lowercase();
+        let clash = map.iter().any(|(id, u)| {
+            *id != user
+                && u.username
+                    .as_deref()
+                    .is_some_and(|existing| existing.to_lowercase() == lowered)
+        });
+        if clash {
+            return Err(StorageError::Conflict(format!(
+                "username {name:?} already taken"
+            )));
+        }
+        match map.get_mut(&user) {
+            Some(u) => {
+                // Store the name verbatim; only the comparison is case-folded.
+                u.username = Some(name.to_owned());
+                Ok(())
+            }
+            None => Err(StorageError::NotFound),
+        }
     }
 }
 
@@ -469,6 +496,56 @@ impl RatingRepo for MemoryRatingRepo {
         entries.truncate(limit as usize);
         Ok(entries)
     }
+
+    async fn list_for_user(&self, user: UserId) -> StorageResult<Vec<(String, Rating)>> {
+        let map = self.ratings.lock().expect("mutex poisoned");
+        let uid = user.to_string();
+        let mut entries: Vec<(String, Rating)> = map
+            .iter()
+            .filter(|((u, _), _)| *u == uid)
+            .map(|((_, vid), r)| (vid.clone(), r.clone()))
+            .collect();
+        // Stable, deterministic order by variant id (matches the sqlx impl).
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        Ok(entries)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MemoryRatingHistoryRepo
+// ---------------------------------------------------------------------------
+
+/// In-memory [`RatingHistoryRepo`] backed by an append-only `Vec`.
+#[derive(Debug, Default)]
+pub(super) struct MemoryRatingHistoryRepo {
+    entries: Mutex<Vec<RatingHistoryEntry>>,
+}
+
+#[async_trait]
+impl RatingHistoryRepo for MemoryRatingHistoryRepo {
+    async fn record(&self, entry: &RatingHistoryEntry) -> StorageResult<()> {
+        let mut log = self.entries.lock().expect("mutex poisoned");
+        log.push(entry.clone());
+        Ok(())
+    }
+
+    async fn list(
+        &self,
+        user: UserId,
+        variant_id: &str,
+        limit: u32,
+    ) -> StorageResult<Vec<RatingHistoryEntry>> {
+        let log = self.entries.lock().expect("mutex poisoned");
+        let mut out: Vec<RatingHistoryEntry> = log
+            .iter()
+            .filter(|e| e.user_id == user && e.variant_id == variant_id)
+            .cloned()
+            .collect();
+        // Most-recent-first.
+        out.sort_by_key(|e| std::cmp::Reverse(e.created_at));
+        out.truncate(limit as usize);
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +595,7 @@ pub(super) struct InMemoryRepos {
     sessions: MemorySessionRepo,
     revoked_tokens: MemoryRevokedTokenRepo,
     ratings: MemoryRatingRepo,
+    rating_history: MemoryRatingHistoryRepo,
     payments: MemoryPaymentStore,
 }
 
@@ -552,6 +630,10 @@ impl Repositories for InMemoryRepos {
 
     fn ratings(&self) -> &dyn RatingRepo {
         &self.ratings
+    }
+
+    fn rating_history(&self) -> &dyn RatingHistoryRepo {
+        &self.rating_history
     }
 
     fn payments(&self) -> &dyn PaymentStore {

@@ -8,6 +8,9 @@
 //! algorithm crate.
 
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+
+use crate::ids::{GameId, UserId};
 
 /// A Glicko-2 rating record.
 ///
@@ -55,6 +58,33 @@ impl Default for Rating {
     }
 }
 
+/// A single snapshot of a player's rating in a variant, recorded after a rated
+/// game is scored.
+///
+/// One [`RatingHistoryEntry`] is appended for each player every time a rated
+/// game finishes and their [`Rating`] is recomputed, so a player's history is
+/// the ordered trail of their rating's `value`/`deviation` after each rated
+/// game in a variant. It deliberately stores only the two display-relevant
+/// Glicko-2 parameters (`value` and `deviation`); the full rating, including
+/// `volatility`, lives in the current-rating record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RatingHistoryEntry {
+    /// The player whose rating this snapshot belongs to.
+    pub user_id: UserId,
+    /// The variant the rating is for (an opaque application-level string, e.g.
+    /// `"standard"`).
+    pub variant_id: String,
+    /// The rating value (μ on the display scale) after the game was scored.
+    pub value: f64,
+    /// The rating deviation (φ) after the game was scored.
+    pub deviation: f64,
+    /// The game that produced this snapshot.
+    pub game_id: GameId,
+    /// When the snapshot was recorded (UTC).
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +119,20 @@ mod tests {
         assert_eq!(r.value, back.value);
         assert_eq!(r.deviation, back.deviation);
         assert_eq!(r.volatility, back.volatility);
+    }
+
+    #[test]
+    fn history_entry_serde_round_trip() {
+        let entry = RatingHistoryEntry {
+            user_id: UserId::new(),
+            variant_id: "standard".to_owned(),
+            value: 1612.0,
+            deviation: 90.0,
+            game_id: GameId::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: RatingHistoryEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, back);
     }
 }
