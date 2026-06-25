@@ -12,6 +12,7 @@ use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use crate::state::AppState;
 
@@ -23,7 +24,7 @@ use crate::state::AppState;
 ///
 /// The `id` is the stable, machine-facing key used in seek requests; the
 /// `display_name` is a human-readable label suitable for UI elements.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct VariantDto {
     /// The stable, machine-facing identifier (e.g. `"standard"`, `"chess960"`).
     pub id: String,
@@ -32,7 +33,7 @@ pub struct VariantDto {
 }
 
 /// Response body for `GET /variants`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct VariantListResponse {
     /// All registered variants, sorted by id for a stable response order.
     pub variants: Vec<VariantDto>,
@@ -74,3 +75,19 @@ async fn list_variants(State(state): State<AppState>) -> Json<VariantListRespons
 
     Json(VariantListResponse { variants })
 }
+
+// ---------------------------------------------------------------------------
+// OpenAPI documentation marker
+// ---------------------------------------------------------------------------
+
+/// `GET /variants` — list every registered game variant.
+#[utoipa::path(
+    get,
+    path = "/variants",
+    tag = "variants",
+    responses(
+        (status = 200, description = "All registered variants, sorted by id.", body = VariantListResponse),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn list_variants_doc() {}

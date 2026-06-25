@@ -38,6 +38,7 @@ use axum::routing::{delete, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use utoipa::ToSchema;
 
 use mcs_core::{Color, VariantOptions};
 use mcs_domain::{
@@ -60,13 +61,14 @@ use crate::state::AppState;
 /// the corresponding account. The `rated` and `color` fields default so a
 /// minimal request — just an opponent, a variant, and a time control — issues a
 /// rated challenge with a random colour for the challenger.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateChallengeRequest {
     /// The opponent's Ethereum address (any casing; validated and lowercased).
     pub opponent_address: String,
     /// The variant to play (e.g. `"standard"`).
     pub variant_id: String,
     /// The time control to play under.
+    #[schema(value_type = crate::openapi::schema::TimeControl)]
     pub time_control: TimeControl,
     /// Whether the game should be **rated** (the default) or casual.
     #[serde(default = "default_rated")]
@@ -74,6 +76,7 @@ pub struct CreateChallengeRequest {
     /// Which side the *challenger* wants. Defaults to
     /// [`ColorPreference::Random`] when omitted.
     #[serde(default = "default_color")]
+    #[schema(value_type = crate::openapi::schema::ColorPreference)]
     pub color: ColorPreference,
 }
 
@@ -93,29 +96,37 @@ fn default_color() -> ColorPreference {
 ///
 /// A thin, explicit projection of the domain [`Challenge`] so the HTTP contract
 /// does not silently drift when the domain type changes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ChallengeDto {
     /// The challenge's stable identifier.
+    #[schema(value_type = String, format = Uuid)]
     pub id: ChallengeId,
     /// The user who issued the challenge.
+    #[schema(value_type = String, format = Uuid)]
     pub challenger: UserId,
     /// The user the challenge was issued to.
+    #[schema(value_type = String, format = Uuid)]
     pub challenged: UserId,
     /// The variant to be played.
     pub variant_id: String,
     /// The proposed time control.
+    #[schema(value_type = crate::openapi::schema::TimeControl)]
     pub time_control: TimeControl,
     /// Whether the proposed game is rated.
     pub rated: bool,
     /// The challenger's colour preference.
+    #[schema(value_type = crate::openapi::schema::ColorPreference)]
     pub color_preference: ColorPreference,
     /// The current lifecycle status.
+    #[schema(value_type = crate::openapi::schema::ChallengeStatus)]
     pub status: ChallengeStatus,
     /// The game created on acceptance, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Uuid)]
     pub game_id: Option<GameId>,
     /// When the challenge was created (RFC 3339, UTC).
     #[serde(with = "time::serde::rfc3339")]
+    #[schema(value_type = String, format = DateTime)]
     pub created_at: OffsetDateTime,
 }
 
@@ -138,7 +149,7 @@ impl From<Challenge> for ChallengeDto {
 
 /// Response body for `GET /challenges`: the caller's pending challenges, split
 /// by direction.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ChallengeListResponse {
     /// Pending challenges issued *to* the caller (awaiting their response).
     pub incoming: Vec<ChallengeDto>,
@@ -508,6 +519,128 @@ fn resolve_color(pref: ColorPreference, id: ChallengeId) -> Color {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// OpenAPI path documentation (#127)
+//
+// These `#[utoipa::path]` markers carry the OpenAPI metadata for each route.
+// They are never routed — only their generated path metadata is collected into
+// `crate::openapi::ApiDoc`. Keeping them next to the handlers keeps the docs in
+// step with the real request/response DTOs.
+// ---------------------------------------------------------------------------
+
+/// `POST /challenges` — invite a specific opponent to a game.
+#[utoipa::path(
+    post,
+    path = "/challenges",
+    tag = "challenges",
+    security(("bearerAuth" = [])),
+    request_body = CreateChallengeRequest,
+    responses(
+        (status = 200, description = "Challenge created.", body = ChallengeDto),
+        (status = 400, description = "You cannot challenge yourself.", body = crate::openapi::ProblemDetails),
+        (status = 401, description = "Missing or invalid bearer token.", body = crate::openapi::ProblemDetails),
+        (status = 422, description = "Malformed opponent address.", body = crate::openapi::ProblemDetails),
+        (status = 429, description = "Rate limited.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn create_challenge_doc() {}
+
+/// `GET /challenges` — list the caller's pending incoming and outgoing
+/// challenges.
+#[utoipa::path(
+    get,
+    path = "/challenges",
+    tag = "challenges",
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "The caller's pending challenges, split by direction.", body = ChallengeListResponse),
+        (status = 401, description = "Missing or invalid bearer token.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn list_challenges_doc() {}
+
+/// `POST /challenges/{id}/accept` — accept a challenge and create the game.
+#[utoipa::path(
+    post,
+    path = "/challenges/{id}/accept",
+    tag = "challenges",
+    security(("bearerAuth" = [])),
+    params(
+        ("id" = String, Path, description = "The challenge id (UUID)."),
+    ),
+    responses(
+        (status = 200, description = "The challenge was accepted; the created game is returned.", body = crate::rest::GameDto),
+        (status = 401, description = "Missing or invalid bearer token.", body = crate::openapi::ProblemDetails),
+        (status = 403, description = "Only the challenged player may accept.", body = crate::openapi::ProblemDetails),
+        (status = 404, description = "No such challenge.", body = crate::openapi::ProblemDetails),
+        (status = 409, description = "The challenge is not pending.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn accept_challenge_doc() {}
+
+/// `POST /challenges/{id}/decline` — decline a pending challenge.
+#[utoipa::path(
+    post,
+    path = "/challenges/{id}/decline",
+    tag = "challenges",
+    security(("bearerAuth" = [])),
+    params(
+        ("id" = String, Path, description = "The challenge id (UUID)."),
+    ),
+    responses(
+        (status = 200, description = "The challenge was declined.", body = ChallengeDto),
+        (status = 401, description = "Missing or invalid bearer token.", body = crate::openapi::ProblemDetails),
+        (status = 403, description = "Only the challenged player may decline.", body = crate::openapi::ProblemDetails),
+        (status = 404, description = "No such challenge.", body = crate::openapi::ProblemDetails),
+        (status = 409, description = "The challenge is not pending.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn decline_challenge_doc() {}
+
+/// `DELETE /challenges/{id}` — cancel a pending challenge.
+#[utoipa::path(
+    delete,
+    path = "/challenges/{id}",
+    tag = "challenges",
+    security(("bearerAuth" = [])),
+    params(
+        ("id" = String, Path, description = "The challenge id (UUID)."),
+    ),
+    responses(
+        (status = 200, description = "The challenge was cancelled.", body = ChallengeDto),
+        (status = 401, description = "Missing or invalid bearer token.", body = crate::openapi::ProblemDetails),
+        (status = 403, description = "Only the challenger may cancel.", body = crate::openapi::ProblemDetails),
+        (status = 404, description = "No such challenge.", body = crate::openapi::ProblemDetails),
+        (status = 409, description = "The challenge is not pending.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn cancel_challenge_doc() {}
+
+/// `POST /games/{id}/rematch` — offer a rematch from a finished game.
+#[utoipa::path(
+    post,
+    path = "/games/{id}/rematch",
+    tag = "challenges",
+    security(("bearerAuth" = [])),
+    params(
+        ("id" = String, Path, description = "The id (UUID) of the finished game to rematch."),
+    ),
+    responses(
+        (status = 200, description = "A pre-filled rematch challenge was created.", body = ChallengeDto),
+        (status = 401, description = "Missing or invalid bearer token.", body = crate::openapi::ProblemDetails),
+        (status = 403, description = "The caller was not a player in that game.", body = crate::openapi::ProblemDetails),
+        (status = 404, description = "No such game.", body = crate::openapi::ProblemDetails),
+        (status = 409, description = "The game has not yet finished.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn rematch_game_doc() {}
 
 #[cfg(test)]
 mod tests {

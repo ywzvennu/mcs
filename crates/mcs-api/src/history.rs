@@ -33,6 +33,7 @@ use axum::{Json, Router};
 use mcs_core::Color;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use utoipa::ToSchema;
 
 use mcs_core::Action;
 use mcs_domain::{Game, GameId};
@@ -50,13 +51,15 @@ use crate::state::AppState;
 /// raw, type-erased JSON payload recorded by the variant — it is forwarded
 /// verbatim so the endpoint works for every variant, including RBC
 /// (which includes `sense` actions alongside `move` actions).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MoveEntry {
     /// Zero-based half-move index within the game.
     pub ply: u32,
     /// The colour of the player who took this action.
+    #[schema(value_type = crate::openapi::schema::Color)]
     pub player: Color,
     /// The type-erased action payload, as defined by the variant.
+    #[schema(value_type = crate::openapi::schema::Action)]
     pub action: Action,
     /// White's remaining clock in milliseconds when the action was recorded;
     /// `None` for untimed games.
@@ -68,13 +71,15 @@ pub struct MoveEntry {
     pub clock_black_ms: Option<u64>,
     /// When the action was recorded (RFC 3339, UTC).
     #[serde(with = "time::serde::rfc3339")]
+    #[schema(value_type = String, format = DateTime)]
     pub created_at: OffsetDateTime,
 }
 
 /// Response body for `GET /games/{id}/moves`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MovesResponse {
     /// The game's stable identifier.
+    #[schema(value_type = String, format = Uuid)]
     pub game_id: GameId,
     /// Every recorded action for the game, ordered by ply ascending.
     pub moves: Vec<MoveEntry>,
@@ -289,3 +294,36 @@ fn build_pgn(game: &Game, uci_moves: &[String]) -> String {
 
     pgn
 }
+
+// ---------------------------------------------------------------------------
+// OpenAPI path documentation (#127)
+// ---------------------------------------------------------------------------
+
+/// `GET /games/{id}/moves` — full action log ordered by ply (public).
+#[utoipa::path(
+    get,
+    path = "/games/{id}/moves",
+    tag = "games",
+    params(("id" = String, Path, description = "Game id (UUID).")),
+    responses(
+        (status = 200, description = "The full ordered action log.", body = MovesResponse),
+        (status = 404, description = "No such game.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn get_moves_doc() {}
+
+/// `GET /games/{id}/pgn` — PGN export for board-style variants (public).
+#[utoipa::path(
+    get,
+    path = "/games/{id}/pgn",
+    tag = "games",
+    params(("id" = String, Path, description = "Game id (UUID).")),
+    responses(
+        (status = 200, description = "PGN document.", content_type = "text/plain", body = String),
+        (status = 404, description = "No such game.", body = crate::openapi::ProblemDetails),
+        (status = 409, description = "Variant has non-move actions; no PGN representation.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn get_pgn_doc() {}
