@@ -78,6 +78,7 @@ pub mod history;
 pub mod hub;
 pub mod limits;
 pub mod metrics;
+pub mod openapi;
 pub mod presence;
 pub mod rating;
 pub mod ready;
@@ -104,6 +105,7 @@ pub use metrics::{
     GAMES_CREATED_TOTAL, GAMES_LIVE, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION,
     RATING_UPDATES_TOTAL, WS_CONNECTIONS_ACTIVE,
 };
+pub use openapi::ApiDoc;
 pub use presence::{InProcessPresence, PresenceTracker};
 pub use rating::RatingUpdateHook;
 pub use ready::ready_router;
@@ -196,6 +198,9 @@ pub fn router(state: AppState) -> Router {
         .merge(rest::read_router())
         .merge(history::history_router())
         .merge(ready::ready_router())
+        // OpenAPI document (`GET /openapi.json`) and the Scalar docs UI
+        // (`GET /docs`). Both are unauthenticated reads (#127).
+        .merge(openapi::docs_router())
         // Record per-request metrics for every route above. Applied as the
         // outermost API layer so the matched route template is already resolved
         // when the middleware reads it for the low-cardinality `path` label.

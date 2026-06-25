@@ -43,6 +43,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use utoipa::ToSchema;
 
 use mcs_core::{Color, VariantOptions};
 use mcs_domain::{
@@ -104,13 +105,15 @@ const PROVISIONAL_DEVIATION_THRESHOLD: f64 = 110.0;
 /// The fields reuse the domain value objects directly, so an invalid time
 /// control or colour preference is rejected at deserialization time with a
 /// **422 Unprocessable Entity** before the handler runs.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateSeekRequest {
     /// The variant the caller wants to play (e.g. `"standard"`).
     pub variant_id: String,
     /// The time control the caller wants to play under.
+    #[schema(value_type = crate::openapi::schema::TimeControl)]
     pub time_control: TimeControl,
     /// Which side the caller would prefer.
+    #[schema(value_type = crate::openapi::schema::ColorPreference)]
     pub color_preference: ColorPreference,
     /// Whether the caller wants a **rated** game (the default) or a casual one.
     ///
@@ -133,13 +136,14 @@ fn default_rated() -> bool {
 /// { "status": "queued", "seek_id": "…" }
 /// { "status": "paired", "game": { … } }
 /// ```
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CreateSeekResponse {
     /// No compatible seek was waiting; this one is now in the pool. The client
     /// can later cancel it with `DELETE /seeks/{id}`.
     Queued {
         /// The id of the freshly queued seek.
+        #[schema(value_type = String, format = Uuid)]
         seek_id: SeekId,
     },
     /// A compatible seek was found and a live game was created. The client
@@ -156,12 +160,14 @@ pub enum CreateSeekResponse {
 /// the user store and omitted (rather than failing the whole listing) when the
 /// account cannot be looked up — mirroring how [`LeaderboardEntry`] treats a
 /// missing account.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SeekCreatorDto {
     /// The creator's stable identifier.
+    #[schema(value_type = String, format = Uuid)]
     pub user_id: UserId,
     /// The creator's Ethereum address, if it could be resolved.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
     pub address: Option<EvmAddress>,
 }
 
@@ -170,27 +176,31 @@ pub struct SeekCreatorDto {
 /// A thin, explicit projection of the domain [`Seek`]: the creator is expanded
 /// into a [`SeekCreatorDto`] (id plus best-effort address) so a client can
 /// render the lobby without a second round-trip per row.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SeekDto {
     /// The seek's stable identifier; join it with `POST /seeks/{id}/accept`.
+    #[schema(value_type = String, format = Uuid)]
     pub seek_id: SeekId,
     /// The player who posted the seek.
     pub creator: SeekCreatorDto,
     /// The variant on offer (e.g. `"standard"`).
     pub variant_id: String,
     /// The time control on offer.
+    #[schema(value_type = crate::openapi::schema::TimeControl)]
     pub time_control: TimeControl,
     /// Whether the resulting game would be rated.
     pub rated: bool,
     /// The creator's colour preference (honoured on accept).
+    #[schema(value_type = crate::openapi::schema::ColorPreference)]
     pub color_preference: ColorPreference,
     /// When the seek was posted (RFC 3339, UTC).
     #[serde(with = "time::serde::rfc3339")]
+    #[schema(value_type = String, format = DateTime)]
     pub created_at: OffsetDateTime,
 }
 
 /// Response body for `GET /seeks`: the open-seek lobby.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SeekListResponse {
     /// The seeks currently awaiting an opponent, in no guaranteed order.
     pub seeks: Vec<SeekDto>,
@@ -201,7 +211,7 @@ pub struct SeekListResponse {
 /// A thin projection of the domain [`Rating`]: the three Glicko-2 parameters,
 /// flattened so a client can render "1500 ± 350" without reaching into a nested
 /// object's internals.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RatingDto {
     /// Estimated playing strength (Glicko-1 / display scale, centred at 1500).
     pub value: f64,
@@ -231,15 +241,18 @@ impl From<Rating> for RatingDto {
 /// game's variant**. They are populated by the single-game lookup
 /// (`GET /games/{id}`) and omitted (left `None`) by the bulk list endpoint,
 /// which would otherwise issue two extra reads per row.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct GameDto {
     /// The game's stable identifier; open the socket at `/ws/game/{id}`.
+    #[schema(value_type = String, format = Uuid)]
     pub id: GameId,
     /// The variant being played.
     pub variant_id: String,
     /// The user playing White.
+    #[schema(value_type = String, format = Uuid)]
     pub white: UserId,
     /// The user playing Black.
+    #[schema(value_type = String, format = Uuid)]
     pub black: UserId,
     /// White's current rating for this variant, if looked up.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -248,13 +261,16 @@ pub struct GameDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub black_rating: Option<RatingDto>,
     /// The game's server-side lifecycle state.
+    #[schema(value_type = crate::openapi::schema::GameLifecycle)]
     pub lifecycle: GameLifecycle,
     /// The time control in force.
+    #[schema(value_type = crate::openapi::schema::TimeControl)]
     pub time_control: TimeControl,
     /// Whether the game is rated (counts towards ratings) or casual (exempt).
     pub rated: bool,
     /// When the game record was created (RFC 3339, UTC).
     #[serde(with = "time::serde::rfc3339")]
+    #[schema(value_type = String, format = DateTime)]
     pub created_at: OffsetDateTime,
 }
 
@@ -290,7 +306,7 @@ impl GameDto {
 }
 
 /// Response body for `GET /games`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct GameListResponse {
     /// The most recently created games, newest first.
     pub games: Vec<GameDto>,
@@ -316,20 +332,22 @@ pub struct LeaderboardQuery {
 }
 
 /// One ranked entry in a variant's leaderboard.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct LeaderboardEntry {
     /// The ranked player's stable identifier.
+    #[schema(value_type = String, format = Uuid)]
     pub user_id: UserId,
     /// The player's Ethereum address, if their account could be resolved.
     /// Omitted rather than failing the whole listing if a lookup misses.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
     pub address: Option<EvmAddress>,
     /// The player's current rating for the requested variant.
     pub rating: RatingDto,
 }
 
 /// Response body for `GET /leaderboard`: the top players, highest-rated first.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct LeaderboardResponse {
     /// The variant this leaderboard is for, echoed back from the request.
     pub variant: String,
@@ -351,16 +369,19 @@ pub struct LeaderboardResponse {
 /// deployment a user may appear offline here while being active on another
 /// node; a Redis-backed [`PresenceTracker`](crate::presence::PresenceTracker)
 /// is the cross-node upgrade path.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ProfileDto {
     /// The user's stable identifier.
+    #[schema(value_type = String, format = Uuid)]
     pub id: UserId,
     /// The user's Ethereum address (lowercase, `0x`-prefixed).
+    #[schema(value_type = String)]
     pub address: EvmAddress,
     /// The user's optional display name.
     pub username: Option<String>,
     /// When the account was created (RFC 3339, UTC).
     #[serde(with = "time::serde::rfc3339")]
+    #[schema(value_type = String, format = DateTime)]
     pub created_at: OffsetDateTime,
     /// Whether the user is currently online (seen within the configured TTL).
     pub online: bool,
@@ -371,7 +392,7 @@ pub struct ProfileDto {
 /// Reports whether a user is currently online and when they were last seen.
 /// `online` is derived from the configured TTL (see
 /// [`AppState::online_ttl`](crate::state::AppState::online_ttl)).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct UserStatusResponse {
     /// `true` when the user was seen within the online TTL on this node.
     pub online: bool,
@@ -382,11 +403,12 @@ pub struct UserStatusResponse {
         skip_serializing_if = "Option::is_none",
         with = "time::serde::rfc3339::option"
     )]
+    #[schema(value_type = Option<String>, format = DateTime)]
     pub last_seen: Option<OffsetDateTime>,
 }
 
 /// Request body for `PUT /profile`: the new display name for the caller.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateProfileRequest {
     /// The desired username. Validated for length (3–20) and an
     /// `[A-Za-z0-9_-]` character set; uniqueness is enforced case-insensitively
@@ -395,7 +417,7 @@ pub struct UpdateProfileRequest {
 }
 
 /// One variant's rating in the per-user ratings listing.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct UserRatingDto {
     /// The variant this rating is for (e.g. `"standard"`).
     pub variant_id: String,
@@ -408,9 +430,10 @@ pub struct UserRatingDto {
 }
 
 /// Response body for `GET /users/{id}/ratings`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct UserRatingsResponse {
     /// The user these ratings belong to.
+    #[schema(value_type = String, format = Uuid)]
     pub user_id: UserId,
     /// One entry per variant the user has a rating in, ordered by variant id.
     pub ratings: Vec<UserRatingDto>,
@@ -427,23 +450,26 @@ pub struct RatingHistoryQuery {
 }
 
 /// One snapshot in a user's rating history.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RatingHistoryEntryDto {
     /// The rating value after the game was scored.
     pub value: f64,
     /// The rating deviation after the game was scored.
     pub deviation: f64,
     /// The game that produced this snapshot.
+    #[schema(value_type = String, format = Uuid)]
     pub game_id: GameId,
     /// When the snapshot was recorded (RFC 3339, UTC).
     #[serde(with = "time::serde::rfc3339")]
+    #[schema(value_type = String, format = DateTime)]
     pub created_at: OffsetDateTime,
 }
 
 /// Response body for `GET /users/{id}/rating-history`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RatingHistoryResponse {
     /// The user this history belongs to.
+    #[schema(value_type = String, format = Uuid)]
     pub user_id: UserId,
     /// The variant the history is for, echoed back from the request.
     pub variant_id: String,
@@ -625,9 +651,10 @@ async fn cancel_seek(
 }
 
 /// Response body for a successful `DELETE /seeks/{id}`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CancelSeekResponse {
     /// The id of the seek that was cancelled.
+    #[schema(value_type = String, format = Uuid)]
     pub cancelled: SeekId,
 }
 
@@ -1027,3 +1054,214 @@ async fn get_user_rating_history(
         entries,
     }))
 }
+
+// ---------------------------------------------------------------------------
+// OpenAPI path documentation (#127)
+//
+// These marker functions are never routed; they exist only to carry the
+// `#[utoipa::path]` metadata for the handlers above, which `crate::openapi`
+// collects into the aggregated document. Keeping them beside the handlers keeps
+// the documented contract close to the code that implements it.
+// ---------------------------------------------------------------------------
+
+/// `POST /seeks` — post a seek; queue it or pair it into a game.
+#[utoipa::path(
+    post,
+    path = "/seeks",
+    tag = "seeks",
+    security(("bearerAuth" = [])),
+    request_body = CreateSeekRequest,
+    responses(
+        (status = 200, description = "Seek queued, or paired into a new game.", body = CreateSeekResponse),
+        (status = 401, description = "Unauthenticated.", body = crate::openapi::ProblemDetails),
+        (status = 402, description = "Payment required (only when the x402 gate is enabled)."),
+        (status = 422, description = "Invalid time control or colour preference.", body = crate::openapi::ProblemDetails),
+        (status = 429, description = "Rate limited.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn create_seek_doc() {}
+
+/// `GET /seeks` — browse the open-seek lobby (public).
+#[utoipa::path(
+    get,
+    path = "/seeks",
+    tag = "seeks",
+    responses(
+        (status = 200, description = "The open-seek lobby.", body = SeekListResponse),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn list_seeks_doc() {}
+
+/// `POST /seeks/{id}/accept` — join an open seek directly, creating the game.
+#[utoipa::path(
+    post,
+    path = "/seeks/{id}/accept",
+    tag = "seeks",
+    security(("bearerAuth" = [])),
+    params(("id" = String, Path, description = "Seek id (UUID).")),
+    responses(
+        (status = 200, description = "The created game.", body = GameDto),
+        (status = 400, description = "Cannot accept your own seek.", body = crate::openapi::ProblemDetails),
+        (status = 401, description = "Unauthenticated.", body = crate::openapi::ProblemDetails),
+        (status = 404, description = "No such open seek.", body = crate::openapi::ProblemDetails),
+        (status = 409, description = "The seek has already been taken.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn accept_seek_doc() {}
+
+/// `DELETE /seeks/{id}` — cancel one of the caller's own open seeks.
+#[utoipa::path(
+    delete,
+    path = "/seeks/{id}",
+    tag = "seeks",
+    security(("bearerAuth" = [])),
+    params(("id" = String, Path, description = "Seek id (UUID).")),
+    responses(
+        (status = 200, description = "The seek was cancelled.", body = CancelSeekResponse),
+        (status = 401, description = "Unauthenticated.", body = crate::openapi::ProblemDetails),
+        (status = 403, description = "Only the creator may cancel.", body = crate::openapi::ProblemDetails),
+        (status = 404, description = "No such open seek.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn cancel_seek_doc() {}
+
+/// `GET /games/{id}` — fetch a single game record by id (public).
+#[utoipa::path(
+    get,
+    path = "/games/{id}",
+    tag = "games",
+    params(("id" = String, Path, description = "Game id (UUID).")),
+    responses(
+        (status = 200, description = "The game, with both players' current ratings.", body = GameDto),
+        (status = 404, description = "No such game.", body = crate::openapi::ProblemDetails),
+        (status = 422, description = "Malformed game id.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn get_game_doc() {}
+
+/// `GET /games` — list the most recently created games (public).
+#[utoipa::path(
+    get,
+    path = "/games",
+    tag = "games",
+    params(
+        ("limit" = Option<u32>, Query, description = "Max games to return (clamped to 100; default 20)."),
+    ),
+    responses(
+        (status = 200, description = "Recent games, newest first.", body = GameListResponse),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn list_games_doc() {}
+
+/// `GET /leaderboard` — top-rated players for a variant (public).
+#[utoipa::path(
+    get,
+    path = "/leaderboard",
+    tag = "leaderboard",
+    params(
+        ("variant" = String, Query, description = "The variant to rank (e.g. \"standard\"). Required."),
+        ("limit" = Option<u32>, Query, description = "Max entries (clamped to 200; default 20)."),
+    ),
+    responses(
+        (status = 200, description = "Ranked players, highest-rated first.", body = LeaderboardResponse),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn leaderboard_doc() {}
+
+/// `GET /profile` — the authenticated caller's own profile.
+#[utoipa::path(
+    get,
+    path = "/profile",
+    tag = "profile",
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "The caller's profile.", body = ProfileDto),
+        (status = 401, description = "Unauthenticated.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn my_profile_doc() {}
+
+/// `PUT /profile` — set or change the caller's username.
+#[utoipa::path(
+    put,
+    path = "/profile",
+    tag = "profile",
+    security(("bearerAuth" = [])),
+    request_body = UpdateProfileRequest,
+    responses(
+        (status = 200, description = "The updated profile.", body = ProfileDto),
+        (status = 401, description = "Unauthenticated.", body = crate::openapi::ProblemDetails),
+        (status = 409, description = "Username already taken (case-insensitive).", body = crate::openapi::ProblemDetails),
+        (status = 422, description = "Username fails length/charset validation.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn update_profile_doc() {}
+
+/// `GET /users/{id}` — a user's public profile.
+#[utoipa::path(
+    get,
+    path = "/users/{id}",
+    tag = "profile",
+    params(("id" = String, Path, description = "User id (UUID).")),
+    responses(
+        (status = 200, description = "The user's public profile.", body = ProfileDto),
+        (status = 404, description = "No such user.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn get_profile_doc() {}
+
+/// `GET /users/{id}/status` — a user's real-time presence status.
+#[utoipa::path(
+    get,
+    path = "/users/{id}/status",
+    tag = "profile",
+    params(("id" = String, Path, description = "User id (UUID).")),
+    responses(
+        (status = 200, description = "Online flag and last-seen timestamp.", body = UserStatusResponse),
+        (status = 404, description = "No such user.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn get_user_status_doc() {}
+
+/// `GET /users/{id}/ratings` — a user's per-variant ratings.
+#[utoipa::path(
+    get,
+    path = "/users/{id}/ratings",
+    tag = "profile",
+    params(("id" = String, Path, description = "User id (UUID).")),
+    responses(
+        (status = 200, description = "One rating per variant the user has played.", body = UserRatingsResponse),
+        (status = 404, description = "No such user.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn get_user_ratings_doc() {}
+
+/// `GET /users/{id}/rating-history` — a user's rating trail for a variant.
+#[utoipa::path(
+    get,
+    path = "/users/{id}/rating-history",
+    tag = "profile",
+    params(
+        ("id" = String, Path, description = "User id (UUID)."),
+        ("variant" = String, Query, description = "The variant to report (e.g. \"standard\"). Required."),
+        ("limit" = Option<u32>, Query, description = "Max snapshots (clamped to 200; default 50)."),
+    ),
+    responses(
+        (status = 200, description = "Rating snapshots, most-recent-first.", body = RatingHistoryResponse),
+        (status = 404, description = "No such user.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn get_user_rating_history_doc() {}

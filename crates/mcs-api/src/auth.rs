@@ -38,6 +38,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use utoipa::ToSchema;
 
 use mcs_auth::{generate_nonce, issue_session, nonce_from_message, verify_siwe, ChallengeParams};
 use mcs_domain::{EvmAddress, UserId};
@@ -63,11 +64,12 @@ pub struct NonceQuery {
 /// message so a client can render or re-derive the message if it wishes.
 ///
 /// Times are RFC 3339 strings (e.g. `"2026-06-24T12:00:00Z"`).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ChallengeFields {
     /// The RFC 3986 authority requesting the sign-in.
     pub domain: String,
     /// The address being authenticated (lowercase, `0x`-prefixed).
+    #[schema(value_type = String, example = "0xabc...")]
     pub address: EvmAddress,
     /// The RFC 3986 URI of the resource being signed into.
     pub uri: String,
@@ -77,17 +79,19 @@ pub struct ChallengeFields {
     pub nonce: String,
     /// When the challenge was issued (RFC 3339, UTC).
     #[serde(with = "time::serde::rfc3339")]
+    #[schema(value_type = String, format = DateTime, example = "2026-06-24T12:00:00Z")]
     pub issued_at: OffsetDateTime,
     /// The human-readable statement shown in the wallet.
     pub statement: String,
     /// When the challenge expires (RFC 3339, UTC). After this the nonce is
     /// rejected at verification time.
     #[serde(with = "time::serde::rfc3339")]
+    #[schema(value_type = String, format = DateTime)]
     pub expiration: OffsetDateTime,
 }
 
 /// Response body for `GET /auth/nonce`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct NonceResponse {
     /// The canonical EIP-4361 message string, ready to hand to the wallet for
     /// signing. It must be signed and returned **verbatim**.
@@ -97,7 +101,7 @@ pub struct NonceResponse {
 }
 
 /// Request body for `POST /auth/verify`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct VerifyRequest {
     /// The exact SIWE message string that was signed (as returned by
     /// `GET /auth/nonce`).
@@ -108,14 +112,16 @@ pub struct VerifyRequest {
 }
 
 /// Response body for `POST /auth/verify`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct VerifyResponse {
     /// The HS256 session JWT. Present it as `Authorization: Bearer <token>` on
     /// authenticated requests.
     pub token: String,
     /// The authenticated user's stable identifier.
+    #[schema(value_type = String, format = Uuid)]
     pub user_id: UserId,
     /// The authenticated wallet address (the cryptographically recovered one).
+    #[schema(value_type = String)]
     pub address: EvmAddress,
 }
 
@@ -284,3 +290,54 @@ async fn logout(State(state): State<AppState>, user: AuthUser) -> ApiResult<Stat
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+// ---------------------------------------------------------------------------
+// OpenAPI path documentation (#127)
+// ---------------------------------------------------------------------------
+
+/// `GET /auth/nonce` — issue a single-use SIWE challenge.
+#[utoipa::path(
+    get,
+    path = "/auth/nonce",
+    tag = "auth",
+    params(
+        ("address" = String, Query, description = "The address to authenticate (0x-prefixed, 40 hex)."),
+    ),
+    responses(
+        (status = 200, description = "The canonical SIWE message and its structured fields.", body = NonceResponse),
+        (status = 422, description = "Malformed address.", body = crate::openapi::ProblemDetails),
+        (status = 429, description = "Rate limited.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn nonce_doc() {}
+
+/// `POST /auth/verify` — verify a signed challenge and mint a session token.
+#[utoipa::path(
+    post,
+    path = "/auth/verify",
+    tag = "auth",
+    request_body = VerifyRequest,
+    responses(
+        (status = 200, description = "Authentication succeeded; a session JWT is returned.", body = VerifyResponse),
+        (status = 400, description = "Signature is not valid hex.", body = crate::openapi::ProblemDetails),
+        (status = 401, description = "Signature/nonce verification failed.", body = crate::openapi::ProblemDetails),
+        (status = 429, description = "Rate limited.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn verify_doc() {}
+
+/// `POST /auth/logout` — revoke the caller's current session token.
+#[utoipa::path(
+    post,
+    path = "/auth/logout",
+    tag = "auth",
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 204, description = "The token was revoked (idempotent)."),
+        (status = 401, description = "Missing or invalid bearer token.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn logout_doc() {}

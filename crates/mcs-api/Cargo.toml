@@ -56,6 +56,18 @@ hex = "0.4"
 # root manifest is off-limits). A no-op recorder is used until `mcs-server`
 # installs the Prometheus exporter, so the macros are always safe to call.
 metrics = "0.24"
+# OpenAPI 3.1 document generation (#127). `utoipa` derives `ToSchema`/`OpenApi`
+# at compile time; the `axum_extras` feature pulls in the axum-aware path
+# helpers. Pinned here directly (member deps are allowed; the root manifest is
+# off-limits). MIT/Apache-2.0, so it passes cargo-deny's license allow-list.
+utoipa = { version = "5", features = ["axum_extras", "time", "uuid"] }
+# Scalar docs UI for the generated spec (#127). Chosen over `utoipa-swagger-ui`
+# deliberately: Scalar renders from a tiny self-contained HTML page that pulls
+# its JS from a CDN at runtime, so this crate vendors NO third-party JS/CSS
+# assets. That keeps cargo-deny's `sources`/`licenses` checks clean (the
+# swagger-ui crate bundles vendored assets that can trip the source check),
+# while still serving a full interactive docs UI at `/docs`. MIT/Apache-2.0.
+utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 [dev-dependencies]
 # Drive the router in-process without binding a socket.

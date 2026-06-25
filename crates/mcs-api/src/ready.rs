@@ -106,3 +106,47 @@ fn not_ready(dependency: &'static str) -> Response {
     )
         .into_response()
 }
+
+// ---------------------------------------------------------------------------
+// OpenAPI path documentation (#127)
+//
+// The live response bodies (`Ready` / `NotReady`) are private with `&'static
+// str` fields, so they are mirrored here by `pub` doc-only structs whose serde
+// shape matches them exactly. Only their generated schemas and the path
+// metadata are collected into the OpenAPI document; these types are never
+// constructed or routed.
+// ---------------------------------------------------------------------------
+
+/// Documentation mirror of the readiness success body (`{"status":"ready"}`).
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct ReadyDoc {
+    /// Always `"ready"` when every dependency is healthy.
+    #[schema(example = "ready")]
+    pub status: String,
+}
+
+/// Documentation mirror of the readiness failure body.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct NotReadyDoc {
+    /// Always `"unavailable"`.
+    #[schema(example = "unavailable")]
+    pub status: String,
+    /// Which dependency failed: `"database"` or `"cluster"`.
+    #[schema(example = "database")]
+    pub failed: String,
+}
+
+/// `GET /ready` — readiness probe (200 when DB and cluster reachable, else 503).
+#[utoipa::path(
+    get,
+    path = "/ready",
+    tag = "ops",
+    responses(
+        (status = 200, description = "All dependencies healthy.", body = ReadyDoc),
+        (status = 503, description = "A dependency is unreachable.", body = NotReadyDoc),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn ready_doc() {}
