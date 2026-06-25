@@ -16,7 +16,7 @@
 use mcs_core::{Action, Color, EndReason, Outcome, VariantOptions};
 use mcs_domain::{
     Challenge, ChallengeStatus, ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Rating,
-    RatingHistoryEntry, Seek, TimeControl, User, UserId,
+    RatingHistoryEntry, Seek, TimeClass, TimeControl, User, UserId,
 };
 use time::OffsetDateTime;
 
@@ -893,7 +893,7 @@ async fn rating_get_missing_returns_none() {
     let storage = storage().await;
     let result = storage
         .ratings()
-        .get(UserId::new(), "standard")
+        .get(UserId::new(), "standard", TimeClass::Blitz)
         .await
         .unwrap();
     assert!(result.is_none());
@@ -911,12 +911,12 @@ async fn rating_upsert_then_get_round_trip() {
 
     storage
         .ratings()
-        .upsert(user, "standard", &rating)
+        .upsert(user, "standard", TimeClass::Blitz, &rating)
         .await
         .unwrap();
     let fetched = storage
         .ratings()
-        .get(user, "standard")
+        .get(user, "standard", TimeClass::Blitz)
         .await
         .unwrap()
         .expect("rating must exist after upsert");
@@ -936,6 +936,7 @@ async fn rating_upsert_overwrites_existing() {
         .upsert(
             user,
             "standard",
+            TimeClass::Blitz,
             &Rating {
                 value: 1500.0,
                 deviation: 350.0,
@@ -952,19 +953,76 @@ async fn rating_upsert_overwrites_existing() {
     };
     storage
         .ratings()
-        .upsert(user, "standard", &updated)
+        .upsert(user, "standard", TimeClass::Blitz, &updated)
         .await
         .unwrap();
 
     let fetched = storage
         .ratings()
-        .get(user, "standard")
+        .get(user, "standard", TimeClass::Blitz)
         .await
         .unwrap()
         .expect("rating must exist");
     assert_eq!(fetched.value, updated.value);
     assert_eq!(fetched.deviation, updated.deviation);
     assert_eq!(fetched.volatility, updated.volatility);
+}
+
+#[tokio::test]
+async fn rating_time_class_keys_distinct_rows() {
+    let storage = storage().await;
+    let user = UserId::new();
+
+    storage
+        .ratings()
+        .upsert(
+            user,
+            "standard",
+            TimeClass::Blitz,
+            &Rating {
+                value: 1700.0,
+                deviation: 80.0,
+                volatility: 0.05,
+            },
+        )
+        .await
+        .unwrap();
+    storage
+        .ratings()
+        .upsert(
+            user,
+            "standard",
+            TimeClass::Rapid,
+            &Rating {
+                value: 1400.0,
+                deviation: 90.0,
+                volatility: 0.05,
+            },
+        )
+        .await
+        .unwrap();
+
+    // Same (user, variant), two distinct rows keyed by time class.
+    assert_eq!(
+        storage
+            .ratings()
+            .get(user, "standard", TimeClass::Blitz)
+            .await
+            .unwrap()
+            .unwrap()
+            .value,
+        1700.0
+    );
+    assert_eq!(
+        storage
+            .ratings()
+            .get(user, "standard", TimeClass::Rapid)
+            .await
+            .unwrap()
+            .unwrap()
+            .value,
+        1400.0
+    );
 }
 
 #[tokio::test]
@@ -978,6 +1036,7 @@ async fn rating_leaderboard_ordering_and_limit() {
             .upsert(
                 user,
                 "standard",
+                TimeClass::Blitz,
                 &Rating {
                     value: *v,
                     deviation: 200.0,
@@ -988,7 +1047,11 @@ async fn rating_leaderboard_ordering_and_limit() {
             .unwrap();
     }
 
-    let board = storage.ratings().leaderboard("standard", 3).await.unwrap();
+    let board = storage
+        .ratings()
+        .leaderboard("standard", TimeClass::Blitz, 3)
+        .await
+        .unwrap();
     assert_eq!(board.len(), 3);
     // Must be non-ascending by value.
     assert!(board.windows(2).all(|w| w[0].1.value >= w[1].1.value));
@@ -1000,21 +1063,59 @@ async fn rating_leaderboard_empty_variant_returns_empty() {
     let storage = storage().await;
     let board = storage
         .ratings()
-        .leaderboard("nonexistent", 10)
+        .leaderboard("nonexistent", TimeClass::Blitz, 10)
         .await
         .unwrap();
     assert!(board.is_empty());
 }
 
 #[tokio::test]
-async fn rating_list_for_user_returns_all_variants() {
+async fn rating_leaderboard_time_class_isolation() {
+    let storage = storage().await;
+    storage
+        .ratings()
+        .upsert(
+            UserId::new(),
+            "standard",
+            TimeClass::Blitz,
+            &Rating::default(),
+        )
+        .await
+        .unwrap();
+
+    // The same variant under a different time class must not appear.
+    let board = storage
+        .ratings()
+        .leaderboard("standard", TimeClass::Rapid, 10)
+        .await
+        .unwrap();
+    assert!(board.is_empty());
+}
+
+#[tokio::test]
+async fn rating_list_for_user_returns_all_variants_and_time_classes() {
     let storage = storage().await;
     let user = UserId::new();
     let other = UserId::new();
 
     storage
         .ratings()
-        .upsert(user, "standard", &Rating::default())
+        .upsert(user, "standard", TimeClass::Blitz, &Rating::default())
+        .await
+        .unwrap();
+    // Same variant, a second time class — a distinct entry.
+    storage
+        .ratings()
+        .upsert(
+            user,
+            "standard",
+            TimeClass::Rapid,
+            &Rating {
+                value: 1400.0,
+                deviation: 90.0,
+                volatility: 0.05,
+            },
+        )
         .await
         .unwrap();
     storage
@@ -1022,6 +1123,7 @@ async fn rating_list_for_user_returns_all_variants() {
         .upsert(
             user,
             "chess960",
+            TimeClass::Blitz,
             &Rating {
                 value: 1620.0,
                 deviation: 110.0,
@@ -1033,15 +1135,25 @@ async fn rating_list_for_user_returns_all_variants() {
     // A different user's rating must not appear.
     storage
         .ratings()
-        .upsert(other, "standard", &Rating::default())
+        .upsert(other, "standard", TimeClass::Blitz, &Rating::default())
         .await
         .unwrap();
 
     let ratings = storage.ratings().list_for_user(user).await.unwrap();
-    assert_eq!(ratings.len(), 2);
-    // The sqlx impl orders by variant_id ascending.
-    assert_eq!(ratings[0].0, "chess960");
-    assert_eq!(ratings[1].0, "standard");
+    assert_eq!(ratings.len(), 3);
+    // The sqlx impl orders by (variant_id, time_class) ascending.
+    assert_eq!(
+        (ratings[0].0.as_str(), ratings[0].1),
+        ("chess960", TimeClass::Blitz)
+    );
+    assert_eq!(
+        (ratings[1].0.as_str(), ratings[1].1),
+        ("standard", TimeClass::Blitz)
+    );
+    assert_eq!(
+        (ratings[2].0.as_str(), ratings[2].1),
+        ("standard", TimeClass::Rapid)
+    );
 
     assert!(storage
         .ratings()
@@ -1142,9 +1254,16 @@ async fn set_username_unknown_user_is_not_found() {
 // RatingHistoryRepo — SQLite/Postgres integration tests
 // ---------------------------------------------------------------------------
 
-fn history_entry(user: UserId, variant: &str, value: f64, secs: i64) -> RatingHistoryEntry {
+fn history_entry(
+    user: UserId,
+    variant: &str,
+    time_class: TimeClass,
+    value: f64,
+    secs: i64,
+) -> RatingHistoryEntry {
     RatingHistoryEntry {
         user_id: user,
+        time_class,
         variant_id: variant.to_owned(),
         value,
         deviation: 100.0,
@@ -1160,23 +1279,41 @@ async fn rating_history_record_and_list_most_recent_first() {
 
     storage
         .rating_history()
-        .record(&history_entry(user, "standard", 1500.0, 0))
+        .record(&history_entry(
+            user,
+            "standard",
+            TimeClass::Blitz,
+            1500.0,
+            0,
+        ))
         .await
         .unwrap();
     storage
         .rating_history()
-        .record(&history_entry(user, "standard", 1520.0, 10))
+        .record(&history_entry(
+            user,
+            "standard",
+            TimeClass::Blitz,
+            1520.0,
+            10,
+        ))
         .await
         .unwrap();
     storage
         .rating_history()
-        .record(&history_entry(user, "standard", 1490.0, 20))
+        .record(&history_entry(
+            user,
+            "standard",
+            TimeClass::Blitz,
+            1490.0,
+            20,
+        ))
         .await
         .unwrap();
 
     let listed = storage
         .rating_history()
-        .list(user, "standard", 10)
+        .list(user, "standard", TimeClass::Blitz, 10)
         .await
         .unwrap();
     assert_eq!(listed.len(), 3);
@@ -1188,7 +1325,7 @@ async fn rating_history_record_and_list_most_recent_first() {
     // The limit truncates after ordering.
     let limited = storage
         .rating_history()
-        .list(user, "standard", 2)
+        .list(user, "standard", TimeClass::Blitz, 2)
         .await
         .unwrap();
     assert_eq!(limited.len(), 2);
@@ -1198,43 +1335,83 @@ async fn rating_history_record_and_list_most_recent_first() {
 #[tokio::test]
 async fn rating_history_round_trips_entry_fields() {
     let storage = storage().await;
-    let entry = history_entry(UserId::new(), "standard", 1612.5, 42);
+    let entry = history_entry(UserId::new(), "standard", TimeClass::Rapid, 1612.5, 42);
     storage.rating_history().record(&entry).await.unwrap();
 
     let listed = storage
         .rating_history()
-        .list(entry.user_id, "standard", 10)
+        .list(entry.user_id, "standard", TimeClass::Rapid, 10)
         .await
         .unwrap();
     assert_eq!(listed, vec![entry]);
 }
 
 #[tokio::test]
-async fn rating_history_scoped_per_user_and_variant() {
+async fn rating_history_scoped_per_user_variant_and_time_class() {
     let storage = storage().await;
     let user = UserId::new();
     let other = UserId::new();
 
     storage
         .rating_history()
-        .record(&history_entry(user, "standard", 1500.0, 0))
+        .record(&history_entry(
+            user,
+            "standard",
+            TimeClass::Blitz,
+            1500.0,
+            0,
+        ))
+        .await
+        .unwrap();
+    // Same (user, variant), a different time class is a separate trail.
+    storage
+        .rating_history()
+        .record(&history_entry(
+            user,
+            "standard",
+            TimeClass::Rapid,
+            1480.0,
+            0,
+        ))
         .await
         .unwrap();
     storage
         .rating_history()
-        .record(&history_entry(user, "chess960", 1600.0, 0))
+        .record(&history_entry(
+            user,
+            "chess960",
+            TimeClass::Blitz,
+            1600.0,
+            0,
+        ))
         .await
         .unwrap();
     storage
         .rating_history()
-        .record(&history_entry(other, "standard", 1400.0, 0))
+        .record(&history_entry(
+            other,
+            "standard",
+            TimeClass::Blitz,
+            1400.0,
+            0,
+        ))
         .await
         .unwrap();
 
     assert_eq!(
         storage
             .rating_history()
-            .list(user, "standard", 10)
+            .list(user, "standard", TimeClass::Blitz, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    // The rapid snapshot must not appear in a blitz query.
+    assert_eq!(
+        storage
+            .rating_history()
+            .list(user, "standard", TimeClass::Rapid, 10)
             .await
             .unwrap()
             .len(),
@@ -1242,7 +1419,7 @@ async fn rating_history_scoped_per_user_and_variant() {
     );
     assert!(storage
         .rating_history()
-        .list(user, "atomic", 10)
+        .list(user, "atomic", TimeClass::Blitz, 10)
         .await
         .unwrap()
         .is_empty());

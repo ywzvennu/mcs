@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use mcs_core::{Action, Color};
 use mcs_domain::{
     Challenge, ChallengeId, ChallengeStatus, ColorPreference, EvmAddress, Game, GameId,
-    GameLifecycle, Rating, RatingHistoryEntry, Seek, SeekId, User, UserId,
+    GameLifecycle, Rating, RatingHistoryEntry, Seek, SeekId, TimeClass, User, UserId,
 };
 use mcs_payments::{PaymentRecord, PaymentStore, PaymentStoreError};
 use sqlx::Row;
@@ -212,6 +212,13 @@ fn decode_color_pref(s: &str) -> Result<ColorPreference, StorageError> {
             "unknown color preference {other:?}"
         ))),
     }
+}
+
+/// Decodes a [`TimeClass`] from its lowercase column discriminant (the same
+/// `snake_case` spelling [`TimeClass::as_str`] produces).
+fn decode_time_class(s: &str) -> Result<TimeClass, StorageError> {
+    s.parse()
+        .map_err(|_| StorageError::Serialization(format!("unknown time class {s:?}")))
 }
 
 /// Encodes a [`ChallengeStatus`] as its lowercase column discriminant.
@@ -1108,31 +1115,44 @@ fn rating_from_row(row: &DbRow) -> Result<Rating, StorageError> {
 
 #[async_trait]
 impl RatingRepo for SqlxStorage {
-    async fn get(&self, user: UserId, variant_id: &str) -> StorageResult<Option<Rating>> {
+    async fn get(
+        &self,
+        user: UserId,
+        variant_id: &str,
+        time_class: TimeClass,
+    ) -> StorageResult<Option<Rating>> {
         let row = sqlx::query(
             "SELECT value, deviation, volatility FROM ratings \
-             WHERE user_id = $1 AND variant_id = $2",
+             WHERE user_id = $1 AND variant_id = $2 AND time_class = $3",
         )
         .bind(user.to_string())
         .bind(variant_id)
+        .bind(time_class.as_str())
         .fetch_optional(&self.pool)
         .await?;
         row.map(|r| rating_from_row(&r)).transpose()
     }
 
-    async fn upsert(&self, user: UserId, variant_id: &str, rating: &Rating) -> StorageResult<()> {
+    async fn upsert(
+        &self,
+        user: UserId,
+        variant_id: &str,
+        time_class: TimeClass,
+        rating: &Rating,
+    ) -> StorageResult<()> {
         // INSERT OR REPLACE / ON CONFLICT … DO UPDATE are both supported by
         // SQLite (3.24+) and PostgreSQL with identical syntax.
         sqlx::query(
-            "INSERT INTO ratings (user_id, variant_id, value, deviation, volatility) \
-             VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (user_id, variant_id) \
+            "INSERT INTO ratings (user_id, variant_id, time_class, value, deviation, volatility) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (user_id, variant_id, time_class) \
              DO UPDATE SET value = excluded.value, \
                            deviation = excluded.deviation, \
                            volatility = excluded.volatility",
         )
         .bind(user.to_string())
         .bind(variant_id)
+        .bind(time_class.as_str())
         .bind(rating.value)
         .bind(rating.deviation)
         .bind(rating.volatility)
@@ -1144,15 +1164,17 @@ impl RatingRepo for SqlxStorage {
     async fn leaderboard(
         &self,
         variant_id: &str,
+        time_class: TimeClass,
         limit: u32,
     ) -> StorageResult<Vec<(UserId, Rating)>> {
         let rows = sqlx::query(
             "SELECT user_id, value, deviation, volatility FROM ratings \
-             WHERE variant_id = $1 \
+             WHERE variant_id = $1 AND time_class = $2 \
              ORDER BY value DESC \
-             LIMIT $2",
+             LIMIT $3",
         )
         .bind(variant_id)
+        .bind(time_class.as_str())
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?;
@@ -1166,11 +1188,11 @@ impl RatingRepo for SqlxStorage {
             .collect()
     }
 
-    async fn list_for_user(&self, user: UserId) -> StorageResult<Vec<(String, Rating)>> {
+    async fn list_for_user(&self, user: UserId) -> StorageResult<Vec<(String, TimeClass, Rating)>> {
         let rows = sqlx::query(
-            "SELECT variant_id, value, deviation, volatility FROM ratings \
+            "SELECT variant_id, time_class, value, deviation, volatility FROM ratings \
              WHERE user_id = $1 \
-             ORDER BY variant_id",
+             ORDER BY variant_id, time_class",
         )
         .bind(user.to_string())
         .fetch_all(&self.pool)
@@ -1179,8 +1201,9 @@ impl RatingRepo for SqlxStorage {
         rows.iter()
             .map(|row| {
                 let variant_id = row.try_get::<String, _>("variant_id")?;
+                let time_class = decode_time_class(&row.try_get::<String, _>("time_class")?)?;
                 let rating = rating_from_row(row)?;
-                Ok((variant_id, rating))
+                Ok((variant_id, time_class, rating))
             })
             .collect()
     }
@@ -1195,6 +1218,7 @@ fn rating_history_from_row(row: &DbRow) -> Result<RatingHistoryEntry, StorageErr
     Ok(RatingHistoryEntry {
         user_id: decode_id::<UserId>(&row.try_get::<String, _>("user_id")?)?,
         variant_id: row.try_get::<String, _>("variant_id")?,
+        time_class: decode_time_class(&row.try_get::<String, _>("time_class")?)?,
         value: row.try_get::<f64, _>("value")?,
         deviation: row.try_get::<f64, _>("deviation")?,
         game_id: decode_id::<GameId>(&row.try_get::<String, _>("game_id")?)?,
@@ -1207,11 +1231,12 @@ impl RatingHistoryRepo for SqlxStorage {
     async fn record(&self, entry: &RatingHistoryEntry) -> StorageResult<()> {
         sqlx::query(
             "INSERT INTO rating_history \
-             (user_id, variant_id, value, deviation, game_id, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             (user_id, variant_id, time_class, value, deviation, game_id, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(entry.user_id.to_string())
         .bind(&entry.variant_id)
+        .bind(entry.time_class.as_str())
         .bind(entry.value)
         .bind(entry.deviation)
         .bind(entry.game_id.to_string())
@@ -1225,20 +1250,22 @@ impl RatingHistoryRepo for SqlxStorage {
         &self,
         user: UserId,
         variant_id: &str,
+        time_class: TimeClass,
         limit: u32,
     ) -> StorageResult<Vec<RatingHistoryEntry>> {
         // Most-recent-first. RFC 3339 timestamps sort lexicographically in
         // chronological order, so `ORDER BY created_at DESC` is correct on both
         // SQLite and Postgres.
         let rows = sqlx::query(
-            "SELECT user_id, variant_id, value, deviation, game_id, created_at \
+            "SELECT user_id, variant_id, time_class, value, deviation, game_id, created_at \
              FROM rating_history \
-             WHERE user_id = $1 AND variant_id = $2 \
+             WHERE user_id = $1 AND variant_id = $2 AND time_class = $3 \
              ORDER BY created_at DESC \
-             LIMIT $3",
+             LIMIT $4",
         )
         .bind(user.to_string())
         .bind(variant_id)
+        .bind(time_class.as_str())
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?;

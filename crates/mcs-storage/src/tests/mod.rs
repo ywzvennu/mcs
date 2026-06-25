@@ -32,7 +32,7 @@ use memory::{
 };
 use time::OffsetDateTime;
 
-use mcs_domain::Rating;
+use mcs_domain::{Rating, TimeClass};
 
 use crate::{
     ActionLogRepo, ChallengeRepo, GameRepo, RatingHistoryRepo, RatingRepo, RecordedAction,
@@ -715,7 +715,10 @@ async fn challenge_repo_purge_resolved_removes_only_old_declined_and_canceled() 
 #[tokio::test]
 async fn rating_repo_get_missing_returns_none() {
     let repo = MemoryRatingRepo::default();
-    let result = repo.get(UserId::new(), "standard").await.unwrap();
+    let result = repo
+        .get(UserId::new(), "standard", TimeClass::Blitz)
+        .await
+        .unwrap();
     assert!(result.is_none());
 }
 
@@ -729,8 +732,10 @@ async fn rating_repo_upsert_then_get() {
         volatility: 0.05,
     };
 
-    repo.upsert(user, "standard", &rating).await.unwrap();
-    let fetched = repo.get(user, "standard").await.unwrap();
+    repo.upsert(user, "standard", TimeClass::Blitz, &rating)
+        .await
+        .unwrap();
+    let fetched = repo.get(user, "standard", TimeClass::Blitz).await.unwrap();
     let fetched = fetched.expect("rating must exist after upsert");
     assert_eq!(fetched.value, rating.value);
     assert_eq!(fetched.deviation, rating.deviation);
@@ -747,17 +752,21 @@ async fn rating_repo_upsert_overwrites() {
         deviation: 350.0,
         volatility: 0.06,
     };
-    repo.upsert(user, "standard", &first).await.unwrap();
+    repo.upsert(user, "standard", TimeClass::Blitz, &first)
+        .await
+        .unwrap();
 
     let second = Rating {
         value: 1620.0,
         deviation: 180.0,
         volatility: 0.05,
     };
-    repo.upsert(user, "standard", &second).await.unwrap();
+    repo.upsert(user, "standard", TimeClass::Blitz, &second)
+        .await
+        .unwrap();
 
     let fetched = repo
-        .get(user, "standard")
+        .get(user, "standard", TimeClass::Blitz)
         .await
         .unwrap()
         .expect("rating must exist");
@@ -777,10 +786,15 @@ async fn rating_repo_leaderboard_order_and_limit() {
             deviation: 200.0,
             volatility: 0.06,
         };
-        repo.upsert(*uid, "standard", &r).await.unwrap();
+        repo.upsert(*uid, "standard", TimeClass::Blitz, &r)
+            .await
+            .unwrap();
     }
 
-    let board = repo.leaderboard("standard", 3).await.unwrap();
+    let board = repo
+        .leaderboard("standard", TimeClass::Blitz, 3)
+        .await
+        .unwrap();
     assert_eq!(board.len(), 3);
     // Must be descending by value.
     assert!(board.windows(2).all(|w| w[0].1.value >= w[1].1.value));
@@ -794,6 +808,7 @@ async fn rating_repo_leaderboard_variant_isolation() {
     repo.upsert(
         user,
         "standard",
+        TimeClass::Blitz,
         &Rating {
             value: 1500.0,
             deviation: 200.0,
@@ -804,8 +819,77 @@ async fn rating_repo_leaderboard_variant_isolation() {
     .unwrap();
 
     // A different variant must not appear in the leaderboard.
-    let board = repo.leaderboard("chess960", 10).await.unwrap();
+    let board = repo
+        .leaderboard("chess960", TimeClass::Blitz, 10)
+        .await
+        .unwrap();
     assert!(board.is_empty());
+}
+
+#[tokio::test]
+async fn rating_repo_leaderboard_time_class_isolation() {
+    let repo = MemoryRatingRepo::default();
+    let user = UserId::new();
+    repo.upsert(
+        user,
+        "standard",
+        TimeClass::Blitz,
+        &Rating {
+            value: 1500.0,
+            deviation: 200.0,
+            volatility: 0.06,
+        },
+    )
+    .await
+    .unwrap();
+
+    // The same (user, variant) in a different time class must not leak in.
+    let board = repo
+        .leaderboard("standard", TimeClass::Rapid, 10)
+        .await
+        .unwrap();
+    assert!(board.is_empty());
+}
+
+#[tokio::test]
+async fn rating_repo_time_class_keys_distinct_ratings() {
+    let repo = MemoryRatingRepo::default();
+    let user = UserId::new();
+
+    let blitz = Rating {
+        value: 1700.0,
+        deviation: 80.0,
+        volatility: 0.05,
+    };
+    let rapid = Rating {
+        value: 1400.0,
+        deviation: 90.0,
+        volatility: 0.05,
+    };
+    repo.upsert(user, "standard", TimeClass::Blitz, &blitz)
+        .await
+        .unwrap();
+    repo.upsert(user, "standard", TimeClass::Rapid, &rapid)
+        .await
+        .unwrap();
+
+    // Each (variant, time_class) holds its own independent rating.
+    assert_eq!(
+        repo.get(user, "standard", TimeClass::Blitz)
+            .await
+            .unwrap()
+            .unwrap()
+            .value,
+        1700.0
+    );
+    assert_eq!(
+        repo.get(user, "standard", TimeClass::Rapid)
+            .await
+            .unwrap()
+            .unwrap()
+            .value,
+        1400.0
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -877,17 +961,31 @@ async fn set_username_unknown_user_is_not_found() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn rating_list_for_user_returns_all_variants() {
+async fn rating_list_for_user_returns_all_variants_and_time_classes() {
     let repo = MemoryRatingRepo::default();
     let user = UserId::new();
     let other = UserId::new();
 
-    repo.upsert(user, "standard", &Rating::default())
+    // Same variant, two time classes — both must be listed independently.
+    repo.upsert(user, "standard", TimeClass::Blitz, &Rating::default())
         .await
         .unwrap();
     repo.upsert(
         user,
+        "standard",
+        TimeClass::Rapid,
+        &Rating {
+            value: 1400.0,
+            deviation: 90.0,
+            volatility: 0.05,
+        },
+    )
+    .await
+    .unwrap();
+    repo.upsert(
+        user,
         "chess960",
+        TimeClass::Blitz,
         &Rating {
             value: 1600.0,
             deviation: 120.0,
@@ -897,15 +995,16 @@ async fn rating_list_for_user_returns_all_variants() {
     .await
     .unwrap();
     // A different user's rating must not leak in.
-    repo.upsert(other, "standard", &Rating::default())
+    repo.upsert(other, "standard", TimeClass::Blitz, &Rating::default())
         .await
         .unwrap();
 
     let ratings = repo.list_for_user(user).await.unwrap();
-    assert_eq!(ratings.len(), 2);
-    let variants: Vec<&str> = ratings.iter().map(|(v, _)| v.as_str()).collect();
-    assert!(variants.contains(&"standard"));
-    assert!(variants.contains(&"chess960"));
+    assert_eq!(ratings.len(), 3);
+    let keys: Vec<(&str, TimeClass)> = ratings.iter().map(|(v, tc, _)| (v.as_str(), *tc)).collect();
+    assert!(keys.contains(&("standard", TimeClass::Blitz)));
+    assert!(keys.contains(&("standard", TimeClass::Rapid)));
+    assert!(keys.contains(&("chess960", TimeClass::Blitz)));
 
     // A user with no ratings yields an empty list.
     assert!(repo.list_for_user(UserId::new()).await.unwrap().is_empty());
@@ -915,10 +1014,17 @@ async fn rating_list_for_user_returns_all_variants() {
 // RatingHistoryRepo
 // ---------------------------------------------------------------------------
 
-fn history_entry(user: UserId, variant: &str, value: f64, secs: i64) -> RatingHistoryEntry {
+fn history_entry(
+    user: UserId,
+    variant: &str,
+    time_class: TimeClass,
+    value: f64,
+    secs: i64,
+) -> RatingHistoryEntry {
     RatingHistoryEntry {
         user_id: user,
         variant_id: variant.to_owned(),
+        time_class,
         value,
         deviation: 100.0,
         game_id: GameId::new(),
@@ -931,17 +1037,38 @@ async fn rating_history_record_and_list_most_recent_first() {
     let repo = MemoryRatingHistoryRepo::default();
     let user = UserId::new();
 
-    repo.record(&history_entry(user, "standard", 1500.0, 0))
-        .await
-        .unwrap();
-    repo.record(&history_entry(user, "standard", 1520.0, 10))
-        .await
-        .unwrap();
-    repo.record(&history_entry(user, "standard", 1490.0, 20))
-        .await
-        .unwrap();
+    repo.record(&history_entry(
+        user,
+        "standard",
+        TimeClass::Blitz,
+        1500.0,
+        0,
+    ))
+    .await
+    .unwrap();
+    repo.record(&history_entry(
+        user,
+        "standard",
+        TimeClass::Blitz,
+        1520.0,
+        10,
+    ))
+    .await
+    .unwrap();
+    repo.record(&history_entry(
+        user,
+        "standard",
+        TimeClass::Blitz,
+        1490.0,
+        20,
+    ))
+    .await
+    .unwrap();
 
-    let listed = repo.list(user, "standard", 10).await.unwrap();
+    let listed = repo
+        .list(user, "standard", TimeClass::Blitz, 10)
+        .await
+        .unwrap();
     assert_eq!(listed.len(), 3);
     // Most-recent-first by created_at.
     assert_eq!(listed[0].value, 1490.0);
@@ -949,32 +1076,93 @@ async fn rating_history_record_and_list_most_recent_first() {
     assert_eq!(listed[2].value, 1500.0);
 
     // The limit truncates after ordering.
-    let limited = repo.list(user, "standard", 2).await.unwrap();
+    let limited = repo
+        .list(user, "standard", TimeClass::Blitz, 2)
+        .await
+        .unwrap();
     assert_eq!(limited.len(), 2);
     assert_eq!(limited[0].value, 1490.0);
 }
 
 #[tokio::test]
-async fn rating_history_is_scoped_per_user_and_variant() {
+async fn rating_history_is_scoped_per_user_variant_and_time_class() {
     let repo = MemoryRatingHistoryRepo::default();
     let user = UserId::new();
     let other = UserId::new();
 
-    repo.record(&history_entry(user, "standard", 1500.0, 0))
-        .await
-        .unwrap();
-    repo.record(&history_entry(user, "chess960", 1600.0, 0))
-        .await
-        .unwrap();
-    repo.record(&history_entry(other, "standard", 1400.0, 0))
-        .await
-        .unwrap();
+    repo.record(&history_entry(
+        user,
+        "standard",
+        TimeClass::Blitz,
+        1500.0,
+        0,
+    ))
+    .await
+    .unwrap();
+    // Same (user, variant) but a different time class — a separate trail.
+    repo.record(&history_entry(
+        user,
+        "standard",
+        TimeClass::Rapid,
+        1480.0,
+        0,
+    ))
+    .await
+    .unwrap();
+    repo.record(&history_entry(
+        user,
+        "chess960",
+        TimeClass::Blitz,
+        1600.0,
+        0,
+    ))
+    .await
+    .unwrap();
+    repo.record(&history_entry(
+        other,
+        "standard",
+        TimeClass::Blitz,
+        1400.0,
+        0,
+    ))
+    .await
+    .unwrap();
 
-    assert_eq!(repo.list(user, "standard", 10).await.unwrap().len(), 1);
-    assert_eq!(repo.list(user, "chess960", 10).await.unwrap().len(), 1);
-    assert_eq!(repo.list(other, "standard", 10).await.unwrap().len(), 1);
-    // An empty (user, variant) combination yields no rows.
-    assert!(repo.list(user, "atomic", 10).await.unwrap().is_empty());
+    assert_eq!(
+        repo.list(user, "standard", TimeClass::Blitz, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    // A blitz query must not see the rapid snapshot.
+    assert_eq!(
+        repo.list(user, "standard", TimeClass::Rapid, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        repo.list(user, "chess960", TimeClass::Blitz, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        repo.list(other, "standard", TimeClass::Blitz, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    // An empty (user, variant, time_class) combination yields no rows.
+    assert!(repo
+        .list(user, "atomic", TimeClass::Blitz, 10)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 // ---------------------------------------------------------------------------
