@@ -83,6 +83,11 @@ jobs:
           cargo test -p mcs-server --test cluster_redis -- --ignored
           --test-threads=1
 
+      - name: Run mcs-server multi-node failover integration test
+        run: >
+          cargo test -p mcs-server --test failover_redis -- --ignored
+          --test-threads=1
+
   # ---------------------------------------------------------------------------
   # Postgres compile check — ensures the postgres feature compiles cleanly and
   # passes clippy. No tests are run; a live Postgres instance is not provisioned.

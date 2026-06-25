@@ -79,3 +79,8 @@ mcs-variant-rbc = { path = "../mcs-variant-rbc" }
 tokio-tungstenite = "0.24"
 # `SinkExt`/`StreamExt` for driving the tungstenite client stream in tests.
 futures = { workspace = true }
+# Property/fuzz testing of the untrusted WebSocket protocol parsers and a
+# concurrency load test (#110). MIT/Apache-2.0, so it passes the cargo-deny
+# license check. Pinned here (member dev-deps are allowed; the root manifest is
+# off-limits).
+proptest = "1"
