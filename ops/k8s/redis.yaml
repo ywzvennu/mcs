@@ -1,0 +1,107 @@
+# In-cluster Redis — for development / small deployments only.
+#
+# For production, prefer a managed Redis service (AWS ElastiCache,
+# GCP Memorystore, Redis Cloud, Upstash, etc.) and set
+# MCS_CLUSTER__REDIS_URL in the ConfigMap to point at it.
+# If using a managed Redis, delete this file and the mcs-redis Service.
+#
+# This manifest deploys a single Redis 7 pod with AOF persistence.
+# It is NOT highly available on its own; for HA use Redis Sentinel or
+# Redis Cluster, or a managed service.
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcs-redis
+  namespace: mcs
+  labels:
+    app.kubernetes.io/name: mcs
+    app.kubernetes.io/component: redis
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mcs
+    app.kubernetes.io/component: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mcs-redis
+  namespace: mcs
+  labels:
+    app.kubernetes.io/name: mcs
+    app.kubernetes.io/component: redis
+spec:
+  serviceName: mcs-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mcs
+      app.kubernetes.io/component: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mcs
+        app.kubernetes.io/component: redis
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

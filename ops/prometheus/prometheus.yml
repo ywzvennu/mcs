@@ -1,0 +1,75 @@
+# Prometheus scrape configuration for MCS (Multi Chess Server).
+#
+# Usage:
+#   promtool check config ops/prometheus/prometheus.yml
+#
+# Adjust `targets` to point at your actual mcs-server addresses.
+# When running inside Kubernetes the recommended approach is to use
+# the `kubernetes_sd_configs` service-discovery block instead of
+# static targets; see the inline comments below.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  # Attach these labels to every time-series scraped from this config.
+  external_labels:
+    cluster: mcs-prod
+
+# Load alerting rules from the companion file.
+rule_files:
+  - alerts.yml
+
+# ---------------------------------------------------------------------------
+# Alertmanager (optional)
+# ---------------------------------------------------------------------------
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+
+# ---------------------------------------------------------------------------
+# Scrape configs
+# ---------------------------------------------------------------------------
+scrape_configs:
+
+  # ── MCS server nodes (static) ─────────────────────────────────────────────
+  # Replace with real hostnames / pod IPs or switch to kubernetes_sd_configs.
+  - job_name: mcs
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - mcs-server:8080
+        labels:
+          env: production
+    # TLS + basic-auth examples (uncomment when applicable):
+    # scheme: https
+    # tls_config:
+    #   ca_file: /etc/prometheus/ca.crt
+    # basic_auth:
+    #   username: prometheus
+    #   password_file: /etc/prometheus/scrape-password
+
+  # ── Kubernetes pod auto-discovery (alternative to static targets) ──────────
+  # Uncomment this block and remove the static_configs block above to use
+  # Kubernetes service discovery instead.  The server pods must carry the
+  # annotation `prometheus.io/scrape: "true"`.
+  #
+  # - job_name: mcs-k8s
+  #   metrics_path: /metrics
+  #   kubernetes_sd_configs:
+  #     - role: pod
+  #       namespaces:
+  #         names: [mcs]
+  #   relabel_configs:
+  #     - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+  #       action: keep
+  #       regex: "true"
+  #     - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+  #       action: replace
+  #       target_label: __address__
+  #       regex: (.+)
+  #       replacement: "${1}"
+  #     - source_labels: [__meta_kubernetes_namespace]
+  #       target_label: namespace
+  #     - source_labels: [__meta_kubernetes_pod_name]
+  #       target_label: pod

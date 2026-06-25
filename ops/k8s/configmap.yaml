@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcs-config
+  namespace: mcs
+  labels:
+    app.kubernetes.io/name: mcs
+    app.kubernetes.io/component: server
+data:
+  # Run mode — strict production validation at startup.
+  MCS_ENV: "production"
+
+  # Bind address — listen on all interfaces inside the pod.
+  MCS_BIND: "0.0.0.0:8080"
+
+  # Structured JSON logs are friendlier for log aggregators (Loki, CloudWatch, etc.).
+  MCS_LOG__FORMAT: "json"
+  MCS_LOG__LEVEL: "info"
+
+  # Session token lifetime (24 h).
+  MCS_SESSION__TTL_SECS: "86400"
+  MCS_SESSION__ISSUER: "mcs"
+
+  # SIWE — set these to your actual domain before deploying.
+  MCS_SIWE__DOMAIN: "mcs.example.com"
+  MCS_SIWE__URI: "https://mcs.example.com"
+  MCS_SIWE__CHAIN_ID: "1"
+  MCS_SIWE__STATEMENT: "Sign in to MCS."
+  MCS_SIWE__NONCE_TTL_SECS: "600"
+
+  # Database pool.  Tune max_connections so that
+  # replicas * max_connections stays well under Postgres max_connections.
+  MCS_DATABASE__MAX_CONNECTIONS: "10"
+  MCS_DATABASE__ACQUIRE_TIMEOUT_SECS: "30"
+  MCS_DATABASE__IDLE_TIMEOUT_SECS: "600"
+  MCS_DATABASE__MAX_LIFETIME_SECS: "1800"
+  MCS_DATABASE__STATEMENT_TIMEOUT_SECS: "30"
+
+  # HTTP hardening.  HSTS is enabled because TLS is terminated by the Ingress.
+  MCS_HTTP__HSTS: "true"
+  MCS_HTTP__REQUEST_TIMEOUT_SECS: "30"
+  MCS_HTTP__MAX_BODY_BYTES: "65536"
+
+  # Trust the X-Forwarded-For header from the ingress controller.
+  MCS_LIMITS__TRUSTED_PROXY_HEADER: "x-forwarded-for"
+  MCS_LIMITS__MAX_WS_CONNECTIONS: "10000"
+  MCS_LIMITS__MAX_WS_CONNECTIONS_PER_USER: "20"
+  MCS_LIMITS__MAX_GAMES_PER_USER: "50"
+
+  # CORS — list the browser origins that should be allowed to call this API.
+  # Example: MCS_CORS__ALLOWED_ORIGINS: '["https://app.example.com"]'
+  MCS_CORS__ALLOWED_ORIGINS: "[]"
+  MCS_CORS__ALLOW_CREDENTIALS: "true"
+
+  # Cluster mode — uses the pod name (via Downward API in the Deployment) as
+  # the stable node ID so each replica is uniquely identified.
+  MCS_CLUSTER__ENABLED: "true"
+  # MCS_CLUSTER__NODE_ID is injected per-pod via the Downward API fieldRef.
+  MCS_CLUSTER__REDIS_URL: "redis://mcs-redis:6379"
+  MCS_CLUSTER__HEARTBEAT_TTL_SECS: "15"
+  MCS_CLUSTER__HEARTBEAT_INTERVAL_SECS: "5"
+
+  # Retention / GC — clean up stale seeks and resolved challenges hourly.
+  MCS_RETENTION__ENABLED: "true"
+  MCS_RETENTION__INTERVAL_SECS: "3600"
+  MCS_RETENTION__SEEK_MAX_AGE_SECS: "86400"
+  MCS_RETENTION__CHALLENGE_MAX_AGE_SECS: "86400"

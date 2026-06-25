@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcs-server
+  namespace: mcs
+  labels:
+    app.kubernetes.io/name: mcs
+    app.kubernetes.io/component: server
+  annotations:
+    # Prometheus service monitor annotation (used by ServiceMonitor CRD if
+    # prometheus-operator is installed in the cluster).
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+spec:
+  # ClusterIP is appropriate: external traffic enters via the Ingress.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mcs
+    app.kubernetes.io/component: server
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
