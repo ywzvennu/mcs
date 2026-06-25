@@ -361,6 +361,13 @@ mod tests {
             let map = self.inner.lock().await;
             Ok(map.values().cloned().collect())
         }
+
+        async fn purge_stale(&self, older_than: time::OffsetDateTime) -> StorageResult<u64> {
+            let mut map = self.inner.lock().await;
+            let before = map.len();
+            map.retain(|_, seek| seek.created_at >= older_than);
+            Ok((before - map.len()) as u64)
+        }
     }
 
     // -----------------------------------------------------------------------

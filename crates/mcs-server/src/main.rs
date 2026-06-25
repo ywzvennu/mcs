@@ -42,8 +42,9 @@ async fn main() -> anyhow::Result<()> {
     let session_secret = resolve_session_secret(&cfg);
 
     // `cluster` is `Some` only when cluster mode is enabled; single-node it is
-    // `None` and the server runs exactly as before.
-    let (app, cluster) = build_app(&cfg, session_secret)
+    // `None` and the server runs exactly as before. `retention_token` stops the
+    // GC background task on graceful shutdown.
+    let (app, cluster, retention_token) = build_app(&cfg, session_secret)
         .await
         .context("building the application")?;
 
@@ -68,8 +69,11 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("serving HTTP")?;
 
-    // Graceful shutdown drained; leave the cluster registry promptly so survivors
-    // notice this node's departure without waiting for its TTL to lapse.
+    // Graceful shutdown drained. Stop the retention task first (it holds no
+    // connections open, so this is instant) then leave the cluster registry
+    // promptly so survivors notice this node's departure without waiting for
+    // its TTL to lapse.
+    retention_token.cancel();
     if let Some(cluster) = cluster {
         cluster.shutdown().await;
     }

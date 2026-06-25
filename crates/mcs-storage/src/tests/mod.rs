@@ -25,16 +25,16 @@ use mcs_domain::{
     ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Seek, TimeControl, User, UserId,
 };
 use memory::{
-    InMemoryRepos, MemoryActionLogRepo, MemoryGameRepo, MemoryRatingRepo, MemoryRevokedTokenRepo,
-    MemorySeekRepo, MemorySessionRepo, MemoryUserRepo,
+    InMemoryRepos, MemoryActionLogRepo, MemoryChallengeRepo, MemoryGameRepo, MemoryRatingRepo,
+    MemoryRevokedTokenRepo, MemorySeekRepo, MemorySessionRepo, MemoryUserRepo,
 };
 use time::OffsetDateTime;
 
 use mcs_domain::Rating;
 
 use crate::{
-    ActionLogRepo, GameRepo, RatingRepo, RecordedAction, Repositories, RevokedTokenRepo, SeekRepo,
-    SessionRepo, StorageError, UserRepo,
+    ActionLogRepo, ChallengeRepo, GameRepo, RatingRepo, RecordedAction, Repositories,
+    RevokedTokenRepo, SeekRepo, SessionRepo, StorageError, UserRepo,
 };
 
 // ---------------------------------------------------------------------------
@@ -503,6 +503,147 @@ async fn revoked_token_purge_expired_drops_only_elapsed() {
     assert_eq!(removed, 1, "only the expired entry is purged");
     assert!(!repo.is_revoked("old").await.unwrap());
     assert!(repo.is_revoked("fresh").await.unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// SessionRepo — purge_expired_nonces
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn session_repo_purge_expired_nonces_removes_only_expired() {
+    let repo = MemorySessionRepo::default();
+    let addr = sample_address();
+    let now = OffsetDateTime::now_utc();
+
+    // Store an expired nonce (past) and a live nonce (future).
+    repo.store_nonce(&addr, "expired", now - time::Duration::minutes(5))
+        .await
+        .unwrap();
+    repo.store_nonce(&addr, "live", now + time::Duration::minutes(5))
+        .await
+        .unwrap();
+
+    let removed = repo.purge_expired_nonces(now).await.unwrap();
+    assert_eq!(removed, 1, "only the expired nonce is purged");
+
+    // The live nonce is still consumable.
+    assert!(repo.consume_nonce(&addr, "live").await.unwrap());
+    // The expired nonce is gone.
+    assert!(!repo.consume_nonce(&addr, "expired").await.unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// SeekRepo — purge_stale
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn seek_repo_purge_stale_removes_only_old_seeks() {
+    let repo = MemorySeekRepo::default();
+    let now = OffsetDateTime::now_utc();
+
+    let old = Seek::new(
+        UserId::new(),
+        "standard".to_owned(),
+        mcs_domain::TimeControl::Unlimited,
+        mcs_domain::ColorPreference::Random,
+        true,
+        now - time::Duration::hours(2),
+    );
+    let fresh = Seek::new(
+        UserId::new(),
+        "standard".to_owned(),
+        mcs_domain::TimeControl::Unlimited,
+        mcs_domain::ColorPreference::Random,
+        true,
+        now,
+    );
+
+    repo.create(&old).await.unwrap();
+    repo.create(&fresh).await.unwrap();
+
+    let cutoff = now - time::Duration::hours(1);
+    let removed = repo.purge_stale(cutoff).await.unwrap();
+    assert_eq!(removed, 1, "only the old seek is purged");
+
+    let open = repo.list_open().await.unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].id, fresh.id);
+}
+
+// ---------------------------------------------------------------------------
+// ChallengeRepo — purge_resolved
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn challenge_repo_purge_resolved_removes_only_old_declined_and_canceled() {
+    use mcs_domain::Challenge;
+
+    let repo = MemoryChallengeRepo::default();
+    let now = OffsetDateTime::now_utc();
+    let old_ts = now - time::Duration::hours(2);
+    let fresh_ts = now;
+    let cutoff = now - time::Duration::hours(1);
+
+    // Old declined — should be purged.
+    let mut old_declined = Challenge::new(
+        UserId::new(),
+        UserId::new(),
+        "standard".to_owned(),
+        TimeControl::Unlimited,
+        true,
+        ColorPreference::Random,
+        old_ts,
+    );
+    repo.create(&old_declined).await.unwrap();
+    old_declined.decline();
+    repo.update(&old_declined).await.unwrap();
+
+    // Old canceled — should be purged.
+    let mut old_canceled = Challenge::new(
+        UserId::new(),
+        UserId::new(),
+        "standard".to_owned(),
+        TimeControl::Unlimited,
+        true,
+        ColorPreference::Random,
+        old_ts,
+    );
+    repo.create(&old_canceled).await.unwrap();
+    old_canceled.cancel();
+    repo.update(&old_canceled).await.unwrap();
+
+    // Fresh declined — should NOT be purged (within retention window).
+    let mut fresh_declined = Challenge::new(
+        UserId::new(),
+        UserId::new(),
+        "standard".to_owned(),
+        TimeControl::Unlimited,
+        true,
+        ColorPreference::Random,
+        fresh_ts,
+    );
+    repo.create(&fresh_declined).await.unwrap();
+    fresh_declined.decline();
+    repo.update(&fresh_declined).await.unwrap();
+
+    // Old pending — should NOT be purged (still pending, not resolved).
+    let pending = Challenge::new(
+        UserId::new(),
+        UserId::new(),
+        "standard".to_owned(),
+        TimeControl::Unlimited,
+        true,
+        ColorPreference::Random,
+        old_ts,
+    );
+    repo.create(&pending).await.unwrap();
+
+    let removed = repo.purge_resolved(cutoff).await.unwrap();
+    assert_eq!(removed, 2, "old declined and canceled are purged");
+
+    // Fresh declined and old pending still exist.
+    assert!(repo.get(fresh_declined.id).await.is_ok());
+    assert!(repo.get(pending.id).await.is_ok());
 }
 
 // ---------------------------------------------------------------------------

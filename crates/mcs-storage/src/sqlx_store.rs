@@ -848,6 +848,17 @@ impl SeekRepo for SqlxStorage {
         .await?;
         rows.iter().map(seek_from_row).collect()
     }
+
+    async fn purge_stale(&self, older_than: OffsetDateTime) -> StorageResult<u64> {
+        // Delete open seeks that predate the cutoff. The lexicographic
+        // comparison is sound because both sides are RFC 3339 UTC timestamps.
+        let affected = sqlx::query("DELETE FROM seeks WHERE created_at < $1")
+            .bind(encode_time(older_than)?)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(affected)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -922,6 +933,22 @@ impl ChallengeRepo for SqlxStorage {
         }
         Ok(())
     }
+
+    async fn purge_resolved(&self, older_than: OffsetDateTime) -> StorageResult<u64> {
+        // Delete declined and canceled challenges older than the cutoff.
+        // Accepted challenges are attached to a game and kept for history.
+        // The lexicographic comparison is sound because both sides are RFC 3339
+        // UTC timestamps.
+        let affected =
+            sqlx::query("DELETE FROM challenges WHERE status IN ($1, $2) AND created_at < $3")
+                .bind(encode_challenge_status(ChallengeStatus::Declined))
+                .bind(encode_challenge_status(ChallengeStatus::Canceled))
+                .bind(encode_time(older_than)?)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+        Ok(affected)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -971,6 +998,17 @@ impl SessionRepo for SqlxStorage {
         .rows_affected();
 
         Ok(affected > 0)
+    }
+
+    async fn purge_expired_nonces(&self, now: OffsetDateTime) -> StorageResult<u64> {
+        // Drop nonces whose expiry has already passed. The lexicographic
+        // comparison is sound because both sides are RFC 3339 UTC timestamps.
+        let affected = sqlx::query("DELETE FROM auth_nonces WHERE expires_at <= $1")
+            .bind(encode_time(now)?)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(affected)
     }
 }
 
