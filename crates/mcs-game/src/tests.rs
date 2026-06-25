@@ -20,7 +20,7 @@ use mcs_variant_standard::register;
 use mcs_variant_standard::wire::StandardAction;
 use time::OffsetDateTime;
 
-use crate::{GameActor, GameCompletionHook, GameSessionError, NoopHook};
+use crate::{GameActor, GameCompletionHook, GameSessionError, LocalEventBus, NoopHook};
 
 // --------------------------------------------------------------------------
 // In-memory GameRepo mock.
@@ -683,6 +683,7 @@ async fn move_events_carry_live_clock_snapshots() {
         MockActionLogRepo::new(),
         Arc::new(NoopHook),
         tc,
+        Arc::new(LocalEventBus::new()),
         Box::new(SharedTimeSource(time.clone())),
     );
 
@@ -727,6 +728,7 @@ async fn player_who_stops_moving_loses_on_time() {
         MockActionLogRepo::new(),
         Arc::new(NoopHook),
         tc,
+        Arc::new(LocalEventBus::new()),
         Box::new(SharedTimeSource(time.clone())),
     );
 
@@ -773,6 +775,7 @@ async fn moving_after_flagging_is_rejected() {
         MockActionLogRepo::new(),
         Arc::new(NoopHook),
         tc,
+        Arc::new(LocalEventBus::new()),
         Box::new(SharedTimeSource(time.clone())),
     );
 
@@ -802,6 +805,7 @@ async fn unlimited_game_never_flags_and_omits_clock() {
         MockActionLogRepo::new(),
         Arc::new(NoopHook),
         TimeControl::Unlimited,
+        Arc::new(LocalEventBus::new()),
         Box::new(SharedTimeSource(time.clone())),
     );
 
@@ -1016,6 +1020,7 @@ async fn each_applied_move_is_recorded_and_snapshots_the_live_game() {
         log.clone(),
         Arc::new(NoopHook),
         tc,
+        Arc::new(LocalEventBus::new()),
         Box::new(SharedTimeSource(time.clone())),
     );
 
@@ -1213,6 +1218,7 @@ async fn resumed_actor_continues_recording_at_the_seeded_ply() {
             white: Duration::from_secs(280),
             black: Duration::from_secs(290),
         },
+        Arc::new(LocalEventBus::new()),
         Box::new(SharedTimeSource(time.clone())),
     );
 
@@ -1265,6 +1271,7 @@ async fn resumed_clock_does_not_charge_downtime() {
             white: Duration::from_secs(300),
             black: Duration::from_secs(250),
         },
+        Arc::new(LocalEventBus::new()),
         Box::new(SharedTimeSource(time.clone())),
     );
 

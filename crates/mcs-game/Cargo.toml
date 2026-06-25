@@ -21,6 +21,12 @@ mcs-domain.workspace = true
 # A `path` dep is required because `default-features = false` is ignored when a
 # dependency is inherited via `workspace = true`.
 mcs-storage = { path = "../mcs-storage", default-features = false }
+# The cross-node event bus (#109): the actor publishes a spectator-safe frame on
+# each applied action through an `Arc<dyn EventBus>`. Referenced by path with NO
+# Redis feature — the actor only ever holds the trait object; the default
+# `LocalEventBus` needs no backend, and `mcs-server` supplies a `RedisEventBus`
+# when cluster mode is enabled.
+mcs-cluster = { path = "../mcs-cluster" }
 tokio.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true

@@ -14,6 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use mcs_cluster::{EventBus, LocalEventBus};
 use mcs_core::{
     Action, ActionEffect, Color, EndReason, GameSession, GameStatus, Outcome, PlayerView,
 };
@@ -27,6 +28,7 @@ use crate::clock::ClockEngine;
 use crate::completion::GameCompletionHook;
 use crate::error::GameSessionError;
 use crate::event::GameEvent;
+use crate::spectator::{spectator_topic, SpectatorFrame};
 use crate::time_source::{SystemTimeSource, TimeSource};
 
 /// How many `GameEvent`s the broadcast channel retains for slow subscribers
@@ -414,6 +416,17 @@ pub struct GameActor {
     /// game-ending action (which the session would already reject) can never
     /// trigger a redundant write.
     persisted: bool,
+    /// The cross-node event bus (#109). After each applied action — and on a
+    /// finish or timeout — the actor publishes a spectator-safe
+    /// [`SpectatorFrame`] to this bus on the game's
+    /// [`spectator_topic`](crate::spectator_topic), so a spectator connected to
+    /// any node can stream the game. The default [`LocalEventBus`] keeps this
+    /// in-process (single-node behaviour is unchanged); a `RedisEventBus`
+    /// fans it out across the cluster.
+    bus: Arc<dyn EventBus>,
+    /// The pre-computed `game:{id}:spectator` topic this actor publishes on,
+    /// cached so each move avoids re-formatting it.
+    spectator_topic: String,
 }
 
 impl std::fmt::Debug for GameActor {
@@ -466,6 +479,41 @@ impl GameActor {
         hook: Arc<dyn GameCompletionHook>,
         time_control: TimeControl,
     ) -> GameHandle {
+        // No bus supplied: default to a fresh in-process `LocalEventBus`. Its
+        // spectator frames go nowhere (no subscriber to that private bus), so
+        // this is byte-for-byte the pre-#109 behaviour — exactly what the
+        // existing single-game tests and callers expect.
+        Self::spawn_with_bus(
+            game_id,
+            session,
+            repo,
+            action_log,
+            hook,
+            time_control,
+            Arc::new(LocalEventBus::new()),
+        )
+    }
+
+    /// Like [`spawn`](GameActor::spawn) but with an injected cross-node
+    /// [`EventBus`] (#109).
+    ///
+    /// This is the production entry point the API uses: it hands the actor the
+    /// *shared* bus so the spectator-safe frames published after each move reach
+    /// subscribers — in-process with the default [`LocalEventBus`], or across the
+    /// cluster with a `RedisEventBus`. [`spawn`](GameActor::spawn) is the
+    /// convenience wrapper that supplies a private local bus for callers (and
+    /// tests) that do not fan out to spectators.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn spawn_with_bus(
+        game_id: GameId,
+        session: Box<dyn GameSession>,
+        repo: Arc<dyn GameRepo>,
+        action_log: Arc<dyn ActionLogRepo>,
+        hook: Arc<dyn GameCompletionHook>,
+        time_control: TimeControl,
+        bus: Arc<dyn EventBus>,
+    ) -> GameHandle {
         Self::spawn_with_time_source(
             game_id,
             session,
@@ -473,15 +521,19 @@ impl GameActor {
             action_log,
             hook,
             time_control,
+            bus,
             Box::new(SystemTimeSource),
         )
     }
 
-    /// Like [`spawn`](GameActor::spawn) but with an injected [`TimeSource`].
+    /// Like [`spawn_with_bus`](GameActor::spawn_with_bus) but with an injected
+    /// [`TimeSource`].
     ///
     /// Used by tests to drive "now" and flag-deadline sleeps deterministically;
-    /// production code uses [`spawn`](GameActor::spawn), which supplies the real
-    /// wall clock.
+    /// production code uses [`spawn`](GameActor::spawn) /
+    /// [`spawn_with_bus`](GameActor::spawn_with_bus), which supply the real wall
+    /// clock.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_with_time_source(
         game_id: GameId,
         session: Box<dyn GameSession>,
@@ -489,6 +541,7 @@ impl GameActor {
         action_log: Arc<dyn ActionLogRepo>,
         hook: Arc<dyn GameCompletionHook>,
         time_control: TimeControl,
+        bus: Arc<dyn EventBus>,
         time: Box<dyn TimeSource>,
     ) -> GameHandle {
         // A fresh game starts at ply 0 with both clocks at their full budget.
@@ -500,6 +553,7 @@ impl GameActor {
             hook,
             time_control,
             None,
+            bus,
             time,
         )
     }
@@ -543,6 +597,7 @@ impl GameActor {
         time_control: TimeControl,
         start_ply: u32,
         clock_remaining: ClockRemaining,
+        bus: Arc<dyn EventBus>,
     ) -> GameHandle {
         Self::spawn_resumed_with_time_source(
             game_id,
@@ -553,6 +608,7 @@ impl GameActor {
             time_control,
             start_ply,
             clock_remaining,
+            bus,
             Box::new(SystemTimeSource),
         )
     }
@@ -569,6 +625,7 @@ impl GameActor {
         time_control: TimeControl,
         start_ply: u32,
         clock_remaining: ClockRemaining,
+        bus: Arc<dyn EventBus>,
         time: Box<dyn TimeSource>,
     ) -> GameHandle {
         Self::spawn_inner(
@@ -579,6 +636,7 @@ impl GameActor {
             hook,
             time_control,
             Some((start_ply, clock_remaining)),
+            bus,
             time,
         )
     }
@@ -597,6 +655,7 @@ impl GameActor {
         hook: Arc<dyn GameCompletionHook>,
         time_control: TimeControl,
         resume: Option<(u32, ClockRemaining)>,
+        bus: Arc<dyn EventBus>,
         time: Box<dyn TimeSource>,
     ) -> GameHandle {
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
@@ -643,6 +702,8 @@ impl GameActor {
             time,
             timed_out: None,
             persisted: false,
+            bus,
+            spectator_topic: spectator_topic(game_id),
         };
 
         tokio::spawn(actor.run(commands_rx));
@@ -737,11 +798,16 @@ impl GameActor {
         let status = GameStatus::Finished(outcome.clone());
         // Freeze the clock snapshot at the flag instant for the final event.
         let snapshot = self.clock.as_ref().map(|c| c.snapshot(now));
-        let event = match snapshot {
-            Some(clock) => GameEvent::with_clock(Vec::new(), status, clock),
-            None => GameEvent::new(Vec::new(), status),
+        let event = match &snapshot {
+            Some(clock) => GameEvent::with_clock(Vec::new(), status.clone(), clock.clone()),
+            None => GameEvent::new(Vec::new(), status.clone()),
         };
         let _ = self.events.send(event);
+
+        // Publish the final spectator-safe frame so watchers on any node learn
+        // the game ended on time (#109). The status is now `Finished`, so a
+        // hidden-information variant's `spectator_view` may reveal the full game.
+        self.publish_spectator_frame(status, snapshot).await;
 
         if let Err(error) = self.persist_finished(outcome).await {
             tracing::error!(
@@ -885,6 +951,14 @@ impl GameActor {
         self.record_action(player, action, clock_snapshot.as_ref(), finished, now)
             .await?;
 
+        // Publish the spectator-safe frame to the cross-node bus (#109), now that
+        // `record_action` has advanced `next_ply` to the post-move count. The
+        // frame carries the *spectator* view, never a player view, so a
+        // hidden-information variant never leaks a player's secret state to a
+        // watcher. Best-effort: a bus error is logged but never fails the move.
+        self.publish_spectator_frame(effect.status.clone(), clock_snapshot)
+            .await;
+
         // When the game has just finished, durably mark the lifecycle finished
         // and run the completion hook. The snapshot above already captured the
         // final ply and clocks; this is the terminal transition on top of it.
@@ -893,6 +967,43 @@ impl GameActor {
         }
 
         Ok(effect)
+    }
+
+    /// Publishes a spectator-safe [`SpectatorFrame`] to the cross-node event bus
+    /// (#109).
+    ///
+    /// The frame is built from the session's
+    /// [`spectator_view`](GameSession::spectator_view) — **never** a player view
+    /// — so a hidden-information variant (RBC) only ever exposes its redacted
+    /// public view while ongoing, revealing the full game once `status` is
+    /// finished. It carries the post-action `status`, the optional `clock`
+    /// snapshot, and the current half-move count (`self.next_ply`).
+    ///
+    /// Publishing is best-effort, mirroring the in-process broadcast: a serialize
+    /// or bus failure is logged and dropped rather than failing the action. The
+    /// default [`LocalEventBus`] keeps this in-process (single-node unchanged);
+    /// a `RedisEventBus` fans it out to spectators on other nodes.
+    async fn publish_spectator_frame(&self, status: GameStatus, clock: Option<Clock>) {
+        let frame =
+            SpectatorFrame::new(self.session.spectator_view(), status, clock, self.next_ply);
+        let bytes = match frame.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::error!(
+                    game_id = %self.game_id,
+                    %error,
+                    "failed to serialize spectator frame; skipping publish",
+                );
+                return;
+            }
+        };
+        if let Err(error) = self.bus.publish(&self.spectator_topic, &bytes).await {
+            tracing::warn!(
+                game_id = %self.game_id,
+                %error,
+                "failed to publish spectator frame to the event bus",
+            );
+        }
     }
 
     /// Records one applied player action: appends it to the action log at the

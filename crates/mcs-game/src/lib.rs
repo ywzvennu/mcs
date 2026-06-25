@@ -32,6 +32,14 @@
 //!   broadcast event, and ends the game with a
 //!   [`Timeout`](mcs_core::EndReason::Timeout) result — persisted like any other
 //!   ending — when a player flags, including one who simply stops moving.
+//! - For **cross-node spectator broadcast** (#109) the actor also holds an
+//!   `Arc<dyn EventBus>` (re-exported [`EventBus`]) and, after each applied
+//!   action and on finish/timeout, publishes a spectator-safe
+//!   [`SpectatorFrame`] to the game's [`spectator_topic`]. The frame carries the
+//!   session's *spectator* view, never a player view, so hidden-information
+//!   variants never leak. The default [`LocalEventBus`] keeps this in-process
+//!   (single-node behaviour is unchanged); a multi-node deployment injects a
+//!   cross-node bus so a spectator on any node can stream the game.
 //!
 //! ## Variant-agnostic by construction
 //!
@@ -102,6 +110,7 @@ mod error;
 mod event;
 pub mod matchmaking;
 mod recovery;
+mod spectator;
 mod time_source;
 
 pub use actor::{ClockRemaining, GameActor, GameHandle, GameSnapshot};
@@ -111,7 +120,13 @@ pub use error::GameSessionError;
 pub use event::GameEvent;
 pub use matchmaking::{Matchmaker, MatchmakingError, Pairing, SubmitOutcome};
 pub use recovery::{recover_game, RecoveryError};
+pub use spectator::{spectator_topic, SpectatorFrame};
 pub use time_source::{SystemTimeSource, TimeSource};
+
+// Re-export the event-bus trait and the default local bus so callers that spawn
+// actors (and the API/server) can name the bus type without taking a direct
+// `mcs-cluster` dependency where a re-export suffices.
+pub use mcs_cluster::{EventBus, LocalEventBus};
 
 #[cfg(test)]
 mod tests;

@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mcs_api::AppState;
-use mcs_cluster::{NodeRegistry, RedisNodeRegistry};
+use mcs_cluster::{EventBus, NodeRegistry, RedisEventBus, RedisNodeRegistry};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -140,7 +140,17 @@ pub async fn setup(
         interval,
     ));
 
-    let state = state.with_cluster(Arc::clone(&registry), node);
+    // Build the cross-node spectator-broadcast bus (#109) over the same Redis
+    // and inject it into the state, so an actor's spectator frames reach a
+    // watcher on any node and the WS spectator path can subscribe to them. With
+    // cluster mode off this is never reached; the state keeps its in-process
+    // `LocalEventBus` and no bus connection is opened.
+    let bus = RedisEventBus::connect(&cfg.cluster.redis_url).await?;
+    let bus: Arc<dyn EventBus> = Arc::new(bus);
+
+    let state = state
+        .with_cluster(Arc::clone(&registry), node)
+        .with_event_bus(bus);
     Ok((
         state,
         Some(ClusterRuntime {

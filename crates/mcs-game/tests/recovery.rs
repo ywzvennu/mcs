@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use mcs_core::{Action, Color, GameStatus, VariantOptions, VariantRegistry};
 use mcs_domain::{Game, GameLifecycle, TimeControl, UserId};
-use mcs_game::{recover_game, GameActor, GameHandle, NoopHook};
+use mcs_game::{recover_game, GameActor, GameHandle, LocalEventBus, NoopHook};
 use mcs_storage::{ActionLogRepo, GameRepo, SqlxStorage};
 use mcs_variant_standard::wire::StandardAction;
 use time::OffsetDateTime;
@@ -159,6 +159,7 @@ async fn game_in_progress_is_recovered_after_an_actor_restart() {
         action_log.clone(),
         game_repo.clone(),
         Arc::new(NoopHook),
+        Arc::new(LocalEventBus::new()),
     )
     .await
     .expect("recovery succeeds");
@@ -258,6 +259,7 @@ async fn recovering_an_unplayed_game_resumes_at_the_start_with_a_full_clock() {
         action_log.clone(),
         game_repo.clone(),
         Arc::new(NoopHook),
+        Arc::new(LocalEventBus::new()),
     )
     .await
     .expect("recovery of an unplayed game succeeds");

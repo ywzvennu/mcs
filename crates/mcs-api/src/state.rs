@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use mcs_auth::SessionConfig;
-use mcs_cluster::{LocalRegistry, NodeInfo, NodeRegistry};
+use mcs_cluster::{EventBus, LocalEventBus, LocalRegistry, NodeInfo, NodeRegistry};
 use mcs_core::{VariantOptions, VariantRegistry};
 use mcs_domain::{Game, GameId, GameLifecycle, TimeControl, UserId};
 use mcs_game::{recover_game, GameActor, GameCompletionHook, GameHandle, Matchmaker};
@@ -265,6 +265,17 @@ pub struct AppState {
     /// routing is a no-op, exactly the pre-cluster behaviour. A multi-node
     /// deployment swaps in a real registry via [`with_cluster`](AppState::with_cluster).
     cluster: Cluster,
+    /// The cross-node spectator-broadcast event bus (#109).
+    ///
+    /// Every game actor spawned or recovered through this state is handed this
+    /// same bus, so it publishes a spectator-safe frame per move to
+    /// `game:{id}:spectator`. The WebSocket spectator path subscribes to that
+    /// topic and streams each frame, serving watchers on *any* node without a
+    /// redirect. Defaults to an in-process [`LocalEventBus`] (single-node
+    /// behaviour unchanged, no Redis); a multi-node deployment swaps in a
+    /// `RedisEventBus` via [`with_event_bus`](AppState::with_event_bus). Held as
+    /// `Arc<dyn EventBus>` so the API links no backend.
+    event_bus: Arc<dyn EventBus>,
     /// Per-game serialization for [`get_or_recover`](AppState::get_or_recover),
     /// so two concurrent connects to the same absent game rebuild its actor only
     /// once. See [`RecoveryLocks`]. Shared across clones via the inner [`Arc`].
@@ -452,6 +463,11 @@ impl AppState {
                 this_node: NodeInfo::new(LOCAL_NODE_ID, ""),
                 registry: Arc::new(LocalRegistry::new(NodeInfo::new(LOCAL_NODE_ID, ""))),
             },
+            // Spectator broadcast (#109): in-process by default. Single-node, the
+            // owner publishes and the spectator subscribes within this one bus,
+            // so behaviour is unchanged. A multi-node deployment swaps in a
+            // `RedisEventBus` via `with_event_bus`.
+            event_bus: Arc::new(LocalEventBus::new()),
             recovery_locks: Arc::new(Mutex::new(HashMap::new())),
             // 1 MiB default; matches `[http].max_ws_message_bytes` default.
             ws_max_message_bytes: 1024 * 1024,
@@ -506,6 +522,36 @@ impl AppState {
     #[must_use]
     pub fn cluster(&self) -> &Cluster {
         &self.cluster
+    }
+
+    /// Overrides the spectator-broadcast event bus (#109), returning the modified
+    /// state (builder style).
+    ///
+    /// The default — installed by [`AppState::new`] — is an in-process
+    /// [`LocalEventBus`], so a single-node deployment fans spectator frames out
+    /// within one process with no external service. A multi-node deployment
+    /// chains `with_event_bus(..)` to swap in a cross-node bus (e.g. a
+    /// `RedisEventBus`), so a spectator on one node receives the frames a game's
+    /// owner node publishes.
+    ///
+    /// The bus is handed to every actor spawned through
+    /// [`create_and_spawn_game`](Self::create_and_spawn_game) and every actor
+    /// recovered through [`get_or_recover`](Self::get_or_recover), and it backs
+    /// the WebSocket spectator subscription.
+    #[must_use]
+    pub fn with_event_bus(mut self, bus: Arc<dyn EventBus>) -> Self {
+        self.event_bus = bus;
+        self
+    }
+
+    /// Returns the shared spectator-broadcast event bus (#109).
+    ///
+    /// The WebSocket spectator path subscribes to a game's
+    /// `game:{id}:spectator` topic on this bus to stream live frames without
+    /// redirecting the watcher to the owning node.
+    #[must_use]
+    pub fn event_bus(&self) -> &Arc<dyn EventBus> {
+        &self.event_bus
     }
 
     /// Overrides the presence tracker and online TTL, returning the modified
@@ -877,14 +923,17 @@ impl AppState {
         }
 
         // 3. Spawn the actor over the same backing store and 4. register its
-        //    handle so the WebSocket endpoint can find the live game by id.
-        let handle = GameActor::spawn(
+        //    handle so the WebSocket endpoint can find the live game by id. The
+        //    shared event bus (#109) is injected so the actor publishes a
+        //    spectator-safe frame per move that watchers on any node can stream.
+        let handle = GameActor::spawn_with_bus(
             game.id,
             session,
             Arc::clone(&self.game_repo),
             Arc::clone(&self.action_log),
             Arc::clone(&self.completion_hook),
             time_control,
+            Arc::clone(&self.event_bus),
         );
         self.game_hub.insert(game.id, handle);
 
@@ -984,6 +1033,7 @@ impl AppState {
             Arc::clone(&self.action_log),
             Arc::clone(&self.game_repo),
             Arc::clone(&self.completion_hook),
+            Arc::clone(&self.event_bus),
         )
         .await
         .map_err(|error| {
@@ -1020,6 +1070,7 @@ impl std::fmt::Debug for AppState {
             .field("completion_hook", &"<dyn GameCompletionHook>")
             .field("payment_gate", &self.payment_gate)
             .field("cluster", &self.cluster)
+            .field("event_bus", &"<dyn EventBus>")
             .field("presence", &"<dyn PresenceTracker>")
             .field("online_ttl", &self.online_ttl)
             .field("ws_max_message_bytes", &self.ws_max_message_bytes)

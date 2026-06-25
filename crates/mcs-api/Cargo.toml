@@ -45,6 +45,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+# Drive the spectator event-bus subscription stream (#109): the WS spectator
+# path consumes the boxed `Stream` of frames returned by `EventBus::subscribe`.
+tokio-stream = { workspace = true }
 time.workspace = true
 hex = "0.4"
 # Metrics facade (#88): handlers and middleware record through these macros into

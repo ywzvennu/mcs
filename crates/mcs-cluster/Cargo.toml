@@ -26,6 +26,10 @@ serde.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+# The event bus (#109) adapts a `tokio::broadcast` receiver into a `Stream` via
+# `BroadcastStream`, which lives behind tokio-stream's `sync` feature. The crate
+# itself has no Redis requirement, so this stays in the default (no-Redis) build.
+tokio-stream = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 # Redis client, optional and gated behind the `redis` feature above. Declared
 # directly here (rather than in the workspace) because it is specific to this
@@ -39,3 +43,5 @@ redis = { version = "0.27", features = [
 [dev-dependencies]
 serde_json.workspace = true
 tokio = { workspace = true }
+# Drive the event bus's `Stream` output in the bus integration tests.
+tokio-stream = { workspace = true }
