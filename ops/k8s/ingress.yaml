@@ -1,0 +1,53 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mcs-server
+  namespace: mcs
+  labels:
+    app.kubernetes.io/name: mcs
+    app.kubernetes.io/component: server
+  annotations:
+    # ── TLS / cert-manager ─────────────────────────────────────────────────
+    # Automatically provision a Let's Encrypt certificate via cert-manager.
+    # Remove this annotation and the tls block if you manage certificates
+    # outside the cluster.
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+
+    # ── nginx-ingress specific settings ───────────────────────────────────
+    # Remove or adapt for your ingress controller (Traefik, Caddy, AWS ALB…).
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # WebSocket upgrade headers required for live-game WS connections.
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+    # Forward the real client IP for per-IP rate limiting.
+    nginx.ingress.kubernetes.io/use-forwarded-headers: "true"
+    nginx.ingress.kubernetes.io/forwarded-for-header: "X-Forwarded-For"
+
+    # ── Body size limit ────────────────────────────────────────────────────
+    # Must be at least as large as MCS_HTTP__MAX_BODY_BYTES (default 64 KiB).
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+
+spec:
+  ingressClassName: nginx   # Replace with your ingress class name.
+
+  # TLS — cert-manager will provision a certificate for the listed hosts.
+  # Replace mcs.example.com with your actual domain.
+  tls:
+    - hosts:
+        - mcs.example.com
+      secretName: mcs-tls
+
+  rules:
+    - host: mcs.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mcs-server
+                port:
+                  name: http

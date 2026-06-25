@@ -292,3 +292,140 @@ named volume).
 The server exposes a `/health` endpoint that returns `200 OK` when it is ready
 to accept requests. The `docker-compose.yml` healthchecks poll this endpoint
 every 10 seconds.
+
+---
+
+## Observability
+
+### Prometheus
+
+`ops/prometheus/` contains two files:
+
+| File | Purpose |
+|------|---------|
+| `prometheus.yml` | Scrape configuration targeting `GET /metrics` on port 8080. |
+| `alerts.yml` | Alerting rules: high 5xx error rate, high p95/p99 latency, instance down, live-games spike, WS connection limit approach, and a games-stalled anomaly. |
+
+**Quick start (Docker Compose):**
+
+```sh
+docker run --rm -d \
+  -p 9090:9090 \
+  -v "$(pwd)/ops/prometheus:/etc/prometheus:ro" \
+  --name prometheus \
+  prom/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/prometheus
+```
+
+**Validate without running:**
+
+```sh
+promtool check config ops/prometheus/prometheus.yml
+promtool check rules  ops/prometheus/alerts.yml
+```
+
+**Tuning:**
+- Adjust the `targets` list in `prometheus.yml` to point at your actual
+  mcs-server addresses.  For Kubernetes, uncomment the `kubernetes_sd_configs`
+  block and remove the `static_configs` block.
+- Tune alert thresholds (`for`, rate windows, quantile cutoffs) to fit your
+  traffic profile before enabling notifications.
+
+---
+
+### Grafana dashboard
+
+`ops/grafana/mcs-overview.json` is an importable Grafana dashboard that
+visualises:
+
+| Panel | PromQL |
+|-------|--------|
+| Request rate | `rate(mcs_http_requests_total[…])` |
+| Error rate (5xx) | 5xx fraction of total requests |
+| p50 / p95 / p99 latency | `histogram_quantile` over `mcs_http_request_duration_seconds_bucket` |
+| Live games | `mcs_games_live` gauge |
+| Games created rate | `rate(mcs_games_created_total[…])` |
+| Active WS connections | `mcs_ws_connections_active` gauge |
+| Rating updates rate | `rate(mcs_rating_updates_total[…])` |
+
+**Importing the dashboard:**
+
+1. Open Grafana → **Dashboards** → **Import**.
+2. Click **Upload JSON file** and select `ops/grafana/mcs-overview.json`.
+3. In the **Prometheus** datasource drop-down, select your Prometheus instance.
+4. Click **Import**.
+
+The dashboard uses a templated `DS_PROMETHEUS` variable so you can switch
+between datasources without editing the JSON.  A `$job` variable lets you
+filter to a specific scrape job if you run multiple environments.
+
+---
+
+## Kubernetes deployment
+
+`ops/k8s/` contains plain Kubernetes manifests for a clustered production
+deployment.  Apply them in order:
+
+```sh
+kubectl apply -f ops/k8s/namespace.yaml
+kubectl apply -f ops/k8s/secret.yaml      # edit placeholders first
+kubectl apply -f ops/k8s/configmap.yaml   # edit domain / CORS origins
+kubectl apply -f ops/k8s/redis.yaml       # optional — skip for managed Redis
+kubectl apply -f ops/k8s/deployment.yaml
+kubectl apply -f ops/k8s/service.yaml
+kubectl apply -f ops/k8s/ingress.yaml     # edit host / ingressClassName
+```
+
+Or apply the whole directory at once (order is resolved by API server):
+
+```sh
+kubectl apply -f ops/k8s/
+```
+
+**Dry-run validation (no cluster required):**
+
+```sh
+kubectl apply --dry-run=client -f ops/k8s/
+```
+
+### What each manifest provides
+
+| File | Kind | Notes |
+|------|------|-------|
+| `namespace.yaml` | Namespace | `mcs` namespace. |
+| `configmap.yaml` | ConfigMap | All non-secret env vars: run mode, logging, SIWE domain, pool sizing, HTTP hardening, cluster settings. Edit `MCS_SIWE__DOMAIN` and `MCS_CORS__ALLOWED_ORIGINS` for your deployment. |
+| `secret.yaml` | Secret | `MCS_SESSION__SECRET` and `MCS_DATABASE_URL` — **replace every `CHANGE_ME` placeholder before applying**. Use a secrets manager (External Secrets Operator, Sealed Secrets, Vault) in production rather than committing encoded literals. |
+| `deployment.yaml` | Deployment | 2 replicas, Postgres-backend image, liveness probe `/health`, readiness probe `/ready`, startup probe, `topologySpreadConstraints` for cross-node spread, pod name injected as `MCS_CLUSTER__NODE_ID` via the Downward API. |
+| `service.yaml` | Service | ClusterIP on port 80 → pod 8080. Annotated for Prometheus scraping. |
+| `ingress.yaml` | Ingress | TLS via cert-manager + Let's Encrypt, WebSocket upgrade headers, forwarded-IP header for rate limiting. Edit `host` and `ingressClassName`. |
+| `redis.yaml` | StatefulSet + Service | Single-replica in-cluster Redis with AOF persistence. **For production use a managed Redis service** and delete this file, updating `MCS_CLUSTER__REDIS_URL` in the ConfigMap. |
+
+### Probes
+
+| Probe | Path | Purpose |
+|-------|------|---------|
+| Liveness | `GET /health` | Is the process alive? Always returns 200; does not touch the database. |
+| Readiness | `GET /ready` | Are dependencies reachable? Checks the database (+ Redis when `MCS_CLUSTER__ENABLED=true`). Pods fail readiness while DB is unavailable, preventing traffic to broken pods. |
+| Startup | `GET /health` | Gives the pod up to 60 s for migrations to apply on first boot before liveness starts. |
+
+### Scaling
+
+To scale the Deployment:
+
+```sh
+kubectl scale deployment mcs-server -n mcs --replicas=4
+```
+
+All pods share the same `MCS_SESSION__SECRET` (from the Secret) so JWTs minted
+on one pod are accepted on others.  Each pod gets a unique `MCS_CLUSTER__NODE_ID`
+from the Downward API (`metadata.name`) and registers itself in Redis.
+
+### Postgres (not included)
+
+The manifests assume an external (managed) Postgres instance.  Set
+`MCS_DATABASE_URL` in `secret.yaml` to the DSN of your managed Postgres.
+Managed options: Amazon RDS, Cloud SQL, Neon, Supabase, Aiven.
+
+To run an in-cluster Postgres for development, adapt the `redis.yaml` pattern
+(StatefulSet + Service + PVC) with the `postgres:16` image.

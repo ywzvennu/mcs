@@ -1,0 +1,175 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcs-server
+  namespace: mcs
+  labels:
+    app.kubernetes.io/name: mcs
+    app.kubernetes.io/component: server
+    app.kubernetes.io/version: "latest"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mcs
+      app.kubernetes.io/component: server
+  strategy:
+    # RollingUpdate ensures zero-downtime deploys.  New pods must pass the
+    # readiness probe (/ready) before old pods are terminated.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mcs
+        app.kubernetes.io/component: server
+        app.kubernetes.io/version: "latest"
+      annotations:
+        # Signal Prometheus to scrape this pod.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Security: run as the non-root mcs user baked into the image.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Spread replicas across nodes for resilience.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: mcs
+              app.kubernetes.io/component: server
+
+      containers:
+        - name: mcs-server
+          # Replace with your actual image registry / tag.
+          # The Postgres backend image is built with DB_BACKEND=postgres.
+          image: ghcr.io/ywzvennu/mcs-server:latest-postgres
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          # ── Environment — non-secret values from ConfigMap ─────────────────
+          envFrom:
+            - configMapRef:
+                name: mcs-config
+
+          # ── Environment — individual values from Secret ────────────────────
+          env:
+            # Session signing secret (required in production).
+            - name: MCS_SESSION__SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: mcs-secret
+                  key: MCS_SESSION__SECRET
+
+            # Postgres connection string.
+            - name: MCS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mcs-secret
+                  key: MCS_DATABASE_URL
+
+            # x402 facilitator API key (only used when payments are enabled).
+            - name: MCS_PAYMENTS__FACILITATOR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mcs-secret
+                  key: MCS_PAYMENTS__FACILITATOR_API_KEY
+                  optional: true
+
+            # Inject the pod name as a stable, unique cluster node ID so every
+            # replica registers itself distinctly in Redis.
+            - name: MCS_CLUSTER__NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+            # Inject the pod IP so peers can route WebSocket game traffic here.
+            - name: MCS_CLUSTER__ADDRESS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+
+          # ── Liveness probe ────────────────────────────────────────────────
+          # /health never touches the database; it is intentionally cheap so
+          # that a DB outage does not restart pods unnecessarily — use the
+          # readiness probe for dependency health.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+
+          # ── Readiness probe ───────────────────────────────────────────────
+          # /ready checks the database (and Redis when clustering is on) before
+          # the pod is added to Service endpoints, preventing traffic from
+          # reaching a pod whose dependencies are not yet available.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+
+          # ── Startup probe ─────────────────────────────────────────────────
+          # Allows up to 60 s for migrations to apply on first boot before
+          # liveness kicks in.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 12
+
+          # ── Resource requests and limits ──────────────────────────────────
+          # Tune these for your actual traffic.  The defaults here are
+          # conservative starting values for a medium-traffic deployment.
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+
+          # ── Security context ──────────────────────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+
+          # A writable /tmp is required for any temp file usage.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+      # Grace period should exceed the longest expected in-flight request.
+      terminationGracePeriodSeconds: 60

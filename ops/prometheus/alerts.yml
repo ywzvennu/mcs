@@ -1,0 +1,177 @@
+# Prometheus alerting rules for MCS (Multi Chess Server).
+#
+# Usage:
+#   promtool check rules ops/prometheus/alerts.yml
+#
+# Tune thresholds (`for`, rate windows, percentile targets) for your traffic
+# profile before deploying to production.
+
+groups:
+
+  # ── Availability ─────────────────────────────────────────────────────────
+  - name: mcs.availability
+    rules:
+
+      - alert: McsInstanceDown
+        expr: up{job="mcs"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MCS instance {{ $labels.instance }} is down"
+          description: >
+            Prometheus cannot reach {{ $labels.instance }} (job={{ $labels.job }}).
+            The scrape has been failing for more than 1 minute.
+            Check pod/container health and network connectivity.
+
+      - alert: McsNoScrapeTargets
+        expr: count(up{job="mcs"}) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No MCS scrape targets are reachable"
+          description: >
+            Prometheus has zero reachable MCS targets.  The entire fleet may be
+            down, or service discovery has lost track of all pods.
+
+  # ── HTTP error rate ───────────────────────────────────────────────────────
+  - name: mcs.http_errors
+    rules:
+
+      - alert: McsHighErrorRate5xx
+        # 5xx responses as a fraction of all responses over a 5-minute window.
+        expr: >
+          (
+            sum(rate(mcs_http_requests_total{status=~"5.."}[5m])) by (job)
+            /
+            sum(rate(mcs_http_requests_total[5m])) by (job)
+          ) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCS 5xx error rate above 5 % (job={{ $labels.job }})"
+          description: >
+            The fraction of HTTP responses with a 5xx status code has exceeded
+            5 % over the last 5 minutes (current value: {{ $value | humanizePercentage }}).
+            Investigate recent deployments, database connectivity, and Rust panic logs.
+
+      - alert: McsHighErrorRate5xxCritical
+        expr: >
+          (
+            sum(rate(mcs_http_requests_total{status=~"5.."}[5m])) by (job)
+            /
+            sum(rate(mcs_http_requests_total[5m])) by (job)
+          ) > 0.20
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MCS 5xx error rate above 20 % (job={{ $labels.job }})"
+          description: >
+            More than 20 % of HTTP responses are 5xx over the last 5 minutes
+            (current value: {{ $value | humanizePercentage }}).
+            Immediate investigation required.
+
+  # ── Latency ──────────────────────────────────────────────────────────────
+  - name: mcs.latency
+    rules:
+
+      - alert: McsHighP95Latency
+        # p95 request duration across all routes and methods.
+        expr: >
+          histogram_quantile(
+            0.95,
+            sum(rate(mcs_http_request_duration_seconds_bucket[5m])) by (le, job)
+          ) > 1.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCS p95 latency above 1 s (job={{ $labels.job }})"
+          description: >
+            The 95th-percentile HTTP request duration has exceeded 1 second
+            over the last 5 minutes (current value: {{ $value | humanizeDuration }}).
+            Check database query times, external service calls, and resource pressure.
+
+      - alert: McsHighP99Latency
+        expr: >
+          histogram_quantile(
+            0.99,
+            sum(rate(mcs_http_request_duration_seconds_bucket[5m])) by (le, job)
+          ) > 2.5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MCS p99 latency above 2.5 s (job={{ $labels.job }})"
+          description: >
+            The 99th-percentile HTTP request duration has exceeded 2.5 seconds
+            (current value: {{ $value | humanizeDuration }}).
+
+  # ── Game activity ─────────────────────────────────────────────────────────
+  - name: mcs.games
+    rules:
+
+      - alert: McsLiveGamesSpikeHigh
+        expr: mcs_games_live > 5000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCS live-game count unusually high ({{ $value }})"
+          description: >
+            The number of live games currently registered in the game hub
+            has been above 5000 for more than 5 minutes.  This may indicate
+            games are not completing or being garbage-collected correctly.
+
+      - alert: McsGamesCreatedRateDrop
+        # Alert if the 15-minute creation rate falls to zero during peak hours.
+        # Silence this alert during scheduled maintenance windows.
+        expr: >
+          sum(rate(mcs_games_created_total[15m])) by (job) == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No new games created in the last 30 minutes (job={{ $labels.job }})"
+          description: >
+            The game-creation rate has been zero for 30 minutes.  This may be
+            expected during low-traffic periods; if it occurs during peak hours
+            it could indicate a problem with matchmaking or the seeks API.
+
+      - alert: McsGamesStalled
+        # Fires if games_created_total stops increasing while live games are high,
+        # suggesting games are stuck in-progress and never completing.
+        expr: >
+          (mcs_games_live > 100)
+          and
+          (sum(increase(mcs_games_created_total[30m])) by (job) == 0)
+        for: 20m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Many live games but none created recently — possible stall"
+          description: >
+            There are {{ $value }} live games but no new games have been created
+            in the last 30 minutes.  This suggests existing games may be stalled
+            and not completing normally.
+
+  # ── WebSocket connections ─────────────────────────────────────────────────
+  - name: mcs.websockets
+    rules:
+
+      - alert: McsWebSocketConnectionsHigh
+        expr: mcs_ws_connections_active > 8000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            MCS WebSocket connections approaching per-node limit
+            ({{ $value }} active)
+          description: >
+            The number of active WebSocket connections is above 8000, approaching
+            the default per-node cap of 10000 (MCS_LIMITS__MAX_WS_CONNECTIONS).
+            Consider scaling out or raising the limit if traffic is legitimate.
