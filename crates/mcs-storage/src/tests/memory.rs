@@ -167,6 +167,20 @@ impl GameRepo for MemoryGameRepo {
         Ok(games)
     }
 
+    async fn finished_games_for_user(&self, user: UserId) -> StorageResult<Vec<Game>> {
+        let map = self.games.lock().expect("mutex poisoned");
+        let mut games: Vec<Game> = map
+            .values()
+            .filter(|g| {
+                g.lifecycle == GameLifecycle::Finished && (g.white == user || g.black == user)
+            })
+            .cloned()
+            .collect();
+        // Oldest first, matching the sqlx implementation.
+        games.sort_by_key(|g| g.created_at);
+        Ok(games)
+    }
+
     async fn list_unfinished(&self) -> StorageResult<Vec<Game>> {
         let map = self.games.lock().expect("mutex poisoned");
         let mut games: Vec<Game> = map

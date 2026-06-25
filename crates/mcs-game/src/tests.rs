@@ -101,6 +101,10 @@ impl GameRepo for MockGameRepo {
         unreachable!("the actor never lists games")
     }
 
+    async fn finished_games_for_user(&self, _user: UserId) -> StorageResult<Vec<Game>> {
+        unreachable!("the actor never lists games")
+    }
+
     async fn list_unfinished(&self) -> StorageResult<Vec<Game>> {
         unreachable!("the actor never lists games")
     }
@@ -143,6 +147,10 @@ impl GameRepo for FailingUpdateRepo {
     }
 
     async fn list_for_user(&self, _user: UserId, _limit: u32) -> StorageResult<Vec<Game>> {
+        unreachable!()
+    }
+
+    async fn finished_games_for_user(&self, _user: UserId) -> StorageResult<Vec<Game>> {
         unreachable!()
     }
 

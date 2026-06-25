@@ -446,6 +446,66 @@ async fn game_list_unfinished_excludes_finished_includes_others() {
         .all(|g| g.lifecycle != GameLifecycle::Finished));
 }
 
+#[tokio::test]
+async fn game_finished_games_for_user_filters_by_lifecycle_and_player() {
+    let storage = storage().await;
+    let alice = UserId::new();
+    let bob = UserId::new();
+    let carol = UserId::new();
+
+    // Finished, alice as White (oldest).
+    let mut alice_white = sample_game(alice, bob);
+    alice_white.created_at = OffsetDateTime::UNIX_EPOCH;
+    alice_white.finish(
+        Outcome::win(Color::White, EndReason::Checkmate),
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10),
+    );
+    storage.games().create(&alice_white).await.unwrap();
+
+    // Finished, alice as Black.
+    let mut alice_black = sample_game(bob, alice);
+    alice_black.created_at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1);
+    alice_black.finish(
+        Outcome::draw(EndReason::Other("agreement".into())),
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(11),
+    );
+    storage.games().create(&alice_black).await.unwrap();
+
+    // Unfinished game with alice — excluded.
+    let mut unfinished = sample_game(alice, carol);
+    unfinished.created_at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(2);
+    unfinished.lifecycle = GameLifecycle::Active;
+    storage.games().create(&unfinished).await.unwrap();
+
+    // Finished game without alice — excluded.
+    let mut other = sample_game(bob, carol);
+    other.created_at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(3);
+    other.finish(
+        Outcome::win(Color::Black, EndReason::Resignation),
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(13),
+    );
+    storage.games().create(&other).await.unwrap();
+
+    let finished = storage
+        .games()
+        .finished_games_for_user(alice)
+        .await
+        .unwrap();
+    let ids: Vec<GameId> = finished.iter().map(|g| g.id).collect();
+    assert_eq!(ids, vec![alice_white.id, alice_black.id]);
+    assert!(finished
+        .iter()
+        .all(|g| g.lifecycle == GameLifecycle::Finished));
+
+    // A user with no finished games yields an empty list.
+    assert!(storage
+        .games()
+        .finished_games_for_user(UserId::new())
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // ActionLogRepo
 // ---------------------------------------------------------------------------

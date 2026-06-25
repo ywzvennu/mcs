@@ -16,6 +16,7 @@
 //! | `GET /users/{id}`         | no   | Public profile for a user. |
 //! | `GET /users/{id}/ratings` | no   | A user's per-variant ratings. |
 //! | `GET /users/{id}/rating-history` | no | A user's rating trail for a variant. |
+//! | `GET /users/{id}/stats`   | no   | A user's W/L/D record and performance rating. |
 //! | `GET /profile`            | yes  | Public profile for the authenticated caller. |
 //! | `PUT /profile`            | yes  | Edit the authenticated caller's username. |
 //!
@@ -521,6 +522,86 @@ pub struct RatingHistoryResponse {
     pub entries: Vec<RatingHistoryEntryDto>,
 }
 
+/// The Elo-style spread applied per net win in the **performance rating**.
+///
+/// The formula is `avg(opponent_rating) + PERFORMANCE_SPREAD * (wins - losses)
+/// / games`, the standard tournament "performance rating" approximation: a
+/// player who scores 50% performs at the average of their opponents, and each
+/// net win (or loss) shifts that estimate by a fixed Elo margin. `400` is the
+/// conventional Elo constant.
+const PERFORMANCE_SPREAD: f64 = 400.0;
+
+/// Query parameters for `GET /users/{id}/stats`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserStatsQuery {
+    /// Optional variant filter (e.g. `"standard"`). When present, only matching
+    /// categories are returned; the `overall` tally always spans every game.
+    pub variant: Option<String>,
+    /// Optional time-class filter (e.g. `"blitz"`). An unknown value is a
+    /// **422 Unprocessable Entity**. When present, only matching categories are
+    /// returned.
+    pub time_class: Option<String>,
+}
+
+/// A win/loss/draw tally with a derived total.
+#[derive(Debug, Clone, Copy, Default, Serialize, ToSchema)]
+pub struct RecordDto {
+    /// Games the user won (the outcome's winner is the user's colour).
+    pub wins: u32,
+    /// Games the user lost (the winner is the opposing colour).
+    pub losses: u32,
+    /// Games drawn (the outcome has no winner).
+    pub draws: u32,
+    /// `wins + losses + draws`. Aborted / no-outcome games are excluded
+    /// entirely, so they never count here.
+    pub total: u32,
+}
+
+/// One `(variant, time_class)` category in a user's statistics.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct StatsCategoryDto {
+    /// The variant this category is for (e.g. `"standard"`).
+    pub variant_id: String,
+    /// The time class this category is for (e.g. `"blitz"`), derived from each
+    /// game's time control.
+    #[schema(value_type = String)]
+    pub time_class: TimeClass,
+    /// Games the user won in this category.
+    pub wins: u32,
+    /// Games the user lost in this category.
+    pub losses: u32,
+    /// Games drawn in this category.
+    pub draws: u32,
+    /// `wins + losses + draws` for this category.
+    pub total: u32,
+    /// The **performance rating** for this category, rounded to an integer, or
+    /// `null` when the category has no rated games to compute it from.
+    ///
+    /// Computed as `round(avg(opponent_rating) + 400 * (wins - losses) /
+    /// games)` over this category's **rated** games. Each opponent's rating is
+    /// their **current** `(variant, time_class)` rating (the live value at the
+    /// time of the request, defaulting to the Glicko-2 seed when the opponent
+    /// has never been rated in this bucket) — a deliberate, cheap approximation
+    /// over reconstructing the historical rating each game was played at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub performance_rating: Option<i64>,
+}
+
+/// Response body for `GET /users/{id}/stats`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UserStatsResponse {
+    /// The user these statistics belong to.
+    #[schema(value_type = String, format = Uuid)]
+    pub user_id: UserId,
+    /// The aggregate win/loss/draw tally across **all** of the user's finished
+    /// games, irrespective of any `variant`/`time_class` filter.
+    pub overall: RecordDto,
+    /// One entry per `(variant, time_class)` the user has a finished game in,
+    /// narrowed by the optional `variant`/`time_class` filters, ordered by
+    /// variant id then time class.
+    pub categories: Vec<StatsCategoryDto>,
+}
+
 /// Validates a requested username, returning the trimmed value on success.
 ///
 /// The rules: 3–20 characters, each one of `[A-Za-z0-9_-]`. A violation is a
@@ -621,6 +702,7 @@ pub fn read_router() -> Router<AppState> {
         .route("/users/{id}/status", get(get_user_status))
         .route("/users/{id}/ratings", get(get_user_ratings))
         .route("/users/{id}/rating-history", get(get_user_rating_history))
+        .route("/users/{id}/stats", get(get_user_stats))
         .route("/profile", get(my_profile).put(update_profile))
 }
 
@@ -1143,6 +1225,201 @@ async fn get_user_rating_history(
     }))
 }
 
+/// `GET /users/{id}/stats?variant=&time_class=` — a user's win/loss/draw record
+/// and performance rating, aggregated per `(variant, time_class)`.
+///
+/// The handler folds the user's **finished** games (over
+/// [`GameRepo::finished_games_for_user`](mcs_storage::GameRepo::finished_games_for_user))
+/// into per-category tallies plus an `overall` total:
+///
+/// - **win** — the outcome's winner is the user's colour;
+/// - **loss** — the winner is the opposing colour;
+/// - **draw** — the outcome has no winner.
+///
+/// Games with no outcome (aborted / no result recorded) are skipped entirely:
+/// they never count towards any tally. The `time_class` of each game is derived
+/// from its time control.
+///
+/// The **performance rating** of a category is
+/// `round(avg(opponent_rating) + 400 * (wins - losses) / games)` over that
+/// category's **rated** games. Each opponent contributes their *current*
+/// `(variant, time_class)` rating (defaulting to the Glicko-2 seed when they
+/// have none) — see [`StatsCategoryDto::performance_rating`]. A category with no
+/// rated games omits the field (`null`).
+///
+/// The optional `variant`/`time_class` query parameters narrow the returned
+/// `categories` to matching ones; `overall` always spans every finished game. A
+/// missing user is a **404 Not Found**; an unknown `time_class` is a **422**.
+async fn get_user_stats(
+    State(state): State<AppState>,
+    Path(id): Path<UserId>,
+    Query(query): Query<UserStatsQuery>,
+) -> ApiResult<Json<UserStatsResponse>> {
+    // Confirm the user exists so an unknown id is a clean 404 rather than an
+    // empty-but-successful body.
+    let _user = state.storage().users().get(id).await?;
+
+    // Validate the optional time-class filter up front (an unknown value is a
+    // 422, mirroring the leaderboard/history endpoints).
+    let time_class_filter = match query.time_class.as_deref() {
+        None => None,
+        Some(s) => Some(s.parse::<TimeClass>().map_err(|_| {
+            ApiError::UnprocessableEntity(format!(
+                "unknown time class {s:?}; expected one of bullet, blitz, rapid, \
+                 classical, correspondence"
+            ))
+        })?),
+    };
+
+    let games = state.storage().games().finished_games_for_user(id).await?;
+
+    // Accumulate per-(variant, time_class) tallies plus the running opponent
+    // total over rated games (the performance-rating numerator).
+    let mut overall = RecordDto::default();
+    let mut buckets: std::collections::HashMap<(String, TimeClass), StatsBucket> =
+        std::collections::HashMap::new();
+
+    for game in games {
+        // Determine the user's colour and their opponent. A finished game always
+        // has the user on one side (the repo filtered for it).
+        let (user_color, opponent) = if game.white == id {
+            (Color::White, game.black)
+        } else {
+            (Color::Black, game.white)
+        };
+
+        // Classify the result against the outcome's winner. No outcome → skip.
+        let Some(outcome) = game.outcome.as_ref() else {
+            continue;
+        };
+        let result = match outcome.winner {
+            None => GameResult::Draw,
+            Some(winner) if winner == user_color => GameResult::Win,
+            Some(_) => GameResult::Loss,
+        };
+
+        let time_class = game.time_control.time_class();
+        overall.record(result);
+
+        let bucket = buckets
+            .entry((game.variant_id.clone(), time_class))
+            .or_default();
+        bucket.record.record(result);
+
+        // The performance rating draws only on rated games. Defer the opponent
+        // rating lookup to after the fold so each opponent is read once per
+        // bucket-game (rather than holding the rating store across the loop).
+        if game.rated {
+            bucket.rated_games.push(RatedGame {
+                opponent,
+                variant_id: game.variant_id.clone(),
+                time_class,
+            });
+        }
+    }
+
+    // A stable category order — by variant id then time class — so the response
+    // is deterministic regardless of `HashMap` iteration order.
+    let mut buckets: Vec<((String, TimeClass), StatsBucket)> = buckets.into_iter().collect();
+    buckets.sort_by(|((va, ta), _), ((vb, tb), _)| {
+        va.cmp(vb).then_with(|| ta.as_str().cmp(tb.as_str()))
+    });
+
+    // Resolve performance ratings: for each bucket with rated games, average the
+    // opponents' *current* ratings and apply the Elo-style net-result spread.
+    let ratings = state.storage().ratings();
+    let mut categories = Vec::with_capacity(buckets.len());
+    for ((variant_id, time_class), bucket) in buckets {
+        // Apply the optional filters: a category is kept only if it matches both
+        // the variant filter (when present) and the time-class filter.
+        if let Some(ref want) = query.variant {
+            if &variant_id != want {
+                continue;
+            }
+        }
+        if let Some(want_tc) = time_class_filter {
+            if time_class != want_tc {
+                continue;
+            }
+        }
+
+        let performance_rating = if bucket.rated_games.is_empty() {
+            None
+        } else {
+            let games = bucket.rated_games.len() as f64;
+            let mut opponent_sum = 0.0_f64;
+            for rated in &bucket.rated_games {
+                // Each opponent's *current* rating in this (variant, time_class);
+                // a never-rated opponent contributes the Glicko-2 seed.
+                let rating = ratings
+                    .get(rated.opponent, &rated.variant_id, rated.time_class)
+                    .await?
+                    .unwrap_or_default();
+                opponent_sum += rating.value;
+            }
+            let wins = f64::from(bucket.record.wins);
+            let losses = f64::from(bucket.record.losses);
+            let perf = opponent_sum / games + PERFORMANCE_SPREAD * (wins - losses) / games;
+            Some(perf.round() as i64)
+        };
+
+        categories.push(StatsCategoryDto {
+            variant_id,
+            time_class,
+            wins: bucket.record.wins,
+            losses: bucket.record.losses,
+            draws: bucket.record.draws,
+            total: bucket.record.total,
+            performance_rating,
+        });
+    }
+
+    Ok(Json(UserStatsResponse {
+        user_id: id,
+        overall,
+        categories,
+    }))
+}
+
+/// The result of a finished game from one player's perspective.
+#[derive(Debug, Clone, Copy)]
+enum GameResult {
+    Win,
+    Loss,
+    Draw,
+}
+
+impl RecordDto {
+    /// Folds one game result into this tally, bumping the matching counter and
+    /// the total.
+    fn record(&mut self, result: GameResult) {
+        match result {
+            GameResult::Win => self.wins += 1,
+            GameResult::Loss => self.losses += 1,
+            GameResult::Draw => self.draws += 1,
+        }
+        self.total += 1;
+    }
+}
+
+/// One rated game's performance-rating inputs: the opponent and the
+/// `(variant, time_class)` whose *current* opponent rating to fetch.
+#[derive(Debug, Clone)]
+struct RatedGame {
+    opponent: UserId,
+    variant_id: String,
+    time_class: TimeClass,
+}
+
+/// Per-`(variant, time_class)` accumulator while folding a user's finished
+/// games: the running W/L/D tally and the rated games that feed the performance
+/// rating.
+#[derive(Debug, Default)]
+struct StatsBucket {
+    record: RecordDto,
+    rated_games: Vec<RatedGame>,
+}
+
 // ---------------------------------------------------------------------------
 // OpenAPI path documentation (#127)
 //
@@ -1358,3 +1635,23 @@ pub(crate) fn get_user_ratings_doc() {}
 )]
 #[allow(dead_code)]
 pub(crate) fn get_user_rating_history_doc() {}
+
+/// `GET /users/{id}/stats` — a user's win/loss/draw record and performance
+/// rating, per `(variant, time_class)`.
+#[utoipa::path(
+    get,
+    path = "/users/{id}/stats",
+    tag = "profile",
+    params(
+        ("id" = String, Path, description = "User id (UUID)."),
+        ("variant" = Option<String>, Query, description = "Optional variant filter (e.g. \"standard\"). Narrows the returned categories."),
+        ("time_class" = Option<String>, Query, description = "Optional time-class filter (bullet|blitz|rapid|classical|correspondence). Narrows the returned categories."),
+    ),
+    responses(
+        (status = 200, description = "Overall W/L/D plus per-category tallies and performance ratings.", body = UserStatsResponse),
+        (status = 404, description = "No such user.", body = crate::openapi::ProblemDetails),
+        (status = 422, description = "Unknown time class.", body = crate::openapi::ProblemDetails),
+    ),
+)]
+#[allow(dead_code)]
+pub(crate) fn get_user_stats_doc() {}

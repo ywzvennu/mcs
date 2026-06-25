@@ -49,8 +49,9 @@ use crate::history::{MoveEntry, MovesResponse};
 use crate::rest::{
     CancelSeekResponse, CreateSeekRequest, CreateSeekResponse, GameDto, GameListResponse,
     LeaderboardEntry, LeaderboardResponse, ProfileDto, RatingDto, RatingHistoryEntryDto,
-    RatingHistoryResponse, SeekCreatorDto, SeekDto, SeekListResponse, UpdateProfileRequest,
-    UserRatingDto, UserRatingsResponse, UserStatusResponse,
+    RatingHistoryResponse, RecordDto, SeekCreatorDto, SeekDto, SeekListResponse, StatsCategoryDto,
+    UpdateProfileRequest, UserRatingDto, UserRatingsResponse, UserStatsResponse,
+    UserStatusResponse,
 };
 use crate::variants::{VariantDto, VariantListResponse};
 
@@ -270,6 +271,7 @@ impl Modify for SecurityAddon {
         crate::rest::get_user_status_doc,
         crate::rest::get_user_ratings_doc,
         crate::rest::get_user_rating_history_doc,
+        crate::rest::get_user_stats_doc,
     ),
     components(schemas(
         // error contract
@@ -321,6 +323,9 @@ impl Modify for SecurityAddon {
         UserRatingsResponse,
         RatingHistoryEntryDto,
         RatingHistoryResponse,
+        RecordDto,
+        StatsCategoryDto,
+        UserStatsResponse,
     )),
 )]
 pub struct ApiDoc;
