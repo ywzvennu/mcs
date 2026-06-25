@@ -492,6 +492,7 @@ impl RatingRepo for MemoryRatingRepo {
         &self,
         variant_id: &str,
         time_class: TimeClass,
+        offset: u32,
         limit: u32,
     ) -> StorageResult<Vec<(UserId, Rating)>> {
         let map = self.ratings.lock().expect("mutex poisoned");
@@ -510,8 +511,26 @@ impl RatingRepo for MemoryRatingRepo {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a_id.to_string().cmp(&b_id.to_string()))
         });
-        entries.truncate(limit as usize);
-        Ok(entries)
+        let start = (offset as usize).min(entries.len());
+        let page: Vec<(UserId, Rating)> = entries
+            .into_iter()
+            .skip(start)
+            .take(limit as usize)
+            .collect();
+        Ok(page)
+    }
+
+    async fn leaderboard_count(
+        &self,
+        variant_id: &str,
+        time_class: TimeClass,
+    ) -> StorageResult<u64> {
+        let map = self.ratings.lock().expect("mutex poisoned");
+        let count = map
+            .keys()
+            .filter(|(_, vid, tc)| vid == variant_id && *tc == time_class)
+            .count();
+        Ok(count as u64)
     }
 
     async fn list_for_user(&self, user: UserId) -> StorageResult<Vec<(String, TimeClass, Rating)>> {

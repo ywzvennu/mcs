@@ -792,7 +792,7 @@ async fn rating_repo_leaderboard_order_and_limit() {
     }
 
     let board = repo
-        .leaderboard("standard", TimeClass::Blitz, 3)
+        .leaderboard("standard", TimeClass::Blitz, 0, 3)
         .await
         .unwrap();
     assert_eq!(board.len(), 3);
@@ -820,7 +820,7 @@ async fn rating_repo_leaderboard_variant_isolation() {
 
     // A different variant must not appear in the leaderboard.
     let board = repo
-        .leaderboard("chess960", TimeClass::Blitz, 10)
+        .leaderboard("chess960", TimeClass::Blitz, 0, 10)
         .await
         .unwrap();
     assert!(board.is_empty());
@@ -845,7 +845,7 @@ async fn rating_repo_leaderboard_time_class_isolation() {
 
     // The same (user, variant) in a different time class must not leak in.
     let board = repo
-        .leaderboard("standard", TimeClass::Rapid, 10)
+        .leaderboard("standard", TimeClass::Rapid, 0, 10)
         .await
         .unwrap();
     assert!(board.is_empty());

@@ -484,3 +484,187 @@ async fn leaderboard_rejects_unknown_time_class() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+// ---------------------------------------------------------------------------
+// Leaderboard pagination tests (#133)
+// ---------------------------------------------------------------------------
+
+/// Fetches a leaderboard page with explicit offset, limit, and time_class.
+async fn get_leaderboard_page(
+    state: &AppState,
+    variant: &str,
+    time_class: TimeClass,
+    offset: u32,
+    limit: u32,
+) -> Value {
+    let resp = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/leaderboard?variant={variant}&time_class={tc}&offset={offset}&limit={limit}",
+                    tc = time_class.as_str()
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp.into_body()).await
+}
+
+/// Seeds `count` rated games for distinct players against a shared opponent.
+/// Each player finishes with a distinct rating (the shared opponent resigns
+/// once per game, so every real player wins). Returns the players in the order
+/// they were created (NOT necessarily in rating order).
+async fn seed_rated_players(state: &AppState, count: usize) -> Vec<User> {
+    // Create a permanent "punching bag" opponent who loses every game.
+    // EVM addresses are 0x + exactly 40 hex chars (42 chars total).
+    let bag = create_user(state, "0xd000000000000000000000000000000000000000").await;
+    let mut players = Vec::with_capacity(count);
+
+    for i in 0..count {
+        // Unique player addresses: start at 0x1 and step by 1, zero-padded to
+        // 40 hex chars.  They never overlap with the bag's address.
+        let hex = format!("0x{:040x}", i + 1);
+        let player = create_user(state, &hex).await;
+        players.push(player.clone());
+
+        // The bag opens with a king's-pawn move, the player resigns immediately
+        // to give the bag a win — but we want the player to win, so actually:
+        // bag is White and player is Black; White resigns → Black wins.
+        let tc = TimeControl::RealTime {
+            initial: std::time::Duration::from_secs(300),
+            increment: std::time::Duration::ZERO,
+        };
+        let (_, handle) = start_game_full(state, bag.id, player.id, true, tc.clone()).await;
+        // White (bag) resigns: Black (player) wins every time.
+        handle.submit_action(Color::White, resign()).await.unwrap();
+        assert!(handle.status().await.unwrap().is_finished());
+    }
+
+    players
+}
+
+#[tokio::test]
+async fn leaderboard_response_contains_pagination_fields() {
+    let state = test_app().await;
+    // Seed 3 players.
+    seed_rated_players(&state, 3).await;
+
+    let board = get_leaderboard_page(&state, STANDARD_VARIANT_ID, TimeClass::Blitz, 0, 10).await;
+
+    // Pagination fields are present and correct.
+    assert_eq!(board["offset"].as_u64(), Some(0));
+    assert_eq!(board["limit"].as_u64(), Some(10));
+    // total = 3 players (bag is counted too — it lost every game, so it also
+    // has a rating row; let the test be permissive about the exact count).
+    let total = board["total"].as_u64().expect("total field");
+    assert!(total >= 3, "expected at least 3 rated players, got {total}");
+    // entries length equals number of rated players (all fit in one page).
+    let entries = board["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len() as u64, total);
+}
+
+#[tokio::test]
+async fn leaderboard_entries_ordered_desc_and_rank_continues_across_pages() {
+    let state = test_app().await;
+    // Seed enough players to span two pages.
+    seed_rated_players(&state, 6).await;
+
+    let page1 = get_leaderboard_page(&state, STANDARD_VARIANT_ID, TimeClass::Blitz, 0, 3).await;
+    let page2 = get_leaderboard_page(&state, STANDARD_VARIANT_ID, TimeClass::Blitz, 3, 3).await;
+
+    let e1 = page1["entries"].as_array().expect("page1 entries");
+    let e2 = page2["entries"].as_array().expect("page2 entries");
+
+    // Page 1 is ordered descending by rating.
+    assert!(
+        e1.windows(2)
+            .all(|w| w[0]["rating"]["value"].as_f64().unwrap()
+                >= w[1]["rating"]["value"].as_f64().unwrap()),
+        "page 1 must be rating-descending"
+    );
+
+    // Rank starts at 1 on the first page and continues from 4 on the second.
+    assert_eq!(
+        e1[0]["rank"].as_u64(),
+        Some(1),
+        "first entry rank must be 1"
+    );
+    assert_eq!(
+        e2[0]["rank"].as_u64(),
+        Some(4),
+        "second page first-entry rank must be 4"
+    );
+
+    // The last entry on page 1 ranks just above the first entry on page 2.
+    let last_p1_rating = e1.last().unwrap()["rating"]["value"].as_f64().unwrap();
+    let first_p2_rating = e2[0]["rating"]["value"].as_f64().unwrap();
+    assert!(
+        last_p1_rating >= first_p2_rating,
+        "last of page1 ({last_p1_rating}) must be >= first of page2 ({first_p2_rating})"
+    );
+
+    // Both pages share the same `total`.
+    assert_eq!(
+        page1["total"].as_u64(),
+        page2["total"].as_u64(),
+        "total must be the same across pages"
+    );
+}
+
+#[tokio::test]
+async fn leaderboard_offset_beyond_end_returns_empty_entries_with_correct_total() {
+    let state = test_app().await;
+    seed_rated_players(&state, 2).await;
+
+    let total_board =
+        get_leaderboard_page(&state, STANDARD_VARIANT_ID, TimeClass::Blitz, 0, 100).await;
+    let total = total_board["total"].as_u64().expect("total");
+
+    // An offset well beyond the last entry should return zero entries but the
+    // same total.
+    let beyond = get_leaderboard_page(
+        &state,
+        STANDARD_VARIANT_ID,
+        TimeClass::Blitz,
+        total as u32 + 100,
+        10,
+    )
+    .await;
+    assert!(
+        beyond["entries"].as_array().unwrap().is_empty(),
+        "offset beyond end must yield empty entries"
+    );
+    assert_eq!(
+        beyond["total"].as_u64(),
+        Some(total),
+        "total must be the same even with offset beyond end"
+    );
+    assert_eq!(
+        beyond["offset"].as_u64(),
+        Some(total + 100),
+        "offset echoed back"
+    );
+}
+
+#[tokio::test]
+async fn leaderboard_different_time_class_is_independent() {
+    let state = test_app().await;
+    // Seed blitz-rated players.
+    seed_rated_players(&state, 3).await;
+
+    // The rapid leaderboard for the same variant must be empty.
+    let rapid_board =
+        get_leaderboard_page(&state, STANDARD_VARIANT_ID, TimeClass::Rapid, 0, 10).await;
+    assert!(
+        rapid_board["entries"].as_array().unwrap().is_empty(),
+        "rapid leaderboard must be empty when only blitz games have been played"
+    );
+    assert_eq!(
+        rapid_board["total"].as_u64(),
+        Some(0),
+        "total for rapid must be 0"
+    );
+}

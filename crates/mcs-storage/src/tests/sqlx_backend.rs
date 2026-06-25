@@ -1049,7 +1049,7 @@ async fn rating_leaderboard_ordering_and_limit() {
 
     let board = storage
         .ratings()
-        .leaderboard("standard", TimeClass::Blitz, 3)
+        .leaderboard("standard", TimeClass::Blitz, 0, 3)
         .await
         .unwrap();
     assert_eq!(board.len(), 3);
@@ -1063,7 +1063,7 @@ async fn rating_leaderboard_empty_variant_returns_empty() {
     let storage = storage().await;
     let board = storage
         .ratings()
-        .leaderboard("nonexistent", TimeClass::Blitz, 10)
+        .leaderboard("nonexistent", TimeClass::Blitz, 0, 10)
         .await
         .unwrap();
     assert!(board.is_empty());
@@ -1086,7 +1086,7 @@ async fn rating_leaderboard_time_class_isolation() {
     // The same variant under a different time class must not appear.
     let board = storage
         .ratings()
-        .leaderboard("standard", TimeClass::Rapid, 10)
+        .leaderboard("standard", TimeClass::Rapid, 0, 10)
         .await
         .unwrap();
     assert!(board.is_empty());

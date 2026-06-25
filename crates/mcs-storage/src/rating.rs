@@ -57,11 +57,13 @@ pub trait RatingRepo: Send + Sync {
         rating: &Rating,
     ) -> StorageResult<()>;
 
-    /// Returns the top `limit` players for `(variant_id, time_class)`, ordered
-    /// by `value` descending (highest-rated first).
+    /// Returns one page of the leaderboard for `(variant_id, time_class)`,
+    /// ordered by `value` descending (highest-rated first).
     ///
-    /// If fewer than `limit` rows exist for the bucket the returned `Vec` is
-    /// shorter than `limit`. An empty bucket returns an empty `Vec`.
+    /// `offset` is the zero-based starting position in the full ranking; the
+    /// first page has `offset = 0`. If `offset` is beyond the last ranked
+    /// player the returned `Vec` is empty.  If fewer than `limit` rows remain
+    /// after the offset the returned `Vec` is shorter than `limit`.
     ///
     /// # Errors
     ///
@@ -70,8 +72,25 @@ pub trait RatingRepo: Send + Sync {
         &self,
         variant_id: &str,
         time_class: TimeClass,
+        offset: u32,
         limit: u32,
     ) -> StorageResult<Vec<(UserId, Rating)>>;
+
+    /// Returns the total number of players with a rating in
+    /// `(variant_id, time_class)`.
+    ///
+    /// This is the denominator for pagination: a caller can compute the total
+    /// number of pages as `ceil(total / page_size)`.  An empty bucket returns
+    /// `0`.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::Backend`] on driver-level failures.
+    async fn leaderboard_count(
+        &self,
+        variant_id: &str,
+        time_class: TimeClass,
+    ) -> StorageResult<u64>;
 
     /// Returns every rating `user` holds, as `(variant_id, time_class, rating)`
     /// triples.
