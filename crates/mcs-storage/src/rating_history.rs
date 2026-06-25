@@ -1,7 +1,8 @@
-//! Repository trait for append-only per-user, per-variant rating history.
+//! Repository trait for append-only per-user, per-`(variant, time_class)`
+//! rating history.
 
 use async_trait::async_trait;
-use mcs_domain::{RatingHistoryEntry, UserId};
+use mcs_domain::{RatingHistoryEntry, TimeClass, UserId};
 
 use crate::error::StorageResult;
 
@@ -26,10 +27,12 @@ pub trait RatingHistoryRepo: Send + Sync {
     /// - [`StorageError::Backend`] on driver-level failures.
     async fn record(&self, entry: &RatingHistoryEntry) -> StorageResult<()>;
 
-    /// Returns up to `limit` history snapshots for `user` in `variant_id`,
-    /// **most-recent-first** (descending by recorded time).
+    /// Returns up to `limit` history snapshots for `user` in
+    /// `(variant_id, time_class)`, **most-recent-first** (descending by recorded
+    /// time).
     ///
-    /// A player with no history in the variant yields an empty `Vec`.
+    /// A player with no history in the `(variant, time_class)` bucket yields an
+    /// empty `Vec`.
     ///
     /// # Errors
     ///
@@ -38,6 +41,7 @@ pub trait RatingHistoryRepo: Send + Sync {
         &self,
         user: UserId,
         variant_id: &str,
+        time_class: TimeClass,
         limit: u32,
     ) -> StorageResult<Vec<RatingHistoryEntry>>;
 }

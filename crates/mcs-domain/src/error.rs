@@ -17,4 +17,8 @@ pub enum DomainError {
     /// A string did not parse as a valid UUID.
     #[error("invalid id: {0}")]
     InvalidId(String),
+
+    /// A value violated a domain invariant (e.g. an unrecognised enum spelling).
+    #[error("validation error: {0}")]
+    Validation(String),
 }

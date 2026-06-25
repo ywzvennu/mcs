@@ -47,8 +47,8 @@ use utoipa::ToSchema;
 
 use mcs_core::{Color, VariantOptions};
 use mcs_domain::{
-    ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Rating, Seek, SeekId, TimeControl,
-    UserId,
+    ColorPreference, EvmAddress, Game, GameId, GameLifecycle, Rating, Seek, SeekId, TimeClass,
+    TimeControl, UserId,
 };
 use mcs_game::{Pairing, SubmitOutcome};
 use mcs_storage::ClaimOutcome;
@@ -70,6 +70,15 @@ const DEFAULT_LEADERBOARD_LIMIT: u32 = 20;
 /// The largest leaderboard page `GET /leaderboard` will honour, clamping larger
 /// requests.
 const MAX_LEADERBOARD_LIMIT: u32 = 200;
+
+/// The time class `GET /leaderboard` and `GET /games/{id}` rating lookups assume
+/// when the caller does not specify one.
+///
+/// Blitz is the most-played pace, so it is the most useful default leaderboard.
+/// Full per-`(variant, time_class)` selection and pagination on the leaderboard
+/// is a follow-up; today the endpoint always returns a single bucket, defaulting
+/// here when `time_class` is omitted.
+const DEFAULT_TIME_CLASS: TimeClass = TimeClass::Blitz;
 
 /// The minimum length of a username (inclusive).
 const USERNAME_MIN_LEN: usize = 3;
@@ -325,6 +334,11 @@ pub struct ListGamesQuery {
 pub struct LeaderboardQuery {
     /// The variant whose leaderboard to return (e.g. `"standard"`). Required.
     pub variant: String,
+    /// The time class whose leaderboard to return (e.g. `"blitz"`). Optional;
+    /// defaults to [`DEFAULT_TIME_CLASS`] when absent so existing callers that
+    /// only pass `variant` keep getting a populated board. Full
+    /// pagination/filtering of leaderboards is a follow-up issue.
+    pub time_class: Option<String>,
     /// Maximum number of entries to return. Clamped to
     /// [`MAX_LEADERBOARD_LIMIT`]; defaults to [`DEFAULT_LEADERBOARD_LIMIT`] when
     /// absent.
@@ -351,6 +365,10 @@ pub struct LeaderboardEntry {
 pub struct LeaderboardResponse {
     /// The variant this leaderboard is for, echoed back from the request.
     pub variant: String,
+    /// The time class this leaderboard is for (the resolved value, which is
+    /// [`DEFAULT_TIME_CLASS`] when the request omitted it).
+    #[schema(value_type = String)]
+    pub time_class: TimeClass,
     /// The ranked players, ordered by rating descending.
     pub entries: Vec<LeaderboardEntry>,
 }
@@ -416,11 +434,15 @@ pub struct UpdateProfileRequest {
     pub username: String,
 }
 
-/// One variant's rating in the per-user ratings listing.
+/// One `(variant, time_class)` rating in the per-user ratings listing.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct UserRatingDto {
     /// The variant this rating is for (e.g. `"standard"`).
     pub variant_id: String,
+    /// The time class this rating is for (e.g. `"blitz"`). Ratings are kept per
+    /// `(variant, time_class)`, so a player may hold several ratings per variant.
+    #[schema(value_type = String)]
+    pub time_class: TimeClass,
     /// The Glicko-2 rating itself.
     pub rating: RatingDto,
     /// Whether the rating is **provisional** — its deviation is still above the
@@ -435,7 +457,8 @@ pub struct UserRatingsResponse {
     /// The user these ratings belong to.
     #[schema(value_type = String, format = Uuid)]
     pub user_id: UserId,
-    /// One entry per variant the user has a rating in, ordered by variant id.
+    /// One entry per `(variant, time_class)` the user has a rating in, ordered
+    /// by variant id then time class.
     pub ratings: Vec<UserRatingDto>,
 }
 
@@ -444,6 +467,9 @@ pub struct UserRatingsResponse {
 pub struct RatingHistoryQuery {
     /// The variant whose history to return (e.g. `"standard"`). Required.
     pub variant: String,
+    /// The time class whose history to return (e.g. `"blitz"`). Defaults to
+    /// [`DEFAULT_TIME_CLASS`] when absent, so existing callers keep working.
+    pub time_class: Option<String>,
     /// Maximum number of snapshots to return. Clamped to [`MAX_HISTORY_LIMIT`];
     /// defaults to [`DEFAULT_HISTORY_LIMIT`] when absent.
     pub limit: Option<u32>,
@@ -473,6 +499,10 @@ pub struct RatingHistoryResponse {
     pub user_id: UserId,
     /// The variant the history is for, echoed back from the request.
     pub variant_id: String,
+    /// The time class the history is for, echoed back (the resolved value, which
+    /// is [`DEFAULT_TIME_CLASS`] when the request omitted it).
+    #[schema(value_type = String)]
+    pub time_class: TimeClass,
     /// The snapshots, most-recent-first.
     pub entries: Vec<RatingHistoryEntryDto>,
 }
@@ -503,6 +533,23 @@ fn validate_username(raw: &str) -> ApiResult<&str> {
 /// Reports whether a rating is provisional given its deviation.
 fn is_provisional(deviation: f64) -> bool {
     deviation > PROVISIONAL_DEVIATION_THRESHOLD
+}
+
+/// Resolves an optional `time_class` query value to a [`TimeClass`].
+///
+/// `None` (the parameter was omitted) maps to [`DEFAULT_TIME_CLASS`], keeping
+/// callers that only pass `variant` working. A present-but-unrecognised value is
+/// a **422 Unprocessable Entity** so the client can correct it.
+fn resolve_time_class(raw: Option<&str>) -> ApiResult<TimeClass> {
+    match raw {
+        None => Ok(DEFAULT_TIME_CLASS),
+        Some(s) => s.parse::<TimeClass>().map_err(|_| {
+            ApiError::UnprocessableEntity(format!(
+                "unknown time class {s:?}; expected one of bullet, blitz, rapid, \
+                 classical, correspondence"
+            ))
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -807,16 +854,17 @@ async fn get_game(
 ) -> ApiResult<Json<GameDto>> {
     let game = state.storage().games().get(id).await?;
 
-    // Attach each player's current rating for this game's variant. An unrated
-    // player (no row yet) is reported at the Glicko-2 seed, matching what the
-    // rating-update hook would seed them with.
+    // Attach each player's current rating for this game's (variant, time_class).
+    // An unrated player (no row yet) is reported at the Glicko-2 seed, matching
+    // what the rating-update hook would seed them with.
+    let time_class = game.time_control.time_class();
     let ratings = state.storage().ratings();
     let white = ratings
-        .get(game.white, &game.variant_id)
+        .get(game.white, &game.variant_id, time_class)
         .await?
         .unwrap_or_default();
     let black = ratings
-        .get(game.black, &game.variant_id)
+        .get(game.black, &game.variant_id, time_class)
         .await?
         .unwrap_or_default();
 
@@ -841,9 +889,12 @@ async fn list_games(
     }))
 }
 
-/// `GET /leaderboard?variant=&limit=` — the top-rated players for a variant.
+/// `GET /leaderboard?variant=&time_class=&limit=` — the top-rated players for a
+/// `(variant, time_class)`.
 ///
-/// Returns players ordered by rating descending. `limit` is clamped to
+/// Returns players ordered by rating descending. `time_class` is optional and
+/// defaults to [`DEFAULT_TIME_CLASS`] (an unknown value is a **422**); full
+/// per-bucket pagination is a follow-up. `limit` is clamped to
 /// [`MAX_LEADERBOARD_LIMIT`] and defaults to [`DEFAULT_LEADERBOARD_LIMIT`]. Each
 /// entry carries the player's id, current rating, and — where it can be resolved
 /// over the same store — their address. A user lookup that misses leaves
@@ -857,11 +908,12 @@ async fn leaderboard(
         .limit
         .unwrap_or(DEFAULT_LEADERBOARD_LIMIT)
         .min(MAX_LEADERBOARD_LIMIT);
+    let time_class = resolve_time_class(query.time_class.as_deref())?;
 
     let ranked = state
         .storage()
         .ratings()
-        .leaderboard(&query.variant, limit)
+        .leaderboard(&query.variant, time_class, limit)
         .await?;
 
     let mut entries = Vec::with_capacity(ranked.len());
@@ -884,6 +936,7 @@ async fn leaderboard(
 
     Ok(Json(LeaderboardResponse {
         variant: query.variant,
+        time_class,
         entries,
     }))
 }
@@ -983,10 +1036,11 @@ async fn update_profile(
     }))
 }
 
-/// `GET /users/{id}/ratings` — every variant rating the user holds.
+/// `GET /users/{id}/ratings` — every `(variant, time_class)` rating the user
+/// holds.
 ///
-/// Returns `{ user_id, ratings: [{ variant_id, rating, provisional }] }`, where
-/// `provisional` is `true` when the rating's deviation is still above the
+/// Returns `{ user_id, ratings: [{ variant_id, time_class, rating, provisional }] }`,
+/// where `provisional` is `true` when the rating's deviation is still above the
 /// [`PROVISIONAL_DEVIATION_THRESHOLD`]. A user with no rated games yields an
 /// empty `ratings` list. A missing user is a **404 Not Found**.
 async fn get_user_ratings(
@@ -1000,9 +1054,10 @@ async fn get_user_ratings(
     let ratings = state.storage().ratings().list_for_user(id).await?;
     let ratings = ratings
         .into_iter()
-        .map(|(variant_id, rating)| UserRatingDto {
+        .map(|(variant_id, time_class, rating)| UserRatingDto {
             provisional: is_provisional(rating.deviation),
             variant_id,
+            time_class,
             rating: rating.into(),
         })
         .collect();
@@ -1013,12 +1068,13 @@ async fn get_user_ratings(
     }))
 }
 
-/// `GET /users/{id}/rating-history?variant=&limit=` — a user's rating trail for
-/// a variant, most-recent-first.
+/// `GET /users/{id}/rating-history?variant=&time_class=&limit=` — a user's
+/// rating trail for a `(variant, time_class)`, most-recent-first.
 ///
-/// `limit` is clamped to [`MAX_HISTORY_LIMIT`] and defaults to
-/// [`DEFAULT_HISTORY_LIMIT`]. A missing user is a **404 Not Found**; a variant
-/// the user has no history in yields an empty list.
+/// `time_class` is optional and defaults to [`DEFAULT_TIME_CLASS`] (an unknown
+/// value is a **422**). `limit` is clamped to [`MAX_HISTORY_LIMIT`] and defaults
+/// to [`DEFAULT_HISTORY_LIMIT`]. A missing user is a **404 Not Found**; a
+/// `(variant, time_class)` the user has no history in yields an empty list.
 async fn get_user_rating_history(
     State(state): State<AppState>,
     Path(id): Path<UserId>,
@@ -1031,11 +1087,12 @@ async fn get_user_rating_history(
         .limit
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
         .min(MAX_HISTORY_LIMIT);
+    let time_class = resolve_time_class(query.time_class.as_deref())?;
 
     let history = state
         .storage()
         .rating_history()
-        .list(id, &query.variant, limit)
+        .list(id, &query.variant, time_class, limit)
         .await?;
 
     let entries = history
@@ -1051,6 +1108,7 @@ async fn get_user_rating_history(
     Ok(Json(RatingHistoryResponse {
         user_id: id,
         variant_id: query.variant,
+        time_class,
         entries,
     }))
 }
@@ -1166,10 +1224,12 @@ pub(crate) fn list_games_doc() {}
     tag = "leaderboard",
     params(
         ("variant" = String, Query, description = "The variant to rank (e.g. \"standard\"). Required."),
+        ("time_class" = Option<String>, Query, description = "Time class to rank (bullet|blitz|rapid|classical|correspondence; default blitz)."),
         ("limit" = Option<u32>, Query, description = "Max entries (clamped to 200; default 20)."),
     ),
     responses(
         (status = 200, description = "Ranked players, highest-rated first.", body = LeaderboardResponse),
+        (status = 422, description = "Unknown time class.", body = crate::openapi::ProblemDetails),
     ),
 )]
 #[allow(dead_code)]
@@ -1256,11 +1316,13 @@ pub(crate) fn get_user_ratings_doc() {}
     params(
         ("id" = String, Path, description = "User id (UUID)."),
         ("variant" = String, Query, description = "The variant to report (e.g. \"standard\"). Required."),
+        ("time_class" = Option<String>, Query, description = "Time class to report (bullet|blitz|rapid|classical|correspondence; default blitz)."),
         ("limit" = Option<u32>, Query, description = "Max snapshots (clamped to 200; default 50)."),
     ),
     responses(
         (status = 200, description = "Rating snapshots, most-recent-first.", body = RatingHistoryResponse),
         (status = 404, description = "No such user.", body = crate::openapi::ProblemDetails),
+        (status = 422, description = "Unknown time class.", body = crate::openapi::ProblemDetails),
     ),
 )]
 #[allow(dead_code)]

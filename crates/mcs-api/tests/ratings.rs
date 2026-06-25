@@ -28,7 +28,7 @@ use tower::ServiceExt;
 use mcs_api::{router, AppState, SiweConfig};
 use mcs_auth::SessionConfig;
 use mcs_core::{Action, Color, GameSession, VariantOptions, VariantRegistry};
-use mcs_domain::{Game, GameId, GameLifecycle, TimeControl, User, UserId};
+use mcs_domain::{Game, GameId, GameLifecycle, TimeClass, TimeControl, User, UserId};
 use mcs_game::{GameActor, GameHandle};
 use mcs_storage::SqlxStorage;
 use mcs_variant_standard::wire::StandardAction;
@@ -107,12 +107,26 @@ async fn start_game_rated(
     black: UserId,
     rated: bool,
 ) -> (GameId, GameHandle) {
+    start_game_full(state, white, black, rated, TimeControl::Unlimited).await
+}
+
+/// The most general game-start helper: an `Active`, persisted standard game with
+/// an explicit `rated` flag and `time_control`. The time control determines the
+/// game's [`mcs_domain::TimeClass`], which keys the rating the finish hook
+/// updates.
+async fn start_game_full(
+    state: &AppState,
+    white: UserId,
+    black: UserId,
+    rated: bool,
+    time_control: TimeControl,
+) -> (GameId, GameHandle) {
     let mut game = Game::new(
         STANDARD_VARIANT_ID.to_owned(),
         VariantOptions::default(),
         white,
         black,
-        TimeControl::Unlimited,
+        time_control.clone(),
         rated,
         OffsetDateTime::now_utc(),
     );
@@ -133,7 +147,7 @@ async fn start_game_rated(
         repo,
         action_log,
         hook,
-        TimeControl::Unlimited,
+        time_control,
     );
     state.game_hub().insert(game_id, handle.clone());
     (game_id, handle)
@@ -182,12 +196,18 @@ async fn get_game_json(state: &AppState, game_id: GameId) -> Value {
     body_json(resp.into_body()).await
 }
 
-/// `GET /leaderboard?variant=&limit=`, returning the parsed JSON body.
+/// `GET /leaderboard?variant=&time_class=&limit=`, returning the parsed JSON
+/// body.
+///
+/// These tests drive `TimeControl::Unlimited` games, which map to the
+/// `correspondence` time class, so the leaderboard is queried for that bucket.
 async fn get_leaderboard(state: &AppState, variant: &str, limit: u32) -> Value {
     let resp = router(state.clone())
         .oneshot(
             Request::builder()
-                .uri(format!("/leaderboard?variant={variant}&limit={limit}"))
+                .uri(format!(
+                    "/leaderboard?variant={variant}&time_class=correspondence&limit={limit}"
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -374,5 +394,93 @@ async fn leaderboard_for_unknown_variant_is_empty() {
     // Querying a variant nobody has played returns an empty list, not an error.
     let board = get_leaderboard(&state, "chess960", 10).await;
     assert_eq!(board["variant"].as_str().unwrap(), "chess960");
+    assert_eq!(board["time_class"].as_str().unwrap(), "correspondence");
     assert!(board["entries"].as_array().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// A finished game updates only its own time class; sibling classes are
+// untouched (#132).
+// ---------------------------------------------------------------------------
+
+/// `GET /leaderboard` for an explicit `(variant, time_class)`.
+async fn get_leaderboard_tc(state: &AppState, variant: &str, time_class: TimeClass) -> Value {
+    let resp = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/leaderboard?variant={variant}&time_class={}&limit=10",
+                    time_class.as_str()
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp.into_body()).await
+}
+
+#[tokio::test]
+async fn blitz_game_leaves_rapid_rating_untouched() {
+    let state = test_app().await;
+    let white = create_user(&state, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").await;
+    let black = create_user(&state, "0xcccccccccccccccccccccccccccccccccccccccc").await;
+
+    // 5+0 → estimated 300s → blitz.
+    let blitz = TimeControl::RealTime {
+        initial: std::time::Duration::from_secs(300),
+        increment: std::time::Duration::ZERO,
+    };
+    let (_game_id, handle) = start_game_full(&state, white.id, black.id, true, blitz).await;
+    handle.submit_action(Color::White, resign()).await.unwrap();
+    assert!(handle.status().await.unwrap().is_finished());
+
+    // The blitz leaderboard now lists both players.
+    let blitz_board = get_leaderboard_tc(&state, STANDARD_VARIANT_ID, TimeClass::Blitz).await;
+    assert_eq!(
+        blitz_board["entries"].as_array().unwrap().len(),
+        2,
+        "blitz game must populate the blitz leaderboard: {blitz_board}"
+    );
+
+    // The rapid leaderboard is untouched: a blitz game must not write rapid rows.
+    let rapid_board = get_leaderboard_tc(&state, STANDARD_VARIANT_ID, TimeClass::Rapid).await;
+    assert!(
+        rapid_board["entries"].as_array().unwrap().is_empty(),
+        "a blitz game must leave the rapid rating untouched: {rapid_board}"
+    );
+
+    // The per-user ratings listing reports the single blitz rating only.
+    let resp = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/users/{}/ratings", white.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_json(resp.into_body()).await;
+    let ratings = body["ratings"].as_array().expect("ratings");
+    assert_eq!(ratings.len(), 1, "exactly one (variant, time_class) rating");
+    assert_eq!(ratings[0]["variant_id"].as_str(), Some(STANDARD_VARIANT_ID));
+    assert_eq!(ratings[0]["time_class"].as_str(), Some("blitz"));
+}
+
+#[tokio::test]
+async fn leaderboard_rejects_unknown_time_class() {
+    let state = test_app().await;
+    let resp = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/leaderboard?variant={STANDARD_VARIANT_ID}&time_class=hyperbullet"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }

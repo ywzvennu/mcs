@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::ids::{GameId, UserId};
+use crate::time_control::TimeClass;
 
 /// A Glicko-2 rating record.
 ///
@@ -74,6 +75,9 @@ pub struct RatingHistoryEntry {
     /// The variant the rating is for (an opaque application-level string, e.g.
     /// `"standard"`).
     pub variant_id: String,
+    /// The time class the rating is for. Ratings are keyed per
+    /// `(variant, time_class)`, so a snapshot records which bucket it belongs to.
+    pub time_class: TimeClass,
     /// The rating value (μ on the display scale) after the game was scored.
     pub value: f64,
     /// The rating deviation (φ) after the game was scored.
@@ -126,6 +130,7 @@ mod tests {
         let entry = RatingHistoryEntry {
             user_id: UserId::new(),
             variant_id: "standard".to_owned(),
+            time_class: TimeClass::Blitz,
             value: 1612.0,
             deviation: 90.0,
             game_id: GameId::new(),

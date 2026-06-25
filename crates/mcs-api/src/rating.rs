@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 
 use mcs_core::{Color, Outcome};
-use mcs_domain::{Game, Rating, RatingHistoryEntry, UserId};
+use mcs_domain::{Game, Rating, RatingHistoryEntry, TimeClass, UserId};
 use mcs_game::GameCompletionHook;
 use mcs_rating::{update_single, Glicko2Rating, Score, DEFAULT_TAU};
 use mcs_storage::{RatingHistoryRepo, RatingRepo};
@@ -72,6 +72,7 @@ impl RatingUpdateHook {
         &self,
         user: UserId,
         variant_id: &str,
+        time_class: TimeClass,
         rating: &Rating,
         game_id: mcs_domain::GameId,
         now: OffsetDateTime,
@@ -79,6 +80,7 @@ impl RatingUpdateHook {
         let entry = RatingHistoryEntry {
             user_id: user,
             variant_id: variant_id.to_owned(),
+            time_class,
             value: rating.value,
             deviation: rating.deviation,
             game_id,
@@ -88,25 +90,33 @@ impl RatingUpdateHook {
             tracing::error!(
                 %user,
                 variant_id,
+                %time_class,
                 %error,
                 "failed to append rating-history snapshot",
             );
         }
     }
 
-    /// Loads `user`'s current rating for `variant_id`, falling back to the
-    /// Glicko-2 seed for an unrated player. A storage error is propagated so the
-    /// caller can abort the whole update rather than persist a partial result.
-    async fn current_rating(&self, user: UserId, variant_id: &str) -> Result<Rating, ()> {
-        match self.ratings.get(user, variant_id).await {
+    /// Loads `user`'s current rating for `(variant_id, time_class)`, falling back
+    /// to the Glicko-2 seed for an unrated player. A storage error is propagated
+    /// so the caller can abort the whole update rather than persist a partial
+    /// result.
+    async fn current_rating(
+        &self,
+        user: UserId,
+        variant_id: &str,
+        time_class: TimeClass,
+    ) -> Result<Rating, ()> {
+        match self.ratings.get(user, variant_id, time_class).await {
             Ok(Some(rating)) => Ok(rating),
-            // No row yet: a player's first rated game in this variant starts from
-            // the standard seed.
+            // No row yet: a player's first rated game in this (variant, time
+            // class) starts from the standard seed.
             Ok(None) => Ok(Rating::default()),
             Err(error) => {
                 tracing::error!(
                     %user,
                     variant_id,
+                    %time_class,
                     %error,
                     "failed to read rating for post-game update; skipping",
                 );
@@ -150,13 +160,18 @@ impl GameCompletionHook for RatingUpdateHook {
         }
 
         let variant_id = game.variant_id.as_str();
+        // Ratings are keyed per (variant, time_class): a bullet game updates the
+        // player's bullet rating, a classical game their classical rating, etc.
+        let time_class = game.time_control.time_class();
         let (white_score, black_score) = scores_for(outcome);
 
         // Read both players' pre-game ratings. If either read fails we abort the
         // whole update so we never persist a one-sided change.
         let (Ok(white_rating), Ok(black_rating)) = (
-            self.current_rating(game.white, variant_id).await,
-            self.current_rating(game.black, variant_id).await,
+            self.current_rating(game.white, variant_id, time_class)
+                .await,
+            self.current_rating(game.black, variant_id, time_class)
+                .await,
         ) else {
             return;
         };
@@ -182,17 +197,25 @@ impl GameCompletionHook for RatingUpdateHook {
         // records a rating the current-rating row does not also reflect.
         match self
             .ratings
-            .upsert(game.white, variant_id, &white_post)
+            .upsert(game.white, variant_id, time_class, &white_post)
             .await
         {
             Ok(()) => {
-                self.record_history(game.white, variant_id, &white_post, game.id, now)
-                    .await;
+                self.record_history(
+                    game.white,
+                    variant_id,
+                    time_class,
+                    &white_post,
+                    game.id,
+                    now,
+                )
+                .await;
             }
             Err(error) => {
                 tracing::error!(
                     user = %game.white,
                     variant_id,
+                    %time_class,
                     %error,
                     "failed to persist updated rating for White",
                 );
@@ -200,17 +223,25 @@ impl GameCompletionHook for RatingUpdateHook {
         }
         match self
             .ratings
-            .upsert(game.black, variant_id, &black_post)
+            .upsert(game.black, variant_id, time_class, &black_post)
             .await
         {
             Ok(()) => {
-                self.record_history(game.black, variant_id, &black_post, game.id, now)
-                    .await;
+                self.record_history(
+                    game.black,
+                    variant_id,
+                    time_class,
+                    &black_post,
+                    game.id,
+                    now,
+                )
+                .await;
             }
             Err(error) => {
                 tracing::error!(
                     user = %game.black,
                     variant_id,
+                    %time_class,
                     %error,
                     "failed to persist updated rating for Black",
                 );
@@ -224,6 +255,7 @@ impl GameCompletionHook for RatingUpdateHook {
         tracing::info!(
             game_id = %game.id,
             variant_id,
+            %time_class,
             "applied post-game Glicko-2 rating update",
         );
     }

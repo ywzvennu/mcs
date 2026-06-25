@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use mcs_domain::{
     Challenge, ChallengeId, ChallengeStatus, EvmAddress, Game, GameId, GameLifecycle, Rating,
-    RatingHistoryEntry, Seek, SeekId, User, UserId,
+    RatingHistoryEntry, Seek, SeekId, TimeClass, User, UserId,
 };
 use time::OffsetDateTime;
 
@@ -453,35 +453,52 @@ impl RevokedTokenRepo for MemoryRevokedTokenRepo {
 
 /// In-memory [`RatingRepo`] backed by a `HashMap`.
 ///
-/// Key: `(user_id_string, variant_id_string)` → [`Rating`].
+/// Key: `(user_id_string, variant_id_string, time_class)` → [`Rating`].
 #[derive(Debug, Default)]
 pub(super) struct MemoryRatingRepo {
-    ratings: Mutex<HashMap<(String, String), Rating>>,
+    ratings: Mutex<HashMap<(String, String, TimeClass), Rating>>,
 }
 
 #[async_trait]
 impl RatingRepo for MemoryRatingRepo {
-    async fn get(&self, user: UserId, variant_id: &str) -> StorageResult<Option<Rating>> {
+    async fn get(
+        &self,
+        user: UserId,
+        variant_id: &str,
+        time_class: TimeClass,
+    ) -> StorageResult<Option<Rating>> {
         let map = self.ratings.lock().expect("mutex poisoned");
-        Ok(map.get(&(user.to_string(), variant_id.to_owned())).cloned())
+        Ok(map
+            .get(&(user.to_string(), variant_id.to_owned(), time_class))
+            .cloned())
     }
 
-    async fn upsert(&self, user: UserId, variant_id: &str, rating: &Rating) -> StorageResult<()> {
+    async fn upsert(
+        &self,
+        user: UserId,
+        variant_id: &str,
+        time_class: TimeClass,
+        rating: &Rating,
+    ) -> StorageResult<()> {
         let mut map = self.ratings.lock().expect("mutex poisoned");
-        map.insert((user.to_string(), variant_id.to_owned()), rating.clone());
+        map.insert(
+            (user.to_string(), variant_id.to_owned(), time_class),
+            rating.clone(),
+        );
         Ok(())
     }
 
     async fn leaderboard(
         &self,
         variant_id: &str,
+        time_class: TimeClass,
         limit: u32,
     ) -> StorageResult<Vec<(UserId, Rating)>> {
         let map = self.ratings.lock().expect("mutex poisoned");
         let mut entries: Vec<(UserId, Rating)> = map
             .iter()
-            .filter(|((_, vid), _)| vid == variant_id)
-            .map(|((uid, _), r)| {
+            .filter(|((_, vid, tc), _)| vid == variant_id && *tc == time_class)
+            .map(|((uid, _, _), r)| {
                 let user_id: UserId = uid.parse().expect("stored UserId must be valid UUID");
                 (user_id, r.clone())
             })
@@ -497,16 +514,19 @@ impl RatingRepo for MemoryRatingRepo {
         Ok(entries)
     }
 
-    async fn list_for_user(&self, user: UserId) -> StorageResult<Vec<(String, Rating)>> {
+    async fn list_for_user(&self, user: UserId) -> StorageResult<Vec<(String, TimeClass, Rating)>> {
         let map = self.ratings.lock().expect("mutex poisoned");
         let uid = user.to_string();
-        let mut entries: Vec<(String, Rating)> = map
+        let mut entries: Vec<(String, TimeClass, Rating)> = map
             .iter()
-            .filter(|((u, _), _)| *u == uid)
-            .map(|((_, vid), r)| (vid.clone(), r.clone()))
+            .filter(|((u, _, _), _)| *u == uid)
+            .map(|((_, vid, tc), r)| (vid.clone(), *tc, r.clone()))
             .collect();
-        // Stable, deterministic order by variant id (matches the sqlx impl).
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        // Stable, deterministic order by (variant id, time class) — matches the
+        // sqlx impl's `ORDER BY variant_id, time_class`.
+        entries.sort_by(|(a_v, a_tc, _), (b_v, b_tc, _)| {
+            a_v.cmp(b_v).then_with(|| a_tc.as_str().cmp(b_tc.as_str()))
+        });
         Ok(entries)
     }
 }
@@ -533,12 +553,15 @@ impl RatingHistoryRepo for MemoryRatingHistoryRepo {
         &self,
         user: UserId,
         variant_id: &str,
+        time_class: TimeClass,
         limit: u32,
     ) -> StorageResult<Vec<RatingHistoryEntry>> {
         let log = self.entries.lock().expect("mutex poisoned");
         let mut out: Vec<RatingHistoryEntry> = log
             .iter()
-            .filter(|e| e.user_id == user && e.variant_id == variant_id)
+            .filter(|e| {
+                e.user_id == user && e.variant_id == variant_id && e.time_class == time_class
+            })
             .cloned()
             .collect();
         // Most-recent-first.

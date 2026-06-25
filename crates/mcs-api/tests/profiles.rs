@@ -23,7 +23,7 @@ use tower::ServiceExt;
 use mcs_api::{router, AppState, SiweConfig};
 use mcs_auth::{issue_session, SessionConfig};
 use mcs_core::{Action, Color, GameSession, VariantOptions, VariantRegistry};
-use mcs_domain::{Game, GameId, GameLifecycle, Rating, TimeControl, User, UserId};
+use mcs_domain::{Game, GameId, GameLifecycle, Rating, TimeClass, TimeControl, User, UserId};
 use mcs_game::{GameActor, GameHandle};
 use mcs_storage::SqlxStorage;
 use mcs_variant_standard::wire::StandardAction;
@@ -227,6 +227,7 @@ async fn user_ratings_lists_all_variants_with_provisional_flag() {
         .upsert(
             user.id,
             "standard",
+            TimeClass::Blitz,
             &Rating {
                 value: 1700.0,
                 deviation: 80.0,
@@ -241,6 +242,7 @@ async fn user_ratings_lists_all_variants_with_provisional_flag() {
         .upsert(
             user.id,
             "chess960",
+            TimeClass::Blitz,
             &Rating {
                 value: 1500.0,
                 deviation: 300.0,
@@ -272,6 +274,7 @@ async fn user_ratings_lists_all_variants_with_provisional_flag() {
         .find(|r| r["variant_id"] == "standard")
         .expect("standard entry");
     assert_eq!(standard["rating"]["value"].as_f64(), Some(1700.0));
+    assert_eq!(standard["time_class"].as_str(), Some("blitz"));
     assert_eq!(standard["provisional"].as_bool(), Some(false));
 
     let chess960 = ratings
@@ -363,11 +366,19 @@ fn resign() -> Action {
     Action::from_typed(&StandardAction::Resign).expect("serializable")
 }
 
-async fn get_rating_history(state: &AppState, user: UserId, variant: &str) -> Value {
+async fn get_rating_history(
+    state: &AppState,
+    user: UserId,
+    variant: &str,
+    time_class: TimeClass,
+) -> Value {
     let resp = router(state.clone())
         .oneshot(
             Request::builder()
-                .uri(format!("/users/{user}/rating-history?variant={variant}"))
+                .uri(format!(
+                    "/users/{user}/rating-history?variant={variant}&time_class={}",
+                    time_class.as_str()
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -390,12 +401,19 @@ async fn rated_game_appends_two_history_rows_returned_ordered() {
     assert!(handle.status().await.unwrap().is_finished());
 
     // White's history: exactly one snapshot from this game.
-    let white_hist = get_rating_history(&state, white.id, STANDARD_VARIANT_ID).await;
+    let white_hist = get_rating_history(
+        &state,
+        white.id,
+        STANDARD_VARIANT_ID,
+        TimeClass::Correspondence,
+    )
+    .await;
     assert_eq!(
         white_hist["user_id"].as_str(),
         Some(white.id.to_string().as_str())
     );
     assert_eq!(white_hist["variant_id"].as_str(), Some(STANDARD_VARIANT_ID));
+    assert_eq!(white_hist["time_class"].as_str(), Some("correspondence"));
     let white_entries = white_hist["entries"].as_array().expect("entries");
     assert_eq!(white_entries.len(), 1);
     assert_eq!(
@@ -406,7 +424,13 @@ async fn rated_game_appends_two_history_rows_returned_ordered() {
     assert!(white_entries[0]["value"].as_f64().unwrap() < 1500.0);
 
     // Black's history: one snapshot, with the winner's value above the seed.
-    let black_hist = get_rating_history(&state, black.id, STANDARD_VARIANT_ID).await;
+    let black_hist = get_rating_history(
+        &state,
+        black.id,
+        STANDARD_VARIANT_ID,
+        TimeClass::Correspondence,
+    )
+    .await;
     let black_entries = black_hist["entries"].as_array().expect("entries");
     assert_eq!(black_entries.len(), 1);
     assert!(black_entries[0]["value"].as_f64().unwrap() > 1500.0);
@@ -417,7 +441,13 @@ async fn rated_game_appends_two_history_rows_returned_ordered() {
     handle2.submit_action(Color::White, resign()).await.unwrap();
     assert!(handle2.status().await.unwrap().is_finished());
 
-    let white_hist = get_rating_history(&state, white.id, STANDARD_VARIANT_ID).await;
+    let white_hist = get_rating_history(
+        &state,
+        white.id,
+        STANDARD_VARIANT_ID,
+        TimeClass::Correspondence,
+    )
+    .await;
     let entries = white_hist["entries"].as_array().expect("entries");
     assert_eq!(entries.len(), 2);
     // Most-recent-first: the second game leads.
@@ -457,7 +487,13 @@ async fn rated_game_appends_two_history_rows_returned_ordered() {
 async fn rating_history_empty_for_unplayed_variant() {
     let state = test_app().await;
     let user = create_user(&state, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").await;
-    let body = get_rating_history(&state, user.id, STANDARD_VARIANT_ID).await;
+    let body = get_rating_history(
+        &state,
+        user.id,
+        STANDARD_VARIANT_ID,
+        TimeClass::Correspondence,
+    )
+    .await;
     assert!(body["entries"].as_array().unwrap().is_empty());
 }
 
