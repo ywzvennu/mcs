@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use mcs_domain::{Challenge, ChallengeId, UserId};
+use time::OffsetDateTime;
 
 use crate::error::StorageResult;
 
@@ -74,4 +75,19 @@ pub trait ChallengeRepo: Send + Sync {
     /// - [`StorageError::Backend`](crate::StorageError::Backend) on driver-level
     ///   failures.
     async fn update(&self, challenge: &Challenge) -> StorageResult<()>;
+
+    /// Deletes resolved (Declined or Canceled) challenges whose `created_at` is
+    /// strictly before `older_than`, returning the count removed.
+    ///
+    /// Accepted, declined, and canceled challenges are terminal. Accepted
+    /// challenges are attached to a live game and should be kept for history.
+    /// Declined and canceled challenges have no associated game and are safe to
+    /// prune after the configured retention window. Run this periodically with a
+    /// cutoff of `now - max_age` to keep the table bounded.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::Backend`](crate::StorageError::Backend) on driver-level
+    ///   failures.
+    async fn purge_resolved(&self, older_than: OffsetDateTime) -> StorageResult<u64>;
 }

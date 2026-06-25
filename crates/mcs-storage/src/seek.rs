@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use mcs_domain::{Seek, SeekId};
+use time::OffsetDateTime;
 
 use crate::error::StorageResult;
 
@@ -113,4 +114,17 @@ pub trait SeekRepo: Send + Sync {
     ///
     /// - [`StorageError::Backend`] on driver-level failures.
     async fn list_open(&self) -> StorageResult<Vec<Seek>>;
+
+    /// Deletes seeks whose `created_at` is strictly before `older_than`,
+    /// returning the count removed.
+    ///
+    /// Seeks that linger in the pool without being matched or cancelled are
+    /// stale. Run this periodically with a cutoff of `now - max_age` to keep
+    /// the pool bounded. A cutoff of [`OffsetDateTime::UNIX_EPOCH`] removes
+    /// nothing; pass the actual wall-clock cutoff for meaningful pruning.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::Backend`] on driver-level failures.
+    async fn purge_stale(&self, older_than: OffsetDateTime) -> StorageResult<u64>;
 }

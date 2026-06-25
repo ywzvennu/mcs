@@ -73,4 +73,16 @@ pub trait SessionRepo: Send + Sync {
     ///
     /// - [`StorageError::Backend`] on driver-level failures.
     async fn consume_nonce(&self, address: &EvmAddress, nonce: &str) -> StorageResult<bool>;
+
+    /// Deletes every nonce whose `expires_at` is at or before `now`, returning
+    /// how many were removed.
+    ///
+    /// Expired nonces have already passed their validity window and can never
+    /// be successfully consumed. Run this periodically to keep the `auth_nonces`
+    /// table bounded by the number of *unexpired* nonces.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::Backend`] on driver-level failures.
+    async fn purge_expired_nonces(&self, now: OffsetDateTime) -> StorageResult<u64>;
 }

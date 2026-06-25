@@ -1006,6 +1006,118 @@ async fn rating_leaderboard_empty_variant_returns_empty() {
 }
 
 // ---------------------------------------------------------------------------
+// Retention / GC purge methods
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn nonce_purge_expired_removes_only_elapsed() {
+    let storage = storage().await;
+    let addr = address("purge_nonce");
+    let now = OffsetDateTime::now_utc();
+
+    storage
+        .sessions()
+        .store_nonce(&addr, "expired", now - time::Duration::minutes(5))
+        .await
+        .unwrap();
+    storage
+        .sessions()
+        .store_nonce(&addr, "live", now + time::Duration::minutes(5))
+        .await
+        .unwrap();
+
+    let removed = storage.sessions().purge_expired_nonces(now).await.unwrap();
+    assert_eq!(removed, 1, "only the expired nonce is purged");
+    // Live nonce is still consumable.
+    assert!(storage
+        .sessions()
+        .consume_nonce(&addr, "live")
+        .await
+        .unwrap());
+    // Expired nonce is gone.
+    assert!(!storage
+        .sessions()
+        .consume_nonce(&addr, "expired")
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn seek_purge_stale_removes_only_old_seeks() {
+    let storage = storage().await;
+    let now = OffsetDateTime::now_utc();
+
+    // Old seek: created 2 hours ago.
+    let mut old = sample_seek(UserId::new());
+    old.created_at = now - time::Duration::hours(2);
+    storage.seeks().create(&old).await.unwrap();
+
+    // Fresh seek: created just now.
+    let mut fresh = sample_seek(UserId::new());
+    fresh.created_at = now;
+    storage.seeks().create(&fresh).await.unwrap();
+
+    let cutoff = now - time::Duration::hours(1);
+    let removed = storage.seeks().purge_stale(cutoff).await.unwrap();
+    assert_eq!(removed, 1, "only the stale seek is removed");
+
+    let open = storage.seeks().list_open().await.unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].id, fresh.id);
+}
+
+#[tokio::test]
+async fn challenge_purge_resolved_removes_old_declined_and_canceled_only() {
+    let storage = storage().await;
+    let now = OffsetDateTime::now_utc();
+    let old_ts = now - time::Duration::hours(2);
+    let cutoff = now - time::Duration::hours(1);
+
+    // Old declined — purged.
+    let mut old_declined = sample_challenge(UserId::new(), UserId::new());
+    old_declined.created_at = old_ts;
+    storage.challenges().create(&old_declined).await.unwrap();
+    old_declined.decline();
+    storage.challenges().update(&old_declined).await.unwrap();
+
+    // Old canceled — purged.
+    let mut old_canceled = sample_challenge(UserId::new(), UserId::new());
+    old_canceled.created_at = old_ts;
+    storage.challenges().create(&old_canceled).await.unwrap();
+    old_canceled.cancel();
+    storage.challenges().update(&old_canceled).await.unwrap();
+
+    // Fresh declined — kept (within retention window).
+    let mut fresh_declined = sample_challenge(UserId::new(), UserId::new());
+    // created_at defaults to UNIX_EPOCH in sample_challenge, so override
+    fresh_declined.created_at = now;
+    storage.challenges().create(&fresh_declined).await.unwrap();
+    fresh_declined.decline();
+    storage.challenges().update(&fresh_declined).await.unwrap();
+
+    // Old pending — kept (not in a resolved terminal state).
+    let mut old_pending = sample_challenge(UserId::new(), UserId::new());
+    old_pending.created_at = old_ts;
+    storage.challenges().create(&old_pending).await.unwrap();
+
+    let removed = storage.challenges().purge_resolved(cutoff).await.unwrap();
+    assert_eq!(removed, 2, "old declined and canceled are purged");
+
+    // Fresh declined and old pending still present.
+    assert!(storage.challenges().get(fresh_declined.id).await.is_ok());
+    assert!(storage.challenges().get(old_pending.id).await.is_ok());
+    // Old declined and canceled are gone.
+    assert!(matches!(
+        storage.challenges().get(old_declined.id).await,
+        Err(StorageError::NotFound)
+    ));
+    assert!(matches!(
+        storage.challenges().get(old_canceled.id).await,
+        Err(StorageError::NotFound)
+    ));
+}
+
+// ---------------------------------------------------------------------------
 // Repositories aggregate
 // ---------------------------------------------------------------------------
 

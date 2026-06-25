@@ -26,6 +26,7 @@
 pub mod cluster;
 pub mod config;
 pub mod metrics;
+pub mod retention;
 
 use std::sync::Arc;
 
@@ -37,6 +38,7 @@ use mcs_auth::SessionConfig;
 use mcs_core::VariantRegistry;
 use mcs_storage::SqlxStorage;
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -348,14 +350,15 @@ pub async fn recover_games(state: &AppState) -> anyhow::Result<usize> {
 /// [`SqlxStorage`](mcs_storage::SqlxStorage) (building the pool and running
 /// migrations), builds the state, **recovers any games that were in progress**
 /// (see [`recover_games`]) into the live-game hub, **wires cluster membership**
-/// (see [`cluster::setup`]) when `[cluster].enabled`, then assembles the router.
-/// The session `secret` is supplied separately so the caller controls the
-/// ephemeral-secret policy.
+/// (see [`cluster::setup`]) when `[cluster].enabled`, **spawns the retention
+/// background task** (see [`retention::spawn_retention_task`]) when
+/// `[retention].enabled`, then assembles the router. The session `secret` is
+/// supplied separately so the caller controls the ephemeral-secret policy.
 ///
-/// Returns the assembled [`Router`] together with an optional [`ClusterRuntime`]:
-/// `Some` when cluster mode is enabled (the caller must
-/// [`shutdown`](ClusterRuntime::shutdown) it on graceful shutdown to leave the
-/// registry promptly), `None` for a single-node server.
+/// Returns the assembled [`Router`] together with an optional [`ClusterRuntime`]
+/// and a [`CancellationToken`] that stops the retention task on graceful shutdown:
+/// `None` cluster runtime for a single-node server. The retention token is always
+/// returned; cancelling it is a no-op when the task was not spawned.
 ///
 /// # Errors
 ///
@@ -368,10 +371,31 @@ pub async fn recover_games(state: &AppState) -> anyhow::Result<usize> {
 pub async fn build_app(
     cfg: &Config,
     session_secret: Vec<u8>,
-) -> anyhow::Result<(Router, Option<ClusterRuntime>)> {
+) -> anyhow::Result<(Router, Option<ClusterRuntime>, CancellationToken)> {
     let storage = Arc::new(
         SqlxStorage::connect_with(&cfg.database_url, cfg.database.to_pool_config()).await?,
     );
+
+    // Spawn the retention background task before handing storage to the state.
+    // The task holds its own `Arc` references to the individual repos so it
+    // runs independently of the HTTP handlers. Each coercion shares the same
+    // underlying allocation (one reference-counted `SqlxStorage`).
+    let retention_token = CancellationToken::new();
+    {
+        let sessions: Arc<dyn mcs_storage::SessionRepo> = storage.clone();
+        let revoked_tokens: Arc<dyn mcs_storage::RevokedTokenRepo> = storage.clone();
+        let seeks: Arc<dyn mcs_storage::SeekRepo> = storage.clone();
+        let challenges: Arc<dyn mcs_storage::ChallengeRepo> = storage.clone();
+        retention::spawn_retention_task(
+            sessions,
+            revoked_tokens,
+            seeks,
+            challenges,
+            cfg.retention.clone(),
+            retention_token.clone(),
+        );
+    }
+
     let state = build_state(cfg, storage, session_secret)?;
     recover_games(&state).await?;
     // Wire cluster membership when enabled (no-op otherwise; the state keeps its
@@ -384,5 +408,6 @@ pub async fn build_app(
     Ok((
         router_with_cors(state, Some(cors_layer), Some(&cfg.http)),
         cluster,
+        retention_token,
     ))
 }

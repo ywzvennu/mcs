@@ -70,6 +70,10 @@
 //! | `http.max_ws_message_bytes` | `MCS_HTTP__MAX_WS_MESSAGE_BYTES` | `1048576` (1 MiB) |
 //! | `http.hsts` | `MCS_HTTP__HSTS` | `false`                                        |
 //! | `http.hsts_max_age_secs` | `MCS_HTTP__HSTS_MAX_AGE_SECS` | `31536000` (1y) |
+//! | `retention.enabled` | `MCS_RETENTION__ENABLED` | `true`                          |
+//! | `retention.interval_secs` | `MCS_RETENTION__INTERVAL_SECS` | `3600` (1h)   |
+//! | `retention.seek_max_age_secs` | `MCS_RETENTION__SEEK_MAX_AGE_SECS` | `86400` (24h) |
+//! | `retention.challenge_max_age_secs` | `MCS_RETENTION__CHALLENGE_MAX_AGE_SECS` | `86400` (24h) |
 //! | `limits.nonce_per_minute` | `MCS_LIMITS__NONCE_PER_MINUTE` | `10`           |
 //! | `limits.verify_per_minute` | `MCS_LIMITS__VERIFY_PER_MINUTE` | `20`         |
 //! | `limits.create_per_minute` | `MCS_LIMITS__CREATE_PER_MINUTE` | `30`         |
@@ -340,6 +344,8 @@ pub struct Config {
     pub http: HttpSettings,
     /// Abuse-protection limits: per-IP rate limiting and resource caps (#100).
     pub limits: LimitsSettings,
+    /// Periodic retention / GC for ephemeral data (#107).
+    pub retention: RetentionSettings,
 }
 
 /// Database connection-pool tuning (#105).
@@ -666,6 +672,61 @@ pub struct HttpSettings {
     pub hsts_max_age_secs: u64,
 }
 
+/// Periodic retention / GC configuration for ephemeral data (#107).
+///
+/// Controls the background task that periodically purges expired and stale
+/// ephemeral rows from storage:
+///
+/// - **auth nonces** — always purged when the retention task runs; `nonce` ages
+///   are controlled by [`SiweSettings::nonce_ttl_secs`] upstream, not here.
+/// - **revoked tokens** — always purged; the denylist is self-trimming.
+/// - **stale seeks** — open seeks older than [`seek_max_age_secs`] are removed.
+/// - **resolved challenges** — declined/canceled challenges older than
+///   [`challenge_max_age_secs`] are removed. Accepted challenges (attached to a
+///   game) are never deleted by the GC task.
+///
+/// Set [`enabled`](RetentionSettings::enabled) to `false` to disable the
+/// background task entirely (useful in tests and operator opt-outs).
+/// Set an individual `*_max_age_secs` to `0` to skip that particular sweep.
+///
+/// # `config.toml` sample
+///
+/// ```toml
+/// [retention]
+/// enabled = true
+/// interval_secs = 3600           # run the sweep every hour
+/// seek_max_age_secs = 86400      # remove open seeks older than 24 h
+/// challenge_max_age_secs = 86400 # remove resolved challenges older than 24 h
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetentionSettings {
+    /// Whether the periodic retention task is running. `true` by default.
+    pub enabled: bool,
+    /// How often the retention task wakes up and runs a sweep, in seconds.
+    ///
+    /// Default: `3600` (1 hour). Must be greater than zero.
+    pub interval_secs: u64,
+    /// Maximum age of an open seek before it is considered stale and purged, in
+    /// seconds. `0` disables the seek sweep. Default: `86400` (24 h).
+    pub seek_max_age_secs: u64,
+    /// Maximum age of a resolved (Declined or Canceled) challenge before it is
+    /// purged, in seconds. `0` disables the challenge sweep. Default: `86400`
+    /// (24 h).
+    pub challenge_max_age_secs: u64,
+}
+
+impl Default for RetentionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 3600,
+            seek_max_age_secs: 86_400,
+            challenge_max_age_secs: 86_400,
+        }
+    }
+}
+
 /// Abuse-protection limits: per-IP rate limiting and resource caps (#100).
 ///
 /// All limits are enforced **per node** (per server process). In a multi-node
@@ -885,6 +946,7 @@ impl Default for Config {
             cors: CorsSettings::default(),
             http: HttpSettings::default(),
             limits: LimitsSettings::default(),
+            retention: RetentionSettings::default(),
         }
     }
 }

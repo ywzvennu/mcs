@@ -242,6 +242,13 @@ impl SeekRepo for MemorySeekRepo {
         let map = self.seeks.lock().expect("mutex poisoned");
         Ok(map.values().cloned().collect())
     }
+
+    async fn purge_stale(&self, older_than: OffsetDateTime) -> StorageResult<u64> {
+        let mut map = self.seeks.lock().expect("mutex poisoned");
+        let before = map.len();
+        map.retain(|_, seek| seek.created_at >= older_than);
+        Ok((before - map.len()) as u64)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +306,20 @@ impl ChallengeRepo for MemoryChallengeRepo {
         map.insert(challenge.id, challenge.clone());
         Ok(())
     }
+
+    async fn purge_resolved(&self, older_than: OffsetDateTime) -> StorageResult<u64> {
+        let mut map = self.challenges.lock().expect("mutex poisoned");
+        let before = map.len();
+        map.retain(|_, c| {
+            // Keep pending and accepted challenges; only remove declined/canceled
+            // ones that are old enough.
+            !(matches!(
+                c.status,
+                ChallengeStatus::Declined | ChallengeStatus::Canceled
+            ) && c.created_at < older_than)
+        });
+        Ok((before - map.len()) as u64)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +373,13 @@ impl SessionRepo for MemorySessionRepo {
                 }
             }
         }
+    }
+
+    async fn purge_expired_nonces(&self, now: OffsetDateTime) -> StorageResult<u64> {
+        let mut map = self.nonces.lock().expect("mutex poisoned");
+        let before = map.len();
+        map.retain(|_, entry| entry.expires_at > now);
+        Ok((before - map.len()) as u64)
     }
 }
 
