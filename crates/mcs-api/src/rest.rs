@@ -65,7 +65,7 @@ const MAX_GAMES_LIMIT: u32 = 100;
 
 /// The default number of entries `GET /leaderboard` returns when no `limit` is
 /// supplied.
-const DEFAULT_LEADERBOARD_LIMIT: u32 = 20;
+const DEFAULT_LEADERBOARD_LIMIT: u32 = 50;
 
 /// The largest leaderboard page `GET /leaderboard` will honour, clamping larger
 /// requests.
@@ -336,9 +336,11 @@ pub struct LeaderboardQuery {
     pub variant: String,
     /// The time class whose leaderboard to return (e.g. `"blitz"`). Optional;
     /// defaults to [`DEFAULT_TIME_CLASS`] when absent so existing callers that
-    /// only pass `variant` keep getting a populated board. Full
-    /// pagination/filtering of leaderboards is a follow-up issue.
+    /// only pass `variant` keep getting a populated board.
     pub time_class: Option<String>,
+    /// Zero-based offset into the full ranking. Defaults to `0` when absent so
+    /// the first page is returned without an explicit `offset` param.
+    pub offset: Option<u32>,
     /// Maximum number of entries to return. Clamped to
     /// [`MAX_LEADERBOARD_LIMIT`]; defaults to [`DEFAULT_LEADERBOARD_LIMIT`] when
     /// absent.
@@ -348,6 +350,10 @@ pub struct LeaderboardQuery {
 /// One ranked entry in a variant's leaderboard.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct LeaderboardEntry {
+    /// The 1-based rank within the full leaderboard. The first entry on page 1
+    /// has `rank = 1`; the first entry on a page fetched with `offset = 50`
+    /// has `rank = 51`.
+    pub rank: u64,
     /// The ranked player's stable identifier.
     #[schema(value_type = String, format = Uuid)]
     pub user_id: UserId,
@@ -360,7 +366,7 @@ pub struct LeaderboardEntry {
     pub rating: RatingDto,
 }
 
-/// Response body for `GET /leaderboard`: the top players, highest-rated first.
+/// Response body for `GET /leaderboard`: a paginated slice of the top players.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct LeaderboardResponse {
     /// The variant this leaderboard is for, echoed back from the request.
@@ -369,8 +375,16 @@ pub struct LeaderboardResponse {
     /// [`DEFAULT_TIME_CLASS`] when the request omitted it).
     #[schema(value_type = String)]
     pub time_class: TimeClass,
-    /// The ranked players, ordered by rating descending.
+    /// The ranked players on this page, ordered by rating descending.
     pub entries: Vec<LeaderboardEntry>,
+    /// The zero-based offset supplied (or defaulted to `0`), echoed back.
+    pub offset: u32,
+    /// The effective page size (the clamped `limit` value), echoed back.
+    pub limit: u32,
+    /// The total number of players with a rating in this `(variant,
+    /// time_class)`. Use this together with `offset` and `limit` to compute
+    /// whether a next page exists: `offset + limit < total`.
+    pub total: u64,
 }
 
 /// A user's **public** profile.
@@ -889,35 +903,47 @@ async fn list_games(
     }))
 }
 
-/// `GET /leaderboard?variant=&time_class=&limit=` — the top-rated players for a
-/// `(variant, time_class)`.
+/// `GET /leaderboard?variant=&time_class=&offset=&limit=` — a paginated slice
+/// of the top-rated players for a `(variant, time_class)`.
 ///
 /// Returns players ordered by rating descending. `time_class` is optional and
-/// defaults to [`DEFAULT_TIME_CLASS`] (an unknown value is a **422**); full
-/// per-bucket pagination is a follow-up. `limit` is clamped to
-/// [`MAX_LEADERBOARD_LIMIT`] and defaults to [`DEFAULT_LEADERBOARD_LIMIT`]. Each
-/// entry carries the player's id, current rating, and — where it can be resolved
-/// over the same store — their address. A user lookup that misses leaves
-/// `address` absent rather than failing the whole listing, so a stale rating row
-/// cannot 500 the endpoint.
+/// defaults to [`DEFAULT_TIME_CLASS`] (an unknown value is a **422**). `offset`
+/// is the zero-based starting position in the full ranking (default `0`).
+/// `limit` is clamped to [`MAX_LEADERBOARD_LIMIT`] and defaults to
+/// [`DEFAULT_LEADERBOARD_LIMIT`]. Each entry carries the player's 1-based rank
+/// (continuing from `offset`), their id, current rating, and — where it can be
+/// resolved over the same store — their address. A user lookup that misses
+/// leaves `address` absent rather than failing the whole listing. The response
+/// also includes `total` (the full count of ranked players in the bucket) and
+/// the effective `offset`/`limit` for the caller to compute next-page existence
+/// (`offset + limit < total`).
 async fn leaderboard(
     State(state): State<AppState>,
     Query(query): Query<LeaderboardQuery>,
 ) -> ApiResult<Json<LeaderboardResponse>> {
+    let offset = query.offset.unwrap_or(0);
     let limit = query
         .limit
         .unwrap_or(DEFAULT_LEADERBOARD_LIMIT)
         .min(MAX_LEADERBOARD_LIMIT);
     let time_class = resolve_time_class(query.time_class.as_deref())?;
 
-    let ranked = state
-        .storage()
-        .ratings()
-        .leaderboard(&query.variant, time_class, limit)
+    let ratings = state.storage().ratings();
+
+    // Issue the page query and the total count in sequence. The count query is
+    // cheap (an indexed aggregate on a small table) and avoids a second
+    // round-trip to the store for pages that are already empty.
+    let ranked = ratings
+        .leaderboard(&query.variant, time_class, offset, limit)
+        .await?;
+    let total = ratings
+        .leaderboard_count(&query.variant, time_class)
         .await?;
 
     let mut entries = Vec::with_capacity(ranked.len());
-    for (user_id, rating) in ranked {
+    for (i, (user_id, rating)) in ranked.into_iter().enumerate() {
+        // Rank is 1-based and continues from the requested offset.
+        let rank = u64::from(offset) + i as u64 + 1;
         // Resolve the address best-effort: a missing user (a rating row with no
         // surviving account) simply omits the address.
         let address = state
@@ -928,6 +954,7 @@ async fn leaderboard(
             .ok()
             .map(|u| u.address);
         entries.push(LeaderboardEntry {
+            rank,
             user_id,
             address,
             rating: rating.into(),
@@ -938,6 +965,9 @@ async fn leaderboard(
         variant: query.variant,
         time_class,
         entries,
+        offset,
+        limit,
+        total,
     }))
 }
 
@@ -1217,7 +1247,7 @@ pub(crate) fn get_game_doc() {}
 #[allow(dead_code)]
 pub(crate) fn list_games_doc() {}
 
-/// `GET /leaderboard` — top-rated players for a variant (public).
+/// `GET /leaderboard` — paginated leaderboard for a `(variant, time_class)` (public).
 #[utoipa::path(
     get,
     path = "/leaderboard",
@@ -1225,10 +1255,11 @@ pub(crate) fn list_games_doc() {}
     params(
         ("variant" = String, Query, description = "The variant to rank (e.g. \"standard\"). Required."),
         ("time_class" = Option<String>, Query, description = "Time class to rank (bullet|blitz|rapid|classical|correspondence; default blitz)."),
-        ("limit" = Option<u32>, Query, description = "Max entries (clamped to 200; default 20)."),
+        ("offset" = Option<u32>, Query, description = "Zero-based starting rank (default 0)."),
+        ("limit" = Option<u32>, Query, description = "Max entries per page (clamped to 200; default 50)."),
     ),
     responses(
-        (status = 200, description = "Ranked players, highest-rated first.", body = LeaderboardResponse),
+        (status = 200, description = "One page of ranked players, highest-rated first, with total count.", body = LeaderboardResponse),
         (status = 422, description = "Unknown time class.", body = crate::openapi::ProblemDetails),
     ),
 )]

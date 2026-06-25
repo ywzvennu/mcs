@@ -1165,17 +1165,19 @@ impl RatingRepo for SqlxStorage {
         &self,
         variant_id: &str,
         time_class: TimeClass,
+        offset: u32,
         limit: u32,
     ) -> StorageResult<Vec<(UserId, Rating)>> {
         let rows = sqlx::query(
             "SELECT user_id, value, deviation, volatility FROM ratings \
              WHERE variant_id = $1 AND time_class = $2 \
              ORDER BY value DESC \
-             LIMIT $3",
+             LIMIT $3 OFFSET $4",
         )
         .bind(variant_id)
         .bind(time_class.as_str())
         .bind(i64::from(limit))
+        .bind(i64::from(offset))
         .fetch_all(&self.pool)
         .await?;
 
@@ -1186,6 +1188,23 @@ impl RatingRepo for SqlxStorage {
                 Ok((user_id, rating))
             })
             .collect()
+    }
+
+    async fn leaderboard_count(
+        &self,
+        variant_id: &str,
+        time_class: TimeClass,
+    ) -> StorageResult<u64> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS cnt FROM ratings \
+             WHERE variant_id = $1 AND time_class = $2",
+        )
+        .bind(variant_id)
+        .bind(time_class.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        let cnt: i64 = row.try_get("cnt")?;
+        Ok(cnt as u64)
     }
 
     async fn list_for_user(&self, user: UserId) -> StorageResult<Vec<(String, TimeClass, Rating)>> {
