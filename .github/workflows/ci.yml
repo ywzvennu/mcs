@@ -20,7 +20,7 @@ jobs:
     name: ci
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -63,7 +63,7 @@ jobs:
       MCS_TEST_REDIS_URL: "redis://localhost:6379"
       SQLX_OFFLINE: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -98,7 +98,7 @@ jobs:
     env:
       SQLX_OFFLINE: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -151,7 +151,7 @@ jobs:
       MCS_TEST_DATABASE_URL: "postgres://postgres:postgres@localhost:5432/mcs_test"
       SQLX_OFFLINE: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -177,7 +177,7 @@ jobs:
     env:
       SQLX_OFFLINE: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust 1.82 toolchain
         uses: dtolnay/rust-toolchain@1.82
@@ -198,7 +198,7 @@ jobs:
     name: cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Run cargo-deny on the host toolchain rather than the action's musl
       # container, which fails to honour the repo's rust-toolchain.toml.

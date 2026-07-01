@@ -48,7 +48,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # ── QEMU + buildx ──────────────────────────────────────────────────────
       # Set up QEMU so buildx can emulate arm64 on the amd64 runner.
