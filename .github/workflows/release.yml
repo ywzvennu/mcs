@@ -77,7 +77,7 @@ jobs:
       #   ghcr.io/ywzvennu/mcs-server:latest
       - name: Extract metadata (SQLite variant)
         id: meta-sqlite
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -95,7 +95,7 @@ jobs:
       #   ghcr.io/ywzvennu/mcs-server:latest-postgres
       - name: Extract metadata (Postgres variant)
         id: meta-postgres
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
