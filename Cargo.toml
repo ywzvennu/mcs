@@ -65,7 +65,7 @@ sqlx = { version = "0.8", default-features = false, features = [
 figment = { version = "0.10", features = ["env", "toml"] }
 
 # Auth (JWT sessions)
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 
 # Internal crates (referenced by path so parallel crate PRs don't edit this file)
 mcs-core = { path = "crates/mcs-core" }
