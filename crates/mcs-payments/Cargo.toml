@@ -30,7 +30,7 @@ tower.workspace = true
 base64 = "0.22"
 
 # SHA-256 for the content-hash fallback of the idempotency key (#108).
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Timestamps on persisted `PaymentRecord`s. The `serde` derive on `PaymentRecord`
 # needs the `serde` feature; `formatting`/`parsing` cover the RFC 3339 round-trip
