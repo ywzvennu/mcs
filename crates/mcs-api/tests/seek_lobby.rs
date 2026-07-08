@@ -21,7 +21,7 @@ use mcs_auth::{issue_session, SessionConfig};
 use mcs_core::VariantRegistry;
 use mcs_domain::{SeekId, User};
 use mcs_storage::{ClaimOutcome, SeekRepo, SqlxStorage};
-use mcs_variant_standard::{register, STANDARD_VARIANT_ID};
+use mcs_variant_mcr::{register, STANDARD_VARIANT_ID};
 
 // ---------------------------------------------------------------------------
 // Test wiring (mirrors crates/mcs-api/tests/rest_game.rs).

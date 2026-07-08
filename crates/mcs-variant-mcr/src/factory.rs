@@ -80,11 +80,10 @@ impl VariantFactory for McrVariant {
 /// Whether `variant` is deliberately **not** registered by this adapter.
 ///
 /// This adapter serves only the *perfect-information, single-move* slice of
-/// mcr's catalog. The following are excluded:
+/// mcr's catalog — which, since #155 retired the cozy-chess-backed
+/// `mcs-variant-standard`, now includes `standard` and `chess960`. The following
+/// are excluded:
 ///
-/// - **`standard` and `chess960`** — owned by the cozy-chess-backed
-///   `mcs-variant-standard` until that crate is retired (#155). Registering them
-///   here too would collide on the registry key.
 /// - **Fog of War and Jieqi** — hidden-information variants (no full-board
 ///   visibility / concealed "dark" pieces) whose views must be redacted
 ///   per player; deferred to the redaction work (#156).
@@ -95,11 +94,7 @@ impl VariantFactory for McrVariant {
 ///   `has_placement` mechanic flag so any future placement variant is excluded
 ///   automatically.
 fn is_excluded(variant: VariantRef) -> bool {
-    // (a) Owned by `mcs-variant-standard` until #155.
-    if matches!(variant.name(), "standard" | "chess960") {
-        return true;
-    }
-    // (b) Hidden-information variants needing per-player redaction (#156).
+    // (a) Hidden-information variants needing per-player redaction (#156).
     if matches!(variant.name(), "fogofwar" | "jieqi") {
         return true;
     }
@@ -113,10 +108,9 @@ fn is_excluded(variant: VariantRef) -> bool {
 /// keyed by the variant's canonical mcr name.
 ///
 /// Every variant in [`VariantRef::all`] is registered **except** those filtered
-/// by [`is_excluded`] (standard / chess960, the hidden-information variants, and
-/// the phased variants — see that function for the rationale). This keeps the PR
-/// additive: the exclusion of `standard` / `chess960` prevents any key collision
-/// with the still-present `mcs-variant-standard`.
+/// by [`is_excluded`] (the hidden-information variants and the phased variants —
+/// see that function for the rationale). Since #155 this includes `standard` and
+/// `chess960`, so mcr is the single gameplay engine for ordinary chess as well.
 pub fn register(registry: &mut VariantRegistry) {
     for variant in VariantRef::all() {
         if is_excluded(variant) {

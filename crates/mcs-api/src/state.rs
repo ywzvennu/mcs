@@ -181,8 +181,9 @@ impl std::fmt::Debug for PaymentGate {
 /// - [`variants`](AppState::variants) — the [`VariantRegistry`] used to
 ///   instantiate a fresh [`GameSession`](mcs_core::GameSession) for a paired
 ///   seek. It is populated **by the caller** at start-up (the server registers
-///   `mcs-variant-standard`; tests register it themselves), which keeps this
-///   crate free of a runtime dependency on any concrete variant.
+///   the `mcs-variant-mcr` catalog and `mcs-variant-rbc`; tests register their
+///   own), which keeps this crate free of a runtime dependency on any concrete
+///   variant.
 /// - [`matchmaker`](AppState::matchmaker) — the [`Matchmaker`] that pools open
 ///   seeks and pairs compatible ones, built from an `Arc<dyn SeekRepo>`.
 /// - [`game_repo`](AppState::game_repo) — the `Arc<dyn GameRepo>` handed to
@@ -384,8 +385,9 @@ impl AppState {
     ///
     /// * `storage` — the backing store, implementing all repository traits.
     /// * `variants` — the registry of game variants, pre-populated by the
-    ///   caller (the server registers `mcs-variant-standard`; tests do the
-    ///   same). Held behind an [`Arc`] so the clone stays cheap.
+    ///   caller (the server registers the `mcs-variant-mcr` catalog and
+    ///   `mcs-variant-rbc`; tests do the same). Held behind an [`Arc`] so the
+    ///   clone stays cheap.
     /// * `session_config` — JWT signing/verification parameters, shared by the
     ///   `/auth/verify` handler (issuance) and the [`AuthUser`](crate::AuthUser)
     ///   extractor (verification).

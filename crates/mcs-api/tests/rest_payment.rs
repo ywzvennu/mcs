@@ -36,7 +36,7 @@ use mcs_payments::{
     X_PAYMENT,
 };
 use mcs_storage::SqlxStorage;
-use mcs_variant_standard::{register, STANDARD_VARIANT_ID};
+use mcs_variant_mcr::{register, STANDARD_VARIANT_ID};
 
 /// A [`PaymentVerifier`] wrapping [`MockVerifier`] that counts verify+settle
 /// invocations, so an idempotent replay can be shown not to re-settle.

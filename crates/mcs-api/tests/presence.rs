@@ -22,7 +22,7 @@ use mcs_api::{router, AppState, InProcessPresence, SiweConfig};
 use mcs_auth::SessionConfig;
 use mcs_core::VariantRegistry;
 use mcs_storage::SqlxStorage;
-use mcs_variant_standard::register;
+use mcs_variant_mcr::register;
 
 // ---------------------------------------------------------------------------
 // Shared test helpers (duplicated from auth_flow.rs to keep each test file

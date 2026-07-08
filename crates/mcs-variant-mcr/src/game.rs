@@ -14,6 +14,64 @@ use mcs_core::{
 
 use crate::wire::{McrAction, McrEvent, McrView};
 
+/// Number of times a position must occur for a draw to become *claimable* under
+/// the threefold-repetition rule. FIDE's claim threshold; mcr's own move-clock
+/// draw rules expose the *automatic* fold (five), not this one, so it is named
+/// here explicitly.
+const THREEFOLD_REPETITION: usize = 3;
+
+/// Halfmove-clock ply count (75 full moves) at which a position is an
+/// *automatic* draw under the seventy-five-move rule. mcr's `Game::outcome`
+/// already terminates on this from the single position; the adapter only reads
+/// it to label the reason precisely.
+const SEVENTY_FIVE_MOVE_PLIES: u32 = 150;
+
+/// The history-dependent FIDE-style draw parameters of a concrete 8x8 variant
+/// (standard, Chess960, and the classic 8x8 variants), resolved once from the
+/// variant's [`mcr` draw rules](mcr::VariantRef::rules) when the game is created.
+///
+/// These are the draws a single position cannot see — they need the move history
+/// the [`McrGame`] accumulates. The purely single-position terminations
+/// (checkmate, stalemate, insufficient material, the seventy-five-move rule) are
+/// left to [`Game::outcome`] and are not represented here.
+#[derive(Debug, Clone, Copy)]
+struct FideDraw {
+    /// Halfmove-clock ply count at which the move-count ("fifty-move") draw
+    /// becomes claimable, from [`mcr`'s `move_rule_plies`](mcr::geometry::rules::DrawRules).
+    /// `None` for a variant with no move-count draw rule.
+    move_rule_claim_plies: Option<u32>,
+    /// Whether this variant keeps a position history for repetition draws.
+    tracks_repetition: bool,
+    /// Position-occurrence count at which the game is *automatically* drawn by
+    /// repetition, from [`mcr`'s `repetition_fold`](mcr::geometry::rules::DrawRules)
+    /// (five for the concrete family).
+    repetition_auto_fold: usize,
+}
+
+impl FideDraw {
+    /// Resolves the FIDE-style draw parameters for `variant`, or `None` for the
+    /// wide-geometry fairy variants whose history-dependent draws (sennichite,
+    /// perpetual check / chase, bikjang, counting, …) are out of this adapter's
+    /// scope and deferred with the rest of the wide-variant history rules.
+    ///
+    /// The concrete 8x8 family shares one FIDE-style draw model (see mcr's
+    /// `concrete_draw`): a claimable fifty-move rule at 100 plies, claimable
+    /// threefold repetition, and automatic fivefold repetition. Gating on the
+    /// concrete family keeps those rules off the wide variants, whose repetition
+    /// semantics differ and must not be adjudicated as western threefold draws.
+    fn resolve(variant: VariantRef) -> Option<FideDraw> {
+        if !matches!(variant, VariantRef::Concrete(_)) {
+            return None;
+        }
+        let draw = variant.rules().draw;
+        Some(FideDraw {
+            move_rule_claim_plies: draw.move_rule_plies.map(u32::from),
+            tracks_repetition: draw.tracks_repetition,
+            repetition_auto_fold: draw.repetition_fold,
+        })
+    }
+}
+
 /// A single in-progress game of some perfect-information mcr variant.
 ///
 /// Wraps an [`mcr::Game`] — which enforces all rules and answers every
@@ -23,12 +81,16 @@ use crate::wire::{McrAction, McrEvent, McrView};
 /// once the game is over (so resignations and draw agreements, which are not
 /// board states, can be recorded).
 ///
-/// `mcr::Game` is a *single-position* handle with no move history, so the
-/// history-dependent draw rules (threefold / fivefold repetition, the
-/// fifty/seventy-five-move clocks, sennichite, …) are not adjudicated here.
-/// Only the automatic single-position terminations mcr reports through
-/// [`Game::outcome`] end a game on the board; everything else ends it through a
-/// meta-action (resignation or a draw agreement).
+/// `mcr::Game` is a *single-position* handle with no move history, so mcr reports
+/// only the automatic single-position terminations (checkmate, stalemate,
+/// insufficient material, the seventy-five-move rule) through [`Game::outcome`].
+/// The history-dependent FIDE draws — threefold / fivefold repetition and the
+/// fifty-move claim — are adjudicated here instead, from the position history
+/// this session accumulates, for the concrete FIDE-style family (see
+/// [`FideDraw`]). The wide-geometry fairy variants' history rules (sennichite,
+/// perpetual check / chase, …) remain out of scope. Everything the board cannot
+/// express — resignation, draw offers and agreements, a claimed draw — ends the
+/// game through a meta-action.
 #[derive(Debug)]
 pub struct McrGame {
     /// The underlying mcr game; enforces all rules and generates all moves. It
@@ -39,11 +101,21 @@ pub struct McrGame {
     variant_id: &'static str,
     /// The color with an outstanding, unanswered draw offer, if any.
     draw_offer: Option<Color>,
+    /// The FIDE-style history-dependent draw parameters for this variant, or
+    /// `None` for the wide fairy variants (whose history draws are out of scope).
+    /// When `Some`, the fifty-move / repetition claims and automatic fivefold
+    /// repetition are adjudicated from [`Self::position_history`].
+    fide: Option<FideDraw>,
+    /// The FIDE position identity (see [`Self::position_key`]) of every position
+    /// that has occurred, including the starting one, oldest first. Maintained
+    /// only when [`Self::fide`] tracks repetition; a position is repeated `n`
+    /// times when its key appears `n` times here.
+    position_history: Vec<String>,
     /// The recorded outcome once the game has finished. `None` while ongoing.
     ///
     /// Board-driven endings can always be re-derived from `game`, but
-    /// resignation and draw agreement cannot, so the outcome is stored
-    /// explicitly the moment the game ends for any reason.
+    /// resignation, draw agreement, and claimed draws cannot, so the outcome is
+    /// stored explicitly the moment the game ends for any reason.
     outcome: Option<Outcome>,
 }
 
@@ -51,12 +123,28 @@ impl McrGame {
     /// Creates a new game of `variant` from its starting position.
     #[must_use]
     pub fn new(variant: VariantRef) -> Self {
-        Self {
-            game: Game::new(variant),
+        Self::wrap(variant, Game::new(variant))
+    }
+
+    /// Builds a session around an already-constructed `game` of `variant`,
+    /// resolving its draw rules and seeding the repetition history with the
+    /// starting position.
+    fn wrap(variant: VariantRef, game: Game) -> Self {
+        let fide = FideDraw::resolve(variant);
+        let mut this = Self {
+            game,
             variant_id: variant.name(),
             draw_offer: None,
+            fide,
+            position_history: Vec::new(),
             outcome: None,
+        };
+        // Seed the history with the starting position so it counts as its own
+        // first occurrence (only when repetition is tracked for this variant).
+        if this.tracks_repetition() {
+            this.position_history.push(this.position_key());
         }
+        this
     }
 
     /// Creates a game of `variant` from a starting FEN in mcr's dialect.
@@ -68,12 +156,73 @@ impl McrGame {
     pub fn from_fen(variant: VariantRef, fen: &str) -> Result<Self, GameError> {
         let game = Game::from_fen(variant, fen)
             .map_err(|e| GameError::InvalidActionPayload(format!("invalid FEN '{fen}': {e}")))?;
-        Ok(Self {
-            game,
-            variant_id: variant.name(),
-            draw_offer: None,
-            outcome: None,
-        })
+        Ok(Self::wrap(variant, game))
+    }
+
+    /// Whether this variant keeps a position history for repetition draws.
+    fn tracks_repetition(&self) -> bool {
+        self.fide.is_some_and(|d| d.tracks_repetition)
+    }
+
+    /// The FIDE position identity of the current position: the first four fields
+    /// of the FEN (piece placement, side to move, castling rights, en-passant
+    /// square) — exactly what FIDE counts as the same position for repetition,
+    /// excluding the two move clocks.
+    fn position_key(&self) -> String {
+        let fen = self.game.fen();
+        fen.split_whitespace().take(4).collect::<Vec<_>>().join(" ")
+    }
+
+    /// The halfmove clock (plies since the last capture or pawn move), read from
+    /// the fifth FEN field. Zero when the FEN carries no such field.
+    fn halfmove_clock(&self) -> u32 {
+        self.game
+            .fen()
+            .split_whitespace()
+            .nth(4)
+            .and_then(|field| field.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// How many times the current position has occurred so far, by FIDE position
+    /// identity. Zero when repetition is not tracked for this variant.
+    fn repetition_count(&self) -> usize {
+        let current = self.position_key();
+        self.position_history
+            .iter()
+            .filter(|key| **key == current)
+            .count()
+    }
+
+    /// Which claimable draw, if any, the side to move may invoke right now —
+    /// threefold repetition (checked first) or the fifty-move rule. `None` when
+    /// no claim is available, the game is over, or the variant has no such rules.
+    fn claimable_draw(&self) -> Option<EndReason> {
+        if self.outcome.is_some() {
+            return None;
+        }
+        let fide = self.fide?;
+        if fide.tracks_repetition && self.repetition_count() >= THREEFOLD_REPETITION {
+            return Some(EndReason::Repetition);
+        }
+        if let Some(plies) = fide.move_rule_claim_plies {
+            if self.halfmove_clock() >= plies {
+                return Some(EndReason::FiftyMoveRule);
+            }
+        }
+        None
+    }
+
+    /// The *automatic* history-dependent draw the current position triggers —
+    /// fivefold repetition — which a single position (and so [`Game::outcome`])
+    /// cannot see. `None` when it does not apply.
+    fn auto_history_draw(&self) -> Option<Outcome> {
+        let fide = self.fide?;
+        if fide.tracks_repetition && self.repetition_count() >= fide.repetition_auto_fold {
+            Some(Outcome::draw(EndReason::Repetition))
+        } else {
+            None
+        }
     }
 
     /// Maps an mcr color onto the core [`Color`].
@@ -104,6 +253,7 @@ impl McrGame {
             status: self.status(),
             check: self.game.is_check(),
             draw_offer: self.draw_offer,
+            can_claim_draw: self.claimable_draw().is_some(),
         }
     }
 
@@ -129,14 +279,32 @@ impl McrGame {
                 };
                 Outcome::win(winner, reason)
             }
-            None => {
-                let reason = if self.game.is_check() {
-                    EndReason::Other("draw".to_owned())
-                } else {
-                    EndReason::Stalemate
-                };
-                Outcome::draw(reason)
+            None => Outcome::draw(self.single_position_draw_reason()),
+        }
+    }
+
+    /// The precise reason for a drawn single-position termination reported by
+    /// [`Game::outcome`], derived from the final position.
+    ///
+    /// For the concrete FIDE-style family the reason is disambiguated: no legal
+    /// move is a stalemate; otherwise a drawn position with the halfmove clock at
+    /// the seventy-five-move threshold is the move-clock draw and anything else is
+    /// insufficient material (repetition is handled separately, not here). The
+    /// wide fairy variants keep the coarse label the seam can justify.
+    fn single_position_draw_reason(&self) -> EndReason {
+        if self.fide.is_some() {
+            if self.game.legal_moves().is_empty() {
+                return EndReason::Stalemate;
             }
+            if self.halfmove_clock() >= SEVENTY_FIVE_MOVE_PLIES {
+                return EndReason::FiftyMoveRule;
+            }
+            return EndReason::InsufficientMaterial;
+        }
+        if self.game.is_check() {
+            EndReason::Other("draw".to_owned())
+        } else {
+            EndReason::Stalemate
         }
     }
 
@@ -156,6 +324,11 @@ impl McrGame {
         // The move was validated as legal above, so this cannot panic.
         self.game = self.game.play(&mv);
 
+        // Record the new position for repetition counting (concrete family only).
+        if self.tracks_repetition() {
+            self.position_history.push(self.position_key());
+        }
+
         // A move always supersedes any pending draw offer.
         self.draw_offer = None;
 
@@ -164,9 +337,16 @@ impl McrGame {
             fen: self.game.fen(),
         })?];
 
-        // Detect an automatic single-position termination produced by the move.
-        if let Some(game_outcome) = self.game.outcome() {
-            let outcome = self.map_outcome(game_outcome);
+        // Detect an automatic termination produced by the move: first the
+        // single-position terminations mcr reports (checkmate, stalemate,
+        // insufficient material, the seventy-five-move rule), then the automatic
+        // history-dependent draw the seam cannot see (fivefold repetition).
+        let ended = self
+            .game
+            .outcome()
+            .map(|game_outcome| self.map_outcome(game_outcome))
+            .or_else(|| self.auto_history_draw());
+        if let Some(outcome) = ended {
             self.outcome = Some(outcome.clone());
             events.push(Event::from_typed(&McrEvent::GameEnded { outcome })?);
         }
@@ -225,6 +405,11 @@ impl GameSession for McrGame {
             for uci in self.legal_moves_uci() {
                 actions.push(serialize(&McrAction::Move { uci }));
             }
+            // ...and may claim a draw when the position is currently eligible
+            // (threefold repetition or the fifty-move rule).
+            if self.claimable_draw().is_some() {
+                actions.push(serialize(&McrAction::ClaimDraw));
+            }
         }
 
         // Resignation is always available to either player.
@@ -281,6 +466,17 @@ impl GameSession for McrGame {
                     self.finish(Outcome::draw(EndReason::DrawAgreement))
                 } else {
                     Err(GameError::IllegalAction)
+                }
+            }
+            McrAction::ClaimDraw => {
+                // A draw claim stands in for a move, so only the side to move may
+                // claim, and only when the position is actually eligible.
+                if self.to_move() != player {
+                    return Err(GameError::NotYourTurn);
+                }
+                match self.claimable_draw() {
+                    Some(reason) => self.finish(Outcome::draw(reason)),
+                    None => Err(GameError::IllegalAction),
                 }
             }
             McrAction::DeclineDraw => {

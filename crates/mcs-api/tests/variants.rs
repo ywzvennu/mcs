@@ -17,9 +17,7 @@ use mcs_api::{router, AppState, SiweConfig};
 use mcs_auth::SessionConfig;
 use mcs_core::VariantRegistry;
 use mcs_storage::SqlxStorage;
-use mcs_variant_standard::{
-    register as register_standard, CHESS960_VARIANT_ID, STANDARD_VARIANT_ID,
-};
+use mcs_variant_mcr::{register as register_mcr, CHESS960_VARIANT_ID, STANDARD_VARIANT_ID};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -80,12 +78,12 @@ async fn get_variants_empty_registry() {
     assert_eq!(json["variants"], serde_json::json!([]));
 }
 
-/// Registering the standard variant adds both `standard` and `chess960` (the
-/// same crate registers Chess960 too), each with an id and display name.
+/// Registering the mcr catalog adds `standard` and `chess960` (among the rest of
+/// the fairy variants), each with an id and display name.
 #[tokio::test]
 async fn get_variants_lists_standard() {
     let mut registry = VariantRegistry::new();
-    register_standard(&mut registry);
+    register_mcr(&mut registry);
     let app = test_app_with_registry(registry).await;
 
     let response = app
@@ -101,7 +99,8 @@ async fn get_variants_lists_standard() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response.into_body()).await;
     let variants = json["variants"].as_array().expect("variants is array");
-    assert_eq!(variants.len(), 2);
+    // mcr registers its whole catalog (112 variants since #155).
+    assert_eq!(variants.len(), 112);
 
     let ids: Vec<&str> = variants
         .iter()
@@ -114,12 +113,12 @@ async fn get_variants_lists_standard() {
         .all(|v| v["display_name"].as_str().is_some()));
 }
 
-/// With the standard crate (standard + chess960) and RBC registered the response
-/// contains all three, sorted by id.
+/// With the mcr catalog and RBC registered the response contains standard,
+/// chess960, and rbc, sorted by id.
 #[tokio::test]
 async fn get_variants_lists_multiple_sorted() {
     let mut registry = VariantRegistry::new();
-    register_standard(&mut registry);
+    register_mcr(&mut registry);
     mcs_variant_rbc::register(&mut registry);
     let app = test_app_with_registry(registry).await;
 
@@ -136,7 +135,8 @@ async fn get_variants_lists_multiple_sorted() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response.into_body()).await;
     let variants = json["variants"].as_array().expect("variants is array");
-    assert_eq!(variants.len(), 3);
+    // mcr's catalog (112) plus rbc.
+    assert_eq!(variants.len(), 113);
 
     // Response must be sorted by id.
     let ids: Vec<&str> = variants
@@ -157,7 +157,7 @@ async fn get_variants_lists_multiple_sorted() {
 #[tokio::test]
 async fn get_variants_response_shape() {
     let mut registry = VariantRegistry::new();
-    register_standard(&mut registry);
+    register_mcr(&mut registry);
     let app = test_app_with_registry(registry).await;
 
     let response = app

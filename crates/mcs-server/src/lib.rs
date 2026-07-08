@@ -67,8 +67,8 @@ async fn health() -> Json<Health> {
 /// Registers all supported game variants into a fresh
 /// [`VariantRegistry`](mcs_core::VariantRegistry):
 ///
-/// - **standard** — ordinary FIDE chess (`mcs-variant-standard`);
-/// - **chess960** — Fischer Random Chess (`mcs-variant-standard`);
+/// - **standard**, **chess960**, and the rest of mcr's fairy catalog
+///   (`mcs-variant-mcr`) — mcr is the single gameplay engine since #155;
 /// - **rbc** — Reconnaissance Blind Chess (`mcs-variant-rbc`).
 ///
 /// After registration the count of registered variants is logged at `INFO`
@@ -92,13 +92,13 @@ pub fn build_state(
     session_secret: Vec<u8>,
 ) -> anyhow::Result<AppState> {
     let mut variants = VariantRegistry::new();
-    // `mcs_variant_standard::register` adds both `standard` and `chess960`.
-    mcs_variant_standard::register(&mut variants);
     mcs_variant_rbc::register(&mut variants);
-    // `mcs_variant_mcr::register` adds the mcr fairy-variant catalog. It
-    // deliberately excludes `standard`/`chess960` (owned by the cozy-chess-backed
-    // adapter above) so there is no registry-key collision, plus the
-    // hidden-information and phased variants that need per-player redaction.
+    // `mcs_variant_mcr::register` adds mcr's whole catalog — since #155 that
+    // includes `standard` and `chess960`, making mcr the single gameplay engine.
+    // It excludes only the hidden-information variants (fog of war, jieqi) and the
+    // phased variants (duck, placement, sittuyin), which need per-player redaction
+    // or a multi-part move seam and are deferred to #156. `mcs-variant-rbc` still
+    // owns Reconnaissance Blind Chess.
     mcs_variant_mcr::register(&mut variants);
     tracing::info!(count = variants.ids().len(), "variant registry built");
 

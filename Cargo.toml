@@ -74,7 +74,6 @@ mcs-storage = { path = "crates/mcs-storage" }
 mcs-auth = { path = "crates/mcs-auth" }
 mcs-game = { path = "crates/mcs-game" }
 mcs-api = { path = "crates/mcs-api" }
-mcs-variant-standard = { path = "crates/mcs-variant-standard" }
 
 # Lints applied across every crate (each crate adds `[lints] workspace = true`).
 [workspace.lints.rust]

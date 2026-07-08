@@ -30,8 +30,8 @@ use mcs_core::{Action, Color, VariantOptions, VariantRegistry};
 use mcs_domain::{Game, GameId, TimeControl, User};
 use mcs_game::{GameActor, GameHandle};
 use mcs_storage::{ActionLogRepo, GameRepo, SqlxStorage};
-use mcs_variant_standard::wire::StandardAction;
-use mcs_variant_standard::{register, STANDARD_VARIANT_ID};
+use mcs_variant_mcr::wire::McrAction;
+use mcs_variant_mcr::{register, STANDARD_VARIANT_ID};
 
 // ---------------------------------------------------------------------------
 // A fixed-membership registry (no backend, no Redis).
@@ -184,7 +184,7 @@ where
 }
 
 fn mv(uci: &str) -> Action {
-    Action::from_typed(&StandardAction::Move {
+    Action::from_typed(&McrAction::Move {
         uci: uci.to_owned(),
     })
     .expect("serializable")

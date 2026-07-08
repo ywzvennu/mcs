@@ -29,7 +29,7 @@ use mcs_core::{Action, Color, VariantOptions};
 use mcs_domain::{ColorPreference, Seek, TimeControl, User, UserId};
 use mcs_game::SubmitOutcome;
 use mcs_storage::{ActionLogRepo, SqlxStorage};
-use mcs_variant_standard::{register, STANDARD_VARIANT_ID};
+use mcs_variant_mcr::{register, STANDARD_VARIANT_ID};
 
 // ---------------------------------------------------------------------------
 // Wiring
