@@ -41,5 +41,10 @@ wildcards = "warn"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# The RBC variant depends on the project's own public git crate.
-allow-git = ["https://github.com/ywzvennu/rbc-rs"]
+# The RBC variant depends on the project's own public git crate, and the mcr
+# variant catalog on the project's clean-room `mcr` rules library (MIT OR
+# Apache-2.0), both pulled from source until published to crates.io.
+allow-git = [
+  "https://github.com/ywzvennu/rbc-rs",
+  "https://github.com/ywzvennu/mcr",
+]

@@ -95,6 +95,11 @@ pub fn build_state(
     // `mcs_variant_standard::register` adds both `standard` and `chess960`.
     mcs_variant_standard::register(&mut variants);
     mcs_variant_rbc::register(&mut variants);
+    // `mcs_variant_mcr::register` adds the mcr fairy-variant catalog. It
+    // deliberately excludes `standard`/`chess960` (owned by the cozy-chess-backed
+    // adapter above) so there is no registry-key collision, plus the
+    // hidden-information and phased variants that need per-player redaction.
+    mcs_variant_mcr::register(&mut variants);
     tracing::info!(count = variants.ids().len(), "variant registry built");
 
     let session_config = SessionConfig::new(

@@ -5,7 +5,8 @@
 //! bound — to assert the wiring is sound: `GET /health` returns `200 OK`, the
 //! API's `GET /auth/nonce` route is actually mounted (proving the `mcs-api`
 //! router was merged), and `GET /variants` lists the expected variant ids
-//! (proving standard, Chess960, and RBC are all registered).
+//! (proving standard, Chess960, RBC, and the mcr fairy catalog are all
+//! registered).
 
 use std::sync::Arc;
 
@@ -100,21 +101,45 @@ async fn variants_endpoint_lists_all_registered_variants() {
         .map(|v| v["id"].as_str().expect("id is string"))
         .collect();
 
-    // Verify the full set is present — proving both register calls fired at
-    // startup (`mcs_variant_standard::register` adds standard + chess960, and
-    // `mcs_variant_rbc::register` adds rbc).
-    for expected in &["standard", "chess960", "rbc"] {
+    // Verify the core adapters are present — proving all three register calls
+    // fired at startup (`mcs_variant_standard::register` adds standard + chess960,
+    // `mcs_variant_rbc::register` adds rbc, and `mcs_variant_mcr::register` adds
+    // the mcr fairy catalog). A representative sample of the mcr catalog is
+    // checked too.
+    for expected in &[
+        "standard",
+        "chess960",
+        "rbc",
+        "kingofthehill",
+        "shogi",
+        "xiangqi",
+    ] {
         assert!(
             ids.contains(expected),
             "expected variant '{expected}' to be registered; got: {ids:?}"
         );
     }
 
-    // The full set: standard + chess960 + rbc = 3 total.
+    // The full set: standard + chess960 + rbc (3) plus the mcr catalog (110 —
+    // mcr's full catalog minus standard/chess960, the hidden-information variants
+    // fogofwar/jieqi, and the phased variants duck/placement/sittuyin) = 113. The
+    // mcr exclusion of standard/chess960 keeps the ids collision-free, so no key
+    // is clobbered.
     assert_eq!(
         ids.len(),
-        3,
-        "expected 3 registered variants; got {}: {ids:?}",
+        113,
+        "expected 113 registered variants; got {}: {ids:?}",
         ids.len()
+    );
+
+    // No id appears twice — the exclusion filter prevents standard/chess960
+    // colliding between the cozy-chess and mcr adapters.
+    let mut unique = ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        ids.len(),
+        "variant ids must be unique: {ids:?}"
     );
 }
