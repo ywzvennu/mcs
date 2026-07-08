@@ -29,8 +29,8 @@ allow = [
 confidence-threshold = 0.8
 
 # No license exceptions: every dependency is permissively licensed. The chess
-# engine is `cozy-chess` (MIT), so the assembled server binary is free of GPL
-# copyleft and remains MIT OR Apache-2.0.
+# rules engine is `mcr` (MIT OR Apache-2.0), so the assembled server binary is
+# free of GPL copyleft and remains MIT OR Apache-2.0.
 
 [bans]
 # The lock file carries some duplicate versions during ecosystem transitions;

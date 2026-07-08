@@ -16,8 +16,8 @@ use mcs_core::{
 };
 use mcs_domain::{Game, GameId, GameLifecycle, TimeControl, UserId};
 use mcs_storage::{ActionLogRepo, GameRepo, RecordedAction, StorageError, StorageResult};
-use mcs_variant_standard::register;
-use mcs_variant_standard::wire::StandardAction;
+use mcs_variant_mcr::register;
+use mcs_variant_mcr::wire::McrAction;
 use time::OffsetDateTime;
 
 use crate::{GameActor, GameCompletionHook, GameSessionError, LocalEventBus, NoopHook};
@@ -262,7 +262,7 @@ fn active_game(id: GameId) -> Game {
 
 /// A `move` action for the given UCI string.
 fn mv(uci: &str) -> Action {
-    Action::from_typed(&StandardAction::Move {
+    Action::from_typed(&McrAction::Move {
         uci: uci.to_owned(),
     })
     .expect("serializable")

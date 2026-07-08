@@ -101,11 +101,10 @@ async fn variants_endpoint_lists_all_registered_variants() {
         .map(|v| v["id"].as_str().expect("id is string"))
         .collect();
 
-    // Verify the core adapters are present — proving all three register calls
-    // fired at startup (`mcs_variant_standard::register` adds standard + chess960,
-    // `mcs_variant_rbc::register` adds rbc, and `mcs_variant_mcr::register` adds
-    // the mcr fairy catalog). A representative sample of the mcr catalog is
-    // checked too.
+    // Verify the core adapters are present — proving both register calls fired at
+    // startup (`mcs_variant_rbc::register` adds rbc, and `mcs_variant_mcr::register`
+    // adds mcr's whole catalog, which since #155 includes standard + chess960). A
+    // representative sample of the mcr catalog is checked too.
     for expected in &[
         "standard",
         "chess960",
@@ -120,11 +119,9 @@ async fn variants_endpoint_lists_all_registered_variants() {
         );
     }
 
-    // The full set: standard + chess960 + rbc (3) plus the mcr catalog (110 —
-    // mcr's full catalog minus standard/chess960, the hidden-information variants
-    // fogofwar/jieqi, and the phased variants duck/placement/sittuyin) = 113. The
-    // mcr exclusion of standard/chess960 keeps the ids collision-free, so no key
-    // is clobbered.
+    // The full set: rbc (1) plus mcr's catalog (112 — mcr's full catalog minus the
+    // hidden-information variants fogofwar/jieqi and the phased variants
+    // duck/placement/sittuyin; standard and chess960 are now mcr-owned) = 113.
     assert_eq!(
         ids.len(),
         113,
@@ -132,8 +129,7 @@ async fn variants_endpoint_lists_all_registered_variants() {
         ids.len()
     );
 
-    // No id appears twice — the exclusion filter prevents standard/chess960
-    // colliding between the cozy-chess and mcr adapters.
+    // No id appears twice across the rbc and mcr adapters.
     let mut unique = ids.clone();
     unique.sort_unstable();
     unique.dedup();

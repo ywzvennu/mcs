@@ -46,7 +46,7 @@
 //! The actor only ever sees the type-erased `mcs-core` boundary types
 //! ([`Action`](mcs_core::Action), [`PlayerView`](mcs_core::PlayerView),
 //! [`Event`](mcs_core::Event)). It has **no** runtime dependency on any
-//! concrete variant; `mcs-variant-standard` is used only by this crate's tests.
+//! concrete variant; `mcs-variant-mcr` is used only by this crate's tests.
 //!
 //! ## Example
 //!

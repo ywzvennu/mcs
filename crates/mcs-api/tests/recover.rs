@@ -24,7 +24,7 @@ use mcs_core::{Action, Color, VariantOptions};
 use mcs_domain::{Game, GameId, GameLifecycle, TimeControl, User};
 use mcs_game::{GameActor, GameHandle};
 use mcs_storage::{ActionLogRepo, GameRepo, SqlxStorage};
-use mcs_variant_standard::{register, STANDARD_VARIANT_ID};
+use mcs_variant_mcr::{register, STANDARD_VARIANT_ID};
 
 // ---------------------------------------------------------------------------
 // Test wiring

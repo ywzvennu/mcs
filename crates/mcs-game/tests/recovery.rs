@@ -25,12 +25,12 @@ use mcs_core::{Action, Color, GameStatus, VariantOptions, VariantRegistry};
 use mcs_domain::{Game, GameLifecycle, TimeControl, UserId};
 use mcs_game::{recover_game, GameActor, GameHandle, LocalEventBus, NoopHook};
 use mcs_storage::{ActionLogRepo, GameRepo, SqlxStorage};
-use mcs_variant_standard::wire::StandardAction;
+use mcs_variant_mcr::wire::McrAction;
 use time::OffsetDateTime;
 
 /// A `move` action for the given UCI string, type-erased as the store sees it.
 fn mv(uci: &str) -> Action {
-    Action::from_typed(&StandardAction::Move {
+    Action::from_typed(&McrAction::Move {
         uci: uci.to_owned(),
     })
     .expect("serializable")
@@ -40,7 +40,7 @@ fn mv(uci: &str) -> Action {
 /// would register it.
 fn standard_registry() -> VariantRegistry {
     let mut registry = VariantRegistry::new();
-    mcs_variant_standard::register(&mut registry);
+    mcs_variant_mcr::register(&mut registry);
     registry
 }
 

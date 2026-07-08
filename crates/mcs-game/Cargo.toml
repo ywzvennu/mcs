@@ -36,5 +36,7 @@ serde_json.workspace = true
 time.workspace = true
 
 [dev-dependencies]
-mcs-variant-standard.workspace = true
+# The mcr rules engine provides the concrete standard-chess variant the actor /
+# recovery tests drive (mcr owns standard since #155).
+mcs-variant-mcr = { path = "../mcs-variant-mcr" }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }

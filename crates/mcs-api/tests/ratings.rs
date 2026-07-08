@@ -31,8 +31,8 @@ use mcs_core::{Action, Color, GameSession, VariantOptions, VariantRegistry};
 use mcs_domain::{Game, GameId, GameLifecycle, TimeClass, TimeControl, User, UserId};
 use mcs_game::{GameActor, GameHandle};
 use mcs_storage::SqlxStorage;
-use mcs_variant_standard::wire::StandardAction;
-use mcs_variant_standard::{register, STANDARD_VARIANT_ID};
+use mcs_variant_mcr::wire::McrAction;
+use mcs_variant_mcr::{register, STANDARD_VARIANT_ID};
 
 // ---------------------------------------------------------------------------
 // Test wiring
@@ -155,7 +155,7 @@ async fn start_game_full(
 
 /// A `move` action for the given UCI string.
 fn mv(uci: &str) -> Action {
-    Action::from_typed(&StandardAction::Move {
+    Action::from_typed(&McrAction::Move {
         uci: uci.to_owned(),
     })
     .expect("serializable")
@@ -163,17 +163,17 @@ fn mv(uci: &str) -> Action {
 
 /// The `Resign` action.
 fn resign() -> Action {
-    Action::from_typed(&StandardAction::Resign).expect("serializable")
+    Action::from_typed(&McrAction::Resign).expect("serializable")
 }
 
 /// An `OfferDraw` action.
 fn offer_draw() -> Action {
-    Action::from_typed(&StandardAction::OfferDraw).expect("serializable")
+    Action::from_typed(&McrAction::OfferDraw).expect("serializable")
 }
 
 /// An `AcceptDraw` action.
 fn accept_draw() -> Action {
-    Action::from_typed(&StandardAction::AcceptDraw).expect("serializable")
+    Action::from_typed(&McrAction::AcceptDraw).expect("serializable")
 }
 
 async fn body_json(body: Body) -> Value {

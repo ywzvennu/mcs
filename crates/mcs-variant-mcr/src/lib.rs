@@ -17,14 +17,17 @@
 //! [`register`] walks mcr's whole catalog ([`mcr::VariantRef::all`]) and
 //! registers a factory for every variant **except**:
 //!
-//! - `standard` and `chess960`, which remain owned by the cozy-chess-backed
-//!   `mcs-variant-standard` (until #155) — excluding them keeps this PR additive
-//!   and avoids a registry-key collision;
 //! - the hidden-information variants (Fog of War, Jieqi), whose views must be
 //!   redacted per player (deferred to #156);
 //! - the phased variants — Duck (a two-part move) and the setup-phase variants
 //!   (Placement, Sittuyin) — which the single-action seam cannot express
 //!   (deferred to #156).
+//!
+//! Since #155 this includes `standard` (ordinary FIDE chess) and `chess960`
+//! (Fischer Random): the cozy-chess-backed `mcs-variant-standard` crate has been
+//! retired, making mcr the single gameplay engine. The history-dependent FIDE
+//! draws that adapter hand-rolled — threefold / fivefold repetition and the
+//! fifty-move claim — are preserved here (see [`McrGame`]).
 //!
 //! Every registered variant is therefore **perfect-information**: both players
 //! and any spectator observe the same complete board at all times. See [`wire`]
@@ -54,6 +57,14 @@ pub mod wire;
 
 pub use factory::{register, McrVariant};
 pub use game::McrGame;
+
+/// The canonical mcr catalog name of standard (FIDE) chess — the marquee variant
+/// this adapter owns since #155 retired the cozy-chess-backed crate.
+pub const STANDARD_VARIANT_ID: &str = "standard";
+
+/// The canonical mcr catalog name of Chess960 (Fischer Random Chess), served by
+/// this adapter since #155.
+pub const CHESS960_VARIANT_ID: &str = "chess960";
 
 #[cfg(test)]
 mod tests;

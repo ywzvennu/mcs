@@ -30,8 +30,8 @@ use mcs_core::{Action, Color, VariantOptions, VariantRegistry};
 use mcs_domain::{Game, GameId, GameLifecycle, TimeControl, User, UserId};
 use mcs_game::{GameActor, GameHandle};
 use mcs_storage::SqlxStorage;
-use mcs_variant_standard::wire::StandardAction;
-use mcs_variant_standard::{register, STANDARD_VARIANT_ID};
+use mcs_variant_mcr::wire::McrAction;
+use mcs_variant_mcr::{register, STANDARD_VARIANT_ID};
 
 // ---------------------------------------------------------------------------
 // Test wiring
@@ -140,7 +140,7 @@ async fn start_game(
 
 /// Drives the game to a finished state by having White resign.
 async fn finish_by_resignation(handle: &GameHandle) {
-    let resign = Action::from_typed(&StandardAction::Resign).expect("resign action");
+    let resign = Action::from_typed(&McrAction::Resign).expect("resign action");
     handle
         .submit_action(Color::White, resign)
         .await

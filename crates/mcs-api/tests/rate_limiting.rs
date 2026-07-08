@@ -19,7 +19,7 @@ use mcs_auth::SessionConfig;
 use mcs_core::{VariantOptions, VariantRegistry};
 use mcs_domain::{TimeControl, UserId};
 use mcs_storage::SqlxStorage;
-use mcs_variant_standard::{register, STANDARD_VARIANT_ID};
+use mcs_variant_mcr::{register, STANDARD_VARIANT_ID};
 use time::Duration;
 
 const TEST_ADDRESS: &str = "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23";

@@ -20,7 +20,7 @@ use mcs_auth::{issue_session, SessionConfig};
 use mcs_core::VariantRegistry;
 use mcs_domain::{ChallengeStatus, User};
 use mcs_storage::SqlxStorage;
-use mcs_variant_standard::{register, STANDARD_VARIANT_ID};
+use mcs_variant_mcr::{register, STANDARD_VARIANT_ID};
 
 // ---------------------------------------------------------------------------
 // Test wiring

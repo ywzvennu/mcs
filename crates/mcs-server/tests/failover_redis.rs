@@ -37,7 +37,7 @@ use mcs_cluster::{NodeInfo, NodeRegistry, RedisEventBus, RedisNodeRegistry};
 use mcs_core::{Action, Color, VariantOptions, VariantRegistry};
 use mcs_domain::{Game, GameId, GameLifecycle, TimeControl, User};
 use mcs_storage::{ActionLogRepo, GameRepo, SqlxStorage, UserRepo};
-use mcs_variant_standard::{register, STANDARD_VARIANT_ID};
+use mcs_variant_mcr::{register, STANDARD_VARIANT_ID};
 
 // ---------------------------------------------------------------------------
 // Shared fixtures

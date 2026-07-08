@@ -83,8 +83,9 @@ sha3 = "0.10"
 # for signing. Kept as a dev-only dep since the production code now goes through
 # mcs-auth exclusively.
 siwe = { version = "0.6.1", default-features = false }
-# The standard-chess variant, used to spawn a real game session in WS tests.
-mcs-variant-standard = { workspace = true }
+# The mcr rules engine, used to spawn a real standard-chess game session in the
+# WS/REST tests (mcr owns standard + chess960 since #155).
+mcs-variant-mcr = { path = "../mcs-variant-mcr" }
 # The RBC variant, used in the variants-endpoint integration tests.
 mcs-variant-rbc = { path = "../mcs-variant-rbc" }
 # A real WebSocket client to exercise the live-game socket end to end.

@@ -25,7 +25,7 @@ use mcs_api::{router, AppState, AuthUser, SiweConfig};
 use mcs_auth::SessionConfig;
 use mcs_core::VariantRegistry;
 use mcs_storage::SqlxStorage;
-use mcs_variant_standard::register;
+use mcs_variant_mcr::register;
 
 // ---------------------------------------------------------------------------
 // Test wallet (fixed key) — mirrors the mcs-auth signing test vector.

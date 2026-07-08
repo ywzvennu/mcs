@@ -26,8 +26,8 @@ use mcs_core::{Action, Color, GameSession, VariantOptions, VariantRegistry};
 use mcs_domain::{Game, GameId, GameLifecycle, Rating, TimeClass, TimeControl, User, UserId};
 use mcs_game::{GameActor, GameHandle};
 use mcs_storage::SqlxStorage;
-use mcs_variant_standard::wire::StandardAction;
-use mcs_variant_standard::{register, STANDARD_VARIANT_ID};
+use mcs_variant_mcr::wire::McrAction;
+use mcs_variant_mcr::{register, STANDARD_VARIANT_ID};
 
 // ---------------------------------------------------------------------------
 // Test wiring
@@ -363,7 +363,7 @@ async fn start_rated_game(state: &AppState, white: UserId, black: UserId) -> (Ga
 }
 
 fn resign() -> Action {
-    Action::from_typed(&StandardAction::Resign).expect("serializable")
+    Action::from_typed(&McrAction::Resign).expect("serializable")
 }
 
 async fn get_rating_history(

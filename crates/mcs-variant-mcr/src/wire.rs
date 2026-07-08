@@ -9,13 +9,15 @@
 //! shogi / crazyhouse family) and reports its position as an mcr-dialect FEN, so
 //! no per-variant wire shape is needed.
 //!
-//! The shapes deliberately mirror `mcs-variant-standard`'s so existing clients
-//! see a familiar action/view/event vocabulary. They differ only where the mcr
-//! [`Game`](mcr::Game) seam offers less than cozy-chess does: there is no
-//! `claim_draw` action and no `can_claim_draw` view flag (a bare mcr game carries
-//! no move history, so the history-dependent repetition / fifty-move claims are
-//! not adjudicable here), and the move event carries no SAN (the `Game` seam
-//! renders moves as UCI only).
+//! The shapes deliberately mirror the retired `mcs-variant-standard`'s so
+//! existing clients see a familiar action/view/event vocabulary. The
+//! history-dependent draw claims cozy-chess provided are preserved: the
+//! [`McrAction::ClaimDraw`] action and the [`McrView::can_claim_draw`] flag are
+//! offered for the variants whose rules define them (the concrete FIDE-style
+//! family — standard, Chess960, and the classic 8x8 variants), driven by the
+//! move history the [`McrGame`](crate::McrGame) session accumulates. They differ
+//! from cozy-chess's shapes only in that the move event carries no SAN (the
+//! `Game` seam renders moves as UCI only).
 
 use mcs_core::{Color, GameStatus, Outcome};
 use serde::{Deserialize, Serialize};
@@ -45,6 +47,12 @@ use serde::{Deserialize, Serialize};
 ///   ```json
 ///   { "type": "decline_draw" }
 ///   ```
+/// - Claim a draw that the current position makes available (threefold
+///   repetition or the fifty-move rule) — offered only when
+///   [`McrView::can_claim_draw`] is `true`:
+///   ```json
+///   { "type": "claim_draw" }
+///   ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum McrAction {
@@ -62,6 +70,10 @@ pub enum McrAction {
     AcceptDraw,
     /// Decline a draw the opponent has offered.
     DeclineDraw,
+    /// Claim a draw the current position makes available under a history-dependent
+    /// rule (threefold repetition or the fifty-move rule). Legal only for the side
+    /// to move, and only while [`McrView::can_claim_draw`] is `true`.
+    ClaimDraw,
 }
 
 /// What a player (or spectator) is permitted to observe about a game.
@@ -85,7 +97,8 @@ pub enum McrAction {
 ///   "legal_moves_uci": ["a2a3", "a2a4", "b1a3", "..."],
 ///   "status": "ongoing",
 ///   "check": false,
-///   "draw_offer": null
+///   "draw_offer": null,
+///   "can_claim_draw": false
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +120,11 @@ pub struct McrView {
     /// `None` if no offer is pending. The opponent of this color may answer it
     /// with [`McrAction::AcceptDraw`] or [`McrAction::DeclineDraw`].
     pub draw_offer: Option<Color>,
+    /// Whether the side to move may end the game right now with
+    /// [`McrAction::ClaimDraw`] — `true` when the current position has repeated
+    /// the threefold count or the fifty-move clock has elapsed. Always `false`
+    /// for variants without these history-dependent draw rules.
+    pub can_claim_draw: bool,
 }
 
 /// An event emitted by an action, for broadcasting to observers.

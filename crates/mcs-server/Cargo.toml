@@ -43,11 +43,10 @@ mcs-game.workspace = true
 mcs-domain.workspace = true
 # This binary is the single place variants are registered at startup, which
 # keeps `mcs-api` variant-agnostic. All supported variants are wired in here.
-# `mcs-variant-standard` registers both standard chess and Chess960.
-mcs-variant-standard.workspace = true
 mcs-variant-rbc = { path = "../mcs-variant-rbc" }
-# `mcs-variant-mcr` registers the mcr fairy-variant catalog (everything except
-# standard/chess960, the hidden-information variants, and the phased variants).
+# `mcs-variant-mcr` registers mcr's whole catalog — the single gameplay engine
+# since #155 (standard and Chess960 included), minus the hidden-information and
+# phased variants deferred to #156.
 mcs-variant-mcr = { path = "../mcs-variant-mcr" }
 # `mcs-observability` is intentionally referenced by path: it is a leaf
 # observability crate not (yet) listed in `[workspace.dependencies]`, and adding

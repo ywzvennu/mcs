@@ -19,7 +19,7 @@ serde_json.workspace = true
 # chess, Chess960, and 100+ fairy variants. It is not yet published to crates.io,
 # so it is pulled from its public source repository, pinned to its default branch.
 # Default features (`std`) are used. Pinned here rather than in the workspace
-# `[workspace.dependencies]`, following the `rbc-rs` / `cozy-chess` precedent: it
-# is used only by this crate, so keeping it member-local leaves the root manifest
-# untouched and parallel crate work conflict-free.
+# `[workspace.dependencies]`, following the `rbc-rs` precedent: it is used only by
+# this crate, so keeping it member-local leaves the root manifest untouched and
+# parallel crate work conflict-free.
 mcr = { git = "https://github.com/ywzvennu/mcr", branch = "main" }

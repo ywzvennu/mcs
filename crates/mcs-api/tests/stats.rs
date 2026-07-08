@@ -30,7 +30,7 @@ use mcs_auth::SessionConfig;
 use mcs_core::{Color, EndReason, Outcome, VariantOptions, VariantRegistry};
 use mcs_domain::{Game, Rating, TimeClass, TimeControl, User, UserId};
 use mcs_storage::SqlxStorage;
-use mcs_variant_standard::{register, STANDARD_VARIANT_ID};
+use mcs_variant_mcr::{register, STANDARD_VARIANT_ID};
 
 // ---------------------------------------------------------------------------
 // Wiring
