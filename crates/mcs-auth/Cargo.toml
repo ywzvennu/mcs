@@ -32,5 +32,5 @@ siwe = { version = "0.6.1", default-features = false }
 # Local test signer: derive an address from a fixed private key and produce
 # EIP-191 personal-sign signatures over known message vectors.
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
-sha3 = "0.10"
+sha3 = "0.12"
 hex = "0.4"
