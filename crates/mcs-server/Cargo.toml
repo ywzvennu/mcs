@@ -46,6 +46,9 @@ mcs-domain.workspace = true
 # `mcs-variant-standard` registers both standard chess and Chess960.
 mcs-variant-standard.workspace = true
 mcs-variant-rbc = { path = "../mcs-variant-rbc" }
+# `mcs-variant-mcr` registers the mcr fairy-variant catalog (everything except
+# standard/chess960, the hidden-information variants, and the phased variants).
+mcs-variant-mcr = { path = "../mcs-variant-mcr" }
 # `mcs-observability` is intentionally referenced by path: it is a leaf
 # observability crate not (yet) listed in `[workspace.dependencies]`, and adding
 # it there would mean editing the root manifest, which this crate must not do.

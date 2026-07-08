@@ -1241,6 +1241,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "mcr"
+version = "0.0.0"
+source = "git+https://github.com/ywzvennu/mcr?branch=main#23d1544e52c83bd7ef508759f4e528e7c3a04686"
+
+[[package]]
 name = "mcs-api"
 version = "0.1.0"
 dependencies = [
@@ -1402,6 +1407,7 @@ dependencies = [
  "mcs-observability",
  "mcs-payments",
  "mcs-storage",
+ "mcs-variant-mcr",
  "mcs-variant-rbc",
  "mcs-variant-standard",
  "metrics",
@@ -1435,6 +1441,16 @@ dependencies = [
  "time",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "mcs-variant-mcr"
+version = "0.1.0"
+dependencies = [
+ "mcr",
+ "mcs-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
