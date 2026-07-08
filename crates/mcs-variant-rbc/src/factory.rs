@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use mcs_core::{GameError, GameSession, VariantFactory, VariantOptions, VariantRegistry};
+use mcs_core::{
+    GameError, GameSession, VariantFactory, VariantMetadata, VariantOptions, VariantRegistry,
+};
 
 use crate::game::{RbcGame, VARIANT_ID};
 
@@ -19,6 +21,19 @@ impl VariantFactory for RbcVariant {
 
     fn display_name(&self) -> &str {
         "Reconnaissance Blind Chess"
+    }
+
+    /// RBC is played on a standard 8x8 board with the ordinary chess army and no
+    /// hand / drops, so it reports the standard geometry and starting position
+    /// rather than relying on the trait default.
+    fn metadata(&self) -> VariantMetadata {
+        VariantMetadata {
+            board_width: 8,
+            board_height: 8,
+            has_hand: false,
+            family: None,
+            start_fen: Some("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_owned()),
+        }
     }
 
     /// Creates a fresh game from the standard RBC starting position.

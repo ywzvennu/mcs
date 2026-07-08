@@ -179,7 +179,77 @@ async fn get_variants_response_shape() {
         variant.get("display_name").is_some(),
         "entry must have 'display_name'"
     );
-    // No extra fields that could break contract.
-    let obj = variant.as_object().expect("entry is object");
-    assert_eq!(obj.len(), 2, "entry has exactly id + display_name");
+    // The enriched render-oriented fields (#157) must be present.
+    assert!(
+        variant.get("board_width").is_some(),
+        "entry must have 'board_width'"
+    );
+    assert!(
+        variant.get("board_height").is_some(),
+        "entry must have 'board_height'"
+    );
+    assert!(
+        variant.get("has_hand").is_some(),
+        "entry must have 'has_hand'"
+    );
+    assert!(
+        variant.get("start_fen").is_some(),
+        "entry must have 'start_fen'"
+    );
+}
+
+/// A single variant's enriched entry, found by id, or `None`.
+fn find_variant(json: &Value, id: &str) -> Option<Value> {
+    json["variants"]
+        .as_array()
+        .expect("variants is array")
+        .iter()
+        .find(|v| v["id"].as_str() == Some(id))
+        .cloned()
+}
+
+/// The enriched metadata (#157) must reflect each variant's real board geometry
+/// and hand capability: `standard` is 8x8 with no hand, while the large-board
+/// shogi/xiangqi variants report their true (non-8) dimensions, and `shogi` has a
+/// hand.
+#[tokio::test]
+async fn get_variants_reports_board_geometry_and_hand() {
+    let mut registry = VariantRegistry::new();
+    register_mcr(&mut registry);
+    let app = test_app_with_registry(registry).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/variants")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response.into_body()).await;
+
+    // Standard chess: an ordinary 8x8 board with no hand and a start FEN.
+    let standard = find_variant(&json, STANDARD_VARIANT_ID).expect("standard is listed");
+    assert_eq!(standard["board_width"], 8);
+    assert_eq!(standard["board_height"], 8);
+    assert_eq!(standard["has_hand"], false);
+    assert!(
+        standard["start_fen"].as_str().is_some(),
+        "standard must carry a start FEN"
+    );
+
+    // Shogi: a 9x9 board with a hand (drops).
+    let shogi = find_variant(&json, "shogi").expect("shogi is listed");
+    assert_eq!(shogi["board_width"], 9);
+    assert_eq!(shogi["board_height"], 9);
+    assert_eq!(shogi["has_hand"], true);
+
+    // Xiangqi: a 9-file, 10-rank board with no hand.
+    let xiangqi = find_variant(&json, "xiangqi").expect("xiangqi is listed");
+    assert_eq!(xiangqi["board_width"], 9);
+    assert_eq!(xiangqi["board_height"], 10);
+    assert_eq!(xiangqi["has_hand"], false);
 }

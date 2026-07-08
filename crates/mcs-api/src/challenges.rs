@@ -210,6 +210,10 @@ async fn create_challenge(
     user: AuthUser,
     Json(body): Json<CreateChallengeRequest>,
 ) -> ApiResult<Json<ChallengeDto>> {
+    // Reject an unknown variant up front (400) rather than recording a challenge
+    // that could never spawn a game when accepted.
+    state.ensure_known_variant(&body.variant_id)?;
+
     // Validate the opponent address; a malformed address is a 422 via the
     // `From<DomainError>` mapping.
     let opponent_address: EvmAddress = body.opponent_address.parse()?;

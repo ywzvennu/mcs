@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use mcr::VariantRef;
-use mcs_core::{GameError, GameSession, VariantFactory, VariantOptions, VariantRegistry};
+use mcs_core::{
+    GameError, GameSession, VariantFactory, VariantMetadata, VariantOptions, VariantRegistry,
+};
 use serde::Deserialize;
 
 use crate::game::McrGame;
@@ -50,6 +52,28 @@ impl VariantFactory for McrVariant {
         // mcr exposes only the canonical (machine) name; enriching this with a
         // human-facing label is deferred to the `/variants` work (#157).
         self.variant.name()
+    }
+
+    /// Reads render-oriented metadata from the variant's engine-derived
+    /// [`mcr::VariantRules`].
+    ///
+    /// - `board_width` / `board_height` come from `rules.board.{width,height}`
+    ///   (so large- or small-board variants report their true geometry).
+    /// - `has_hand` comes from `rules.mechanics.has_hand` (the hand/drop mechanic
+    ///   of Crazyhouse and the shogi family).
+    /// - `start_fen` is `rules.board.start_fen` (mcr's FEN dialect).
+    ///
+    /// `family` is left `None`: mcr's `VariantRules` carries board, army, and
+    /// per-mechanic flags but no family / piece-set taxonomy to map from.
+    fn metadata(&self) -> VariantMetadata {
+        let rules = self.variant.rules();
+        VariantMetadata {
+            board_width: u32::from(rules.board.width),
+            board_height: u32::from(rules.board.height),
+            has_hand: rules.mechanics.has_hand,
+            family: None,
+            start_fen: Some(rules.board.start_fen),
+        }
     }
 
     /// Creates a fresh game of this variant.
