@@ -86,7 +86,7 @@ uuid.workspace = true
 # renders it at `GET /metrics`. Pinned directly here (not in the workspace set;
 # member version deps are allowed, only the root manifest is off-limits).
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.16", default-features = false }
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # CancellationToken for the retention task's graceful-shutdown wiring (#107).
 # Pinned directly here (not in the workspace set; member version deps are allowed,
 # only the root manifest is off-limits).
