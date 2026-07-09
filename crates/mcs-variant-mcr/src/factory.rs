@@ -103,38 +103,43 @@ impl VariantFactory for McrVariant {
 
 /// Whether `variant` is deliberately **not** registered by this adapter.
 ///
-/// This adapter serves only the *perfect-information, single-move* slice of
-/// mcr's catalog — which, since #155 retired the cozy-chess-backed
-/// `mcs-variant-standard`, now includes `standard` and `chess960`. The following
-/// are excluded:
+/// Since #156 this adapter serves the whole of mcr's catalog — including the
+/// once-deferred phased variants (Duck, Placement, Sittuyin) and the flagship
+/// hidden-information variant Fog of War (whose per-player views are redacted;
+/// see [`McrGame`](crate::McrGame)) — with a **single** remaining exclusion:
 ///
-/// - **Fog of War and Jieqi** — hidden-information variants (no full-board
-///   visibility / concealed "dark" pieces) whose views must be redacted
-///   per player; deferred to the redaction work (#156).
-/// - **Duck chess** — a two-part move (piece move, then duck placement) that the
-///   single-action seam here cannot express; deferred to #156.
-/// - **Placement / Sittuyin** — variants with a setup (piece-deployment) phase
-///   before normal play, likewise deferred to #156. These are matched by mcr's
-///   `has_placement` mechanic flag so any future placement variant is excluded
-///   automatically.
+/// - **Jieqi** (dark chess). mcr's [`Game`](mcr::Game) seam models Jieqi's reveal
+///   *deterministically* (a face-down piece reveals as the Xiangqi piece native
+///   to its home square) and its FEN exposes only a **generic** face-down marker
+///   (`=D`/`=d`) for every concealed piece — never the stochastic per-piece
+///   identity that makes real Jieqi a hidden-information game (the seeded reveal
+///   pool is a separate layer, not wired into `Game`). The adapter therefore
+///   cannot show a player its own concealed identities, nor drive a true reveal,
+///   without fabricating hidden state mcr does not expose. Rather than ship a
+///   misleading "deterministic Jieqi", it stays excluded until the seam surfaces
+///   the reveal pool (tracked under #156's follow-up).
+///
+/// Duck, Placement, and Sittuyin need no exclusion: Duck's two-part move is a
+/// single combined UCI (`e2e4,e5`) mcr emits directly, and the setup phases of
+/// Placement and Sittuyin are alternating **open** drops (`N@a1`) driven through
+/// the ordinary [`legal_ucis`](mcr::Game::legal_ucis) / [`play_uci`](mcr::Game::play_uci)
+/// seam — all fully expressible as single actions with no hidden information.
 fn is_excluded(variant: VariantRef) -> bool {
-    // (a) Hidden-information variants needing per-player redaction (#156).
-    if matches!(variant.name(), "fogofwar" | "jieqi") {
-        return true;
-    }
-    // (b) Phased variants: a two-part move (duck) or a setup/placement phase,
-    // neither of which the single-action seam expresses. Deferred to #156.
-    let mechanics = variant.rules().mechanics;
-    mechanics.has_duck || mechanics.has_placement
+    // Jieqi remains deferred: the seam exposes only a generic face-down marker,
+    // not the stochastic per-piece hidden identity (see the doc comment). Every
+    // other variant — Fog of War (redacted views), Duck, Placement, Sittuyin — is
+    // now registered.
+    variant.name() == "jieqi"
 }
 
 /// Registers mcr's variant catalog with `registry`, one factory per variant,
 /// keyed by the variant's canonical mcr name.
 ///
 /// Every variant in [`VariantRef::all`] is registered **except** those filtered
-/// by [`is_excluded`] (the hidden-information variants and the phased variants —
-/// see that function for the rationale). Since #155 this includes `standard` and
-/// `chess960`, so mcr is the single gameplay engine for ordinary chess as well.
+/// by [`is_excluded`] (since #156, only Jieqi — see that function for the
+/// rationale). This includes `standard` and `chess960` (#155), so mcr is the
+/// single gameplay engine for ordinary chess as well, and Fog of War, whose
+/// per-player views are redacted by [`McrGame`](crate::McrGame).
 pub fn register(registry: &mut VariantRegistry) {
     for variant in VariantRef::all() {
         if is_excluded(variant) {

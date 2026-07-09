@@ -12,7 +12,34 @@ use mcs_core::{
     PlayerView,
 };
 
-use crate::wire::{McrAction, McrEvent, McrView};
+use crate::fog::{redacted_placement_for, FOG_OF_WAR_ID};
+use crate::wire::{FogFinalView, FogSpectatorView, FogView, McrAction, McrEvent, McrView};
+
+/// How a variant's per-player views must be redacted before they cross the
+/// session boundary.
+///
+/// Almost every mcr variant is perfect-information and needs no redaction
+/// ([`Redaction::None`]); the sole exception this adapter registers is Fog of War
+/// ([`Redaction::FogOfWar`]), whose views hide the squares a player cannot see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Redaction {
+    /// Perfect information: every party sees the same full board.
+    None,
+    /// Fog of War: each player sees only their own pieces and the squares those
+    /// pieces attack; spectators see nothing but public metadata until the end.
+    FogOfWar,
+}
+
+impl Redaction {
+    /// The redaction policy for `variant`, keyed off its canonical mcr name.
+    fn for_variant(variant: VariantRef) -> Redaction {
+        if variant.name() == FOG_OF_WAR_ID {
+            Redaction::FogOfWar
+        } else {
+            Redaction::None
+        }
+    }
+}
 
 /// Number of times a position must occur for a draw to become *claimable* under
 /// the threefold-repetition rule. FIDE's claim threshold; mcr's own move-clock
@@ -99,6 +126,9 @@ pub struct McrGame {
     game: Game,
     /// The id this session reports, the variant's canonical mcr name.
     variant_id: &'static str,
+    /// How this variant's per-player views are redacted (perfect-information for
+    /// all but Fog of War).
+    redaction: Redaction,
     /// The color with an outstanding, unanswered draw offer, if any.
     draw_offer: Option<Color>,
     /// The FIDE-style history-dependent draw parameters for this variant, or
@@ -134,6 +164,7 @@ impl McrGame {
         let mut this = Self {
             game,
             variant_id: variant.name(),
+            redaction: Redaction::for_variant(variant),
             draw_offer: None,
             fide,
             position_history: Vec::new(),
@@ -254,6 +285,37 @@ impl McrGame {
             check: self.game.is_check(),
             draw_offer: self.draw_offer,
             can_claim_draw: self.claimable_draw().is_some(),
+        }
+    }
+
+    /// The full-move number, read from the sixth FEN field. One when the FEN
+    /// carries no such field. Public metadata that discloses no piece location.
+    fn fullmove_number(&self) -> u32 {
+        self.game
+            .fen()
+            .split_whitespace()
+            .nth(5)
+            .and_then(|field| field.parse().ok())
+            .unwrap_or(1)
+    }
+
+    /// Builds the Fog of War view redacted to `player`: only their own pieces and
+    /// the enemy pieces those pieces attack, plus their own legal moves while it
+    /// is their turn.
+    fn build_fog_view(&self, player: Color) -> FogView {
+        // A player's own move list is theirs to see (its targets reach only
+        // squares they can already see); the opponent gets no move list.
+        let legal_moves_uci = if self.outcome.is_none() && self.to_move() == player {
+            self.legal_moves_uci()
+        } else {
+            Vec::new()
+        };
+        FogView {
+            visible_fen: redacted_placement_for(&self.game.fen(), player),
+            side_to_move: self.to_move(),
+            your_color: player,
+            legal_moves_uci,
+            status: self.status(),
         }
     }
 
@@ -494,14 +556,39 @@ impl GameSession for McrGame {
     }
 
     fn view_for(&self, player: Color) -> PlayerView {
-        // Perfect information: every player sees the same full board.
-        let _ = player;
-        PlayerView::from_typed(&self.build_view()).expect("mcr view always serializes")
+        match self.redaction {
+            // Perfect information: every player sees the same full board.
+            Redaction::None => {
+                PlayerView::from_typed(&self.build_view()).expect("mcr view always serializes")
+            }
+            // Fog of War: redact the board to what this player can see.
+            Redaction::FogOfWar => PlayerView::from_typed(&self.build_fog_view(player))
+                .expect("fog view always serializes"),
+        }
     }
 
     fn spectator_view(&self) -> PlayerView {
-        // Identical to a player's view: these variants hide nothing.
-        PlayerView::from_typed(&self.build_view()).expect("mcr view always serializes")
+        match self.redaction {
+            // Perfect information: identical to a player's view — nothing hidden.
+            Redaction::None => {
+                PlayerView::from_typed(&self.build_view()).expect("mcr view always serializes")
+            }
+            // Fog of War: reveal nothing but public metadata until the game ends,
+            // then the full final board (no hidden information remains).
+            Redaction::FogOfWar => match &self.outcome {
+                Some(_) => PlayerView::from_typed(&FogFinalView {
+                    fen: self.game.fen(),
+                    status: self.status(),
+                })
+                .expect("fog final view always serializes"),
+                None => PlayerView::from_typed(&FogSpectatorView {
+                    side_to_move: self.to_move(),
+                    fullmove_number: self.fullmove_number(),
+                    status: GameStatus::Ongoing,
+                })
+                .expect("fog spectator view always serializes"),
+            },
+        }
     }
 
     fn outcome(&self) -> Option<Outcome> {
