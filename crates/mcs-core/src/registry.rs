@@ -54,6 +54,50 @@ impl VariantOptions {
     }
 }
 
+/// Static, render-oriented facts about one variant: its board geometry and the
+/// capabilities a client needs to draw it.
+///
+/// This is the metadata seam through which the API layer learns enough to render
+/// any variant (board dimensions, whether there is a hand / piece drops, the
+/// starting position) **without** the API crate depending on the rules engine.
+/// Each [`VariantFactory`] fills it in from its own rules source.
+///
+/// The registry stays IO-free, so this is plain owned data. It is serde-friendly
+/// (no `utoipa` dependency); the API layer mirrors it into its own wire DTO.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VariantMetadata {
+    /// The number of files (board width), in squares.
+    pub board_width: u32,
+    /// The number of ranks (board height), in squares.
+    pub board_height: u32,
+    /// Whether the variant has a persistent hand and piece drops (Crazyhouse and
+    /// the shogi family). A client renders a pocket / drop control when this is
+    /// set; for every drop-less variant it is `false`.
+    pub has_hand: bool,
+    /// A coarse family / rule grouping (e.g. a piece-set hint the client uses to
+    /// pick sprites), when the variant's rules source exposes one. `None` when the
+    /// source has no such taxonomy.
+    pub family: Option<String>,
+    /// The starting position in the variant's own FEN dialect, when known — enough
+    /// for a client to draw the initial board.
+    pub start_fen: Option<String>,
+}
+
+impl Default for VariantMetadata {
+    /// The neutral fallback: an ordinary 8x8 board with no hand, no family hint,
+    /// and no start FEN. This is what the default [`VariantFactory::metadata`]
+    /// returns, so a factory that does not override it still reports a sane board.
+    fn default() -> Self {
+        Self {
+            board_width: 8,
+            board_height: 8,
+            has_hand: false,
+            family: None,
+            start_fen: None,
+        }
+    }
+}
+
 /// Creates fresh [`GameSession`]s for one variant.
 ///
 /// A factory is the entry point through which the server instantiates games of
@@ -65,6 +109,16 @@ pub trait VariantFactory: Send + Sync {
 
     /// A human-facing name for this variant (e.g. `"Standard Chess"`).
     fn display_name(&self) -> &str;
+
+    /// Static, render-oriented [`VariantMetadata`] for this variant.
+    ///
+    /// Surfaced through `GET /variants` so a client can render the board without
+    /// knowing the concrete rules engine. The default returns
+    /// [`VariantMetadata::default`] (a plain 8x8, hand-less board); factories with
+    /// a different geometry or a hand should override it.
+    fn metadata(&self) -> VariantMetadata {
+        VariantMetadata::default()
+    }
 
     /// Creates a new game of this variant configured by `options`.
     ///

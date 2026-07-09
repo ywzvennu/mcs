@@ -40,7 +40,7 @@ mod status;
 pub use color::Color;
 pub use error::GameError;
 pub use payload::{Action, Event, PlayerView};
-pub use registry::{VariantFactory, VariantOptions, VariantRegistry};
+pub use registry::{VariantFactory, VariantMetadata, VariantOptions, VariantRegistry};
 pub use session::GameSession;
 pub use status::{ActionEffect, EndReason, GameStatus, Outcome};
 

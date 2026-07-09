@@ -336,6 +336,35 @@ async fn accepting_an_already_taken_seek_is_rejected() {
 }
 
 #[tokio::test]
+async fn posting_a_seek_for_an_unknown_variant_is_bad_request() {
+    let state = test_app().await;
+    let alice = create_user(&state, "0x1111111111111111111111111111111111111111").await;
+    let alice_token = token_for(&state, &alice);
+    let router = router(state.clone());
+
+    // A seek naming a variant that is not registered is rejected up front (400),
+    // before anything is queued.
+    let body = json!({
+        "variant_id": "not-a-real-variant",
+        "time_control": { "type": "real_time", "initial_secs": 300, "increment_secs": 2 },
+        "color_preference": "random",
+        "rated": true,
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/seeks")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {alice_token}"))
+        .body(Body::from(body.to_string()))
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // Nothing was queued.
+    assert!(state.matchmaker().open_seeks().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn accepting_unauthenticated_is_unauthorized() {
     let state = test_app().await;
     let router = router(state);

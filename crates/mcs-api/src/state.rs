@@ -801,6 +801,27 @@ impl AppState {
         &self.variants
     }
 
+    /// Rejects an unregistered `variant_id` up front with a **400 Bad Request**.
+    ///
+    /// The seek and challenge creation endpoints call this before persisting
+    /// anything, so an unknown variant fails immediately at creation rather than
+    /// silently queueing a seek (or recording a challenge) that can never spawn a
+    /// game. The message mirrors the [`GameError::UnknownVariant`] mapping used at
+    /// the later game-spawn path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::BadRequest`] when no variant is registered under
+    /// `variant_id`.
+    pub fn ensure_known_variant(&self, variant_id: &str) -> Result<(), ApiError> {
+        if self.variants.get(variant_id).is_none() {
+            return Err(ApiError::BadRequest(format!(
+                "unknown game variant: {variant_id}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Returns the seek-pool matchmaker.
     ///
     /// `POST /seeks` submits to it and `DELETE /seeks/{id}` cancels through it.

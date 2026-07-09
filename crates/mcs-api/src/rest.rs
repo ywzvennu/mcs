@@ -724,6 +724,10 @@ async fn create_seek(
     user: AuthUser,
     Json(body): Json<CreateSeekRequest>,
 ) -> ApiResult<Json<CreateSeekResponse>> {
+    // Reject an unknown variant up front (400) rather than queueing a seek that
+    // could never spawn a game.
+    state.ensure_known_variant(&body.variant_id)?;
+
     let seek = Seek::new(
         user.user_id,
         body.variant_id,
