@@ -42,7 +42,8 @@ pub struct VariantDto {
     /// the shogi family); a client renders a pocket / drop control when set.
     pub has_hand: bool,
     /// A coarse family / piece-set hint, when the variant exposes one. Currently
-    /// always `null` (the rules engine carries no family taxonomy yet).
+    /// a piece-set hint like `"chess"`, `"xiangqi"`, `"shogi"`, `"makruk"`, …
+    /// (`null` for variants with no family, e.g. RBC).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
     /// The starting position in the variant's FEN dialect, when known.

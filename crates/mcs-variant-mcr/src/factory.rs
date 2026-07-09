@@ -2,10 +2,26 @@
 
 use std::sync::Arc;
 
+use mcr::geometry::VariantFamily;
 use mcr::VariantRef;
 use mcs_core::{
     GameError, GameSession, VariantFactory, VariantMetadata, VariantOptions, VariantRegistry,
 };
+
+/// The stable snake_case label for an mcr [`VariantFamily`] — a coarse piece-set
+/// hint a client uses to pick a glyph set / group variants. Kept in lockstep
+/// with the enum (exhaustive, so a new mcr family fails to compile until mapped).
+fn family_label(family: VariantFamily) -> &'static str {
+    match family {
+        VariantFamily::Chess => "chess",
+        VariantFamily::Capablanca => "capablanca",
+        VariantFamily::Xiangqi => "xiangqi",
+        VariantFamily::Janggi => "janggi",
+        VariantFamily::Shogi => "shogi",
+        VariantFamily::Makruk => "makruk",
+        VariantFamily::Fairy => "fairy",
+    }
+}
 use serde::Deserialize;
 
 use crate::game::McrGame;
@@ -68,15 +84,16 @@ impl VariantFactory for McrVariant {
     ///   of Crazyhouse and the shogi family).
     /// - `start_fen` is `rules.board.start_fen` (mcr's FEN dialect).
     ///
-    /// `family` is left `None`: mcr's `VariantRules` carries board, army, and
-    /// per-mechanic flags but no family / piece-set taxonomy to map from.
+    /// `family` is mapped from mcr's `VariantRules::family` taxonomy (mcr#611) —
+    /// a coarse piece-set hint (chess / capablanca / xiangqi / janggi / shogi /
+    /// makruk / fairy) the client uses to select a glyph set and group variants.
     fn metadata(&self) -> VariantMetadata {
         let rules = self.variant.rules();
         VariantMetadata {
             board_width: u32::from(rules.board.width),
             board_height: u32::from(rules.board.height),
             has_hand: rules.mechanics.has_hand,
-            family: None,
+            family: Some(family_label(rules.family).to_owned()),
             start_fen: Some(rules.board.start_fen),
         }
     }
