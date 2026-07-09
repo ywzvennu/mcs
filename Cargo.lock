@@ -1274,7 +1274,7 @@ dependencies = [
  "jsonwebtoken",
  "k256",
  "mcs-domain",
- "rand 0.8.6",
+ "rand 0.9.4",
  "serde",
  "sha3",
  "siwe",
@@ -1396,7 +1396,7 @@ dependencies = [
  "mcs-variant-rbc",
  "metrics",
  "metrics-exporter-prometheus",
- "rand 0.8.6",
+ "rand 0.9.4",
  "serde",
  "serde_json",
  "sqlx",
@@ -1433,7 +1433,7 @@ version = "0.1.0"
 dependencies = [
  "mcr",
  "mcs-core",
- "rand 0.8.6",
+ "rand 0.9.4",
  "serde",
  "serde_json",
 ]
