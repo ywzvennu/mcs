@@ -34,7 +34,7 @@ tracing.workspace = true
 # Redis client, optional and gated behind the `redis` feature above. Declared
 # directly here (rather than in the workspace) because it is specific to this
 # crate's optional backend.
-redis = { version = "0.27", features = [
+redis = { version = "1.3", features = [
   "tokio-comp",
   "aio",
   "connection-manager",
