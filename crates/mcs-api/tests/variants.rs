@@ -99,8 +99,9 @@ async fn get_variants_lists_standard() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response.into_body()).await;
     let variants = json["variants"].as_array().expect("variants is array");
-    // mcr registers its whole catalog (112 variants since #155).
-    assert_eq!(variants.len(), 112);
+    // mcr registers its whole catalog (116 variants: full catalog minus the one
+    // deferred variant `jieqi`, since #156).
+    assert_eq!(variants.len(), 116);
 
     let ids: Vec<&str> = variants
         .iter()
@@ -135,8 +136,8 @@ async fn get_variants_lists_multiple_sorted() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response.into_body()).await;
     let variants = json["variants"].as_array().expect("variants is array");
-    // mcr's catalog (112) plus rbc.
-    assert_eq!(variants.len(), 113);
+    // mcr's catalog (116) plus rbc.
+    assert_eq!(variants.len(), 117);
 
     // Response must be sorted by id.
     let ids: Vec<&str> = variants

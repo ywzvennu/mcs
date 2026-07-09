@@ -119,13 +119,14 @@ async fn variants_endpoint_lists_all_registered_variants() {
         );
     }
 
-    // The full set: rbc (1) plus mcr's catalog (112 — mcr's full catalog minus the
-    // hidden-information variants fogofwar/jieqi and the phased variants
-    // duck/placement/sittuyin; standard and chess960 are now mcr-owned) = 113.
+    // The full set: rbc (1) plus mcr's catalog (116 — mcr's full catalog minus the
+    // single deferred variant `jieqi`; since #156 Fog of War is redacted-and-
+    // registered and the phased Duck / Placement / Sittuyin are handled, and
+    // standard and chess960 are mcr-owned) = 117.
     assert_eq!(
         ids.len(),
-        113,
-        "expected 113 registered variants; got {}: {ids:?}",
+        117,
+        "expected 117 registered variants; got {}: {ids:?}",
         ids.len()
     );
 

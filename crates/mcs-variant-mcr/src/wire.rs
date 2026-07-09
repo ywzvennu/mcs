@@ -76,13 +76,16 @@ pub enum McrAction {
     ClaimDraw,
 }
 
-/// What a player (or spectator) is permitted to observe about a game.
+/// What a player (or spectator) is permitted to observe about a
+/// **perfect-information** game.
 ///
-/// Every variant served by this adapter is **perfect-information**: both players
-/// and any spectator see exactly the same full board, so this one struct is the
-/// view returned to every party. Hidden-information mcr variants (Fog of War,
-/// Jieqi) are deliberately not registered here — they need per-player redaction
-/// and are deferred (#156).
+/// Almost every variant served by this adapter is perfect-information: both
+/// players and any spectator see exactly the same full board, so this one struct
+/// is the view returned to every party. The one redacted exception is Fog of War,
+/// whose per-player views use the narrower [`FogView`] / [`FogSpectatorView`] /
+/// [`FogFinalView`] shapes instead. Jieqi (dark chess) remains unregistered —
+/// mcr's `Game` seam exposes only a generic face-down marker, not the stochastic
+/// per-piece hidden identity, so it is deferred (#156).
 ///
 /// The `fen` is mcr's variant FEN dialect, which for hand variants (shogi,
 /// crazyhouse, …) already carries the pockets / hand, so no separate field is
@@ -155,4 +158,83 @@ pub enum McrEvent {
         /// The final outcome of the game.
         outcome: Outcome,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Fog of War (Dark Chess) — the one hidden-information variant this adapter
+// redacts. Its views are deliberately narrow: a player sees only their own
+// pieces plus the enemy pieces their own pieces attack, and a spectator sees
+// nothing but public metadata until the game ends. See [`crate::fog`] for where
+// the redaction happens.
+// ---------------------------------------------------------------------------
+
+/// What a single player is permitted to observe about a Fog of War game.
+///
+/// Fog of War is an **imperfect-information** variant: each side sees only the
+/// squares its own pieces occupy or attack. This view is therefore redacted to
+/// the requesting player — [`visible_fen`](FogView::visible_fen) is a one-sided
+/// board showing only what that player can see, so the opponent's hidden piece
+/// locations are never present in the bytes the player receives.
+///
+/// Example JSON:
+///
+/// ```json
+/// {
+///   "visible_fen": "8/8/8/8/8/8/PPPPPPPP/RNBQKBNR",
+///   "side_to_move": "white",
+///   "your_color": "white",
+///   "legal_moves_uci": ["a2a3", "a2a4", "b1a3", "..."],
+///   "status": "ongoing"
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FogView {
+    /// A board diagram (FEN piece-placement field) redacted to the requesting
+    /// player: **all** of their own pieces, plus any opponent piece standing on
+    /// a square one of their pieces attacks. Every opponent piece on an unseen
+    /// square is blanked, so the opponent's hidden locations never appear here.
+    pub visible_fen: String,
+    /// The colour whose turn it is to move.
+    pub side_to_move: Color,
+    /// The colour of the player this view is for.
+    pub your_color: Color,
+    /// This player's legal moves in UCI notation — present only while it is
+    /// their turn, and empty otherwise (and once the game has finished). A
+    /// player's own move list reaches only squares they can already see, so it
+    /// carries no hidden opponent information.
+    pub legal_moves_uci: Vec<String>,
+    /// The lifecycle status of the game (ongoing or finished with an outcome).
+    pub status: GameStatus,
+}
+
+/// The view a spectator is permitted to observe **while a Fog of War game is in
+/// progress**.
+///
+/// To avoid leaking hidden information to a player who might also be watching,
+/// the spectator view is fully redacted until the game ends: it reveals only
+/// whose turn it is and the move number — never a piece location. Once finished,
+/// [`spectator_view`](mcs_core::GameSession::spectator_view) returns the full
+/// final board through a [`FogFinalView`] instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FogSpectatorView {
+    /// The colour whose turn it is to move.
+    pub side_to_move: Color,
+    /// The full-move number, from the game's FEN — harmless public metadata that
+    /// discloses no piece location.
+    pub fullmove_number: u32,
+    /// Always [`GameStatus::Ongoing`] for this view; a finished game returns a
+    /// [`FogFinalView`] instead.
+    pub status: GameStatus,
+}
+
+/// The view returned to a spectator once a Fog of War game is finished.
+///
+/// At this point there is no hidden information left to protect, so the full
+/// final board is revealed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FogFinalView {
+    /// The complete final position in Forsyth–Edwards Notation.
+    pub fen: String,
+    /// The finished status, carrying the game's outcome.
+    pub status: GameStatus,
 }

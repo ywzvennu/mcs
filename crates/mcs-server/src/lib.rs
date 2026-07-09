@@ -95,10 +95,10 @@ pub fn build_state(
     mcs_variant_rbc::register(&mut variants);
     // `mcs_variant_mcr::register` adds mcr's whole catalog — since #155 that
     // includes `standard` and `chess960`, making mcr the single gameplay engine.
-    // It excludes only the hidden-information variants (fog of war, jieqi) and the
-    // phased variants (duck, placement, sittuyin), which need per-player redaction
-    // or a multi-part move seam and are deferred to #156. `mcs-variant-rbc` still
-    // owns Reconnaissance Blind Chess.
+    // Since #156 it also serves the phased variants (duck, placement, sittuyin)
+    // and Fog of War, whose per-player views it redacts; only jieqi remains
+    // deferred (its stochastic hidden identity is not exposed at mcr's seam).
+    // `mcs-variant-rbc` still owns Reconnaissance Blind Chess.
     mcs_variant_mcr::register(&mut variants);
     tracing::info!(count = variants.ids().len(), "variant registry built");
 

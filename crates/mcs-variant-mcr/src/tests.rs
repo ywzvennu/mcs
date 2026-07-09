@@ -12,12 +12,13 @@ use mcs_core::{
 };
 
 use crate::factory::register;
-use crate::wire::{McrAction, McrView};
+use crate::wire::{FogFinalView, FogSpectatorView, FogView, McrAction, McrView};
 
 /// The number of variants this adapter registers (mcr's full catalog minus the
-/// five excluded ids: `fogofwar`, `jieqi`, `duck`, `placement`, `sittuyin`).
-/// Since #155 this includes `standard` and `chess960`.
-const EXPECTED_REGISTERED: usize = 112;
+/// single excluded id `jieqi`). Since #155 this includes `standard` and
+/// `chess960`; since #156 it includes Fog of War (redacted), Duck, Placement, and
+/// Sittuyin.
+const EXPECTED_REGISTERED: usize = 116;
 
 /// Helper: a move action payload from a UCI string.
 fn move_action(uci: &str) -> Action {
@@ -56,7 +57,8 @@ fn registers_the_expected_catalog() {
 
     // A representative sample of the catalog is present: ordinary chess and
     // Chess960 (now mcr-owned, #155), an 8x8 fairy, a hand variant, a
-    // large-board variant, and a small board.
+    // large-board variant, a small board, and the once-deferred variants now
+    // handled since #156 (Fog of War redacted; Duck / Placement / Sittuyin).
     for present in [
         "standard",
         "chess960",
@@ -66,6 +68,10 @@ fn registers_the_expected_catalog() {
         "minishogi",
         "xiangqi",
         "atomic",
+        "fogofwar",
+        "duck",
+        "placement",
+        "sittuyin",
     ] {
         assert!(
             registry.get(present).is_some(),
@@ -73,13 +79,9 @@ fn registers_the_expected_catalog() {
         );
     }
 
-    // The excluded ids are absent: hidden-information and phased variants (#156).
-    for absent in ["fogofwar", "jieqi", "duck", "placement", "sittuyin"] {
-        assert!(
-            registry.get(absent).is_none(),
-            "{absent} should be excluded"
-        );
-    }
+    // Only Jieqi remains excluded (its stochastic hidden identity is not exposed
+    // at mcr's `Game` seam; see `factory::is_excluded`).
+    assert!(registry.get("jieqi").is_none(), "jieqi should be excluded");
 }
 
 #[test]
@@ -370,4 +372,177 @@ fn chess960_is_registered_and_playable() {
     let first = before.legal_moves_uci[0].clone();
     game.apply(Color::White, &move_action(&first))
         .expect("a listed move is legal");
+}
+
+// ---------------------------------------------------------------------------
+// Phased variants routed through the single-action seam (#156): Duck's two-part
+// move is one combined UCI, and Placement / Sittuyin deploy through open drops.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn duck_two_part_move_applies_as_one_action() {
+    let mut game = new_game("duck");
+    assert_eq!(game.variant_id(), "duck");
+
+    // Every duck move is a single combined UCI: a piece move plus a `,`-separated
+    // duck placement (e.g. `b1a3,a3b3`). The move list surfaces them whole.
+    let before = view(game.as_ref(), Color::White);
+    let mv = before
+        .legal_moves_uci
+        .iter()
+        .find(|u| u.contains(','))
+        .expect("duck moves carry a duck-placement addendum")
+        .clone();
+    game.apply(Color::White, &move_action(&mv))
+        .expect("a listed duck move is legal");
+
+    // The move applied as one action and it is now Black's turn; the duck (`*`)
+    // is on the board.
+    assert_eq!(game.to_move(), Color::Black);
+    assert!(
+        view(game.as_ref(), Color::Black).fen.contains('*'),
+        "the duck should be on the board after the first move"
+    );
+}
+
+#[test]
+fn duck_reaches_a_terminal() {
+    // Duck's king is non-royal: capturing it leaves the opponent with no move,
+    // which mcr's `Game` seam adjudicates as a (single-position) terminal. With
+    // the white queen on e7 adjacent to the black king on e8, the combined move
+    // `e7e8,<duck>` captures the king and ends the game — confirming the two-part
+    // move drives the session all the way to a finished outcome.
+    let mut game = game_from_fen("duck", "4k3/4Q3/8/8/8/8/8/4K3 w - - 0 1");
+    let mate = view(game.as_ref(), Color::White)
+        .legal_moves_uci
+        .into_iter()
+        .find(|u| u.starts_with("e7e8,"))
+        .expect("a king-capturing move should be available");
+    let effect = game
+        .apply(Color::White, &move_action(&mate))
+        .expect("the king capture is legal");
+    assert!(
+        matches!(effect.status, GameStatus::Finished(_)),
+        "capturing the king ends the game"
+    );
+    assert!(
+        game.outcome().is_some(),
+        "the game records a terminal outcome"
+    );
+    // No further action is admitted once finished.
+    assert!(game.legal_actions(Color::White).is_empty());
+}
+
+#[test]
+fn placement_and_sittuyin_deploy_through_open_drops() {
+    for variant in ["placement", "sittuyin"] {
+        let mut game = new_game(variant);
+        assert_eq!(game.variant_id(), variant);
+
+        // The opening phase offers only drops (`role@square`); the pocket rides
+        // in the FEN's `[..]` bracket, visible to both sides (open deployment).
+        let before = view(game.as_ref(), Color::White);
+        assert!(
+            before.legal_moves_uci.iter().all(|u| u.contains('@')),
+            "{variant} setup should offer only drops, got {:?}",
+            before.legal_moves_uci
+        );
+        assert!(
+            before.fen.contains('['),
+            "{variant} FEN should carry the deployment pocket"
+        );
+
+        // Deploying a held piece is an ordinary single action.
+        let drop = before.legal_moves_uci[0].clone();
+        game.apply(Color::White, &move_action(&drop))
+            .expect("a listed drop is legal");
+        assert_eq!(game.to_move(), Color::Black);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fog of War redaction (#156): the hidden-information guarantee — a player's
+// view never leaks the opponent's hidden pieces, and spectators see nothing but
+// public metadata until the game ends.
+// ---------------------------------------------------------------------------
+
+/// Helper: decode a Fog of War player view.
+fn fog_view(game: &dyn GameSession, player: Color) -> FogView {
+    game.view_for(player)
+        .to_typed::<FogView>()
+        .expect("fog view decodes")
+}
+
+#[test]
+fn fogofwar_is_registered_and_playable() {
+    let mut game = new_game("fogofwar");
+    assert_eq!(game.variant_id(), "fogofwar");
+    let before = fog_view(game.as_ref(), Color::White);
+    assert_eq!(before.side_to_move, Color::White);
+    assert_eq!(before.your_color, Color::White);
+    assert_eq!(before.legal_moves_uci.len(), 20);
+    game.apply(Color::White, &move_action("e2e4"))
+        .expect("e2e4 is legal in fog of war");
+    assert_eq!(game.to_move(), Color::Black);
+}
+
+#[test]
+fn fogofwar_player_view_never_leaks_the_opponent() {
+    let game = new_game("fogofwar");
+
+    // At the start neither side attacks past the fourth rank, so a player sees
+    // only their own army: no opponent-cased piece may appear in the view.
+    let white = fog_view(game.as_ref(), Color::White);
+    assert!(
+        !white.visible_fen.chars().any(|c| c.is_ascii_lowercase()),
+        "White's fog view leaked a black piece: {}",
+        white.visible_fen
+    );
+    // The whole opponent army must be absent — serialize and check the full view.
+    let serialized = serde_json::to_string(&white).expect("serializes");
+    for black_officer in ['r', 'n', 'b', 'q', 'k'] {
+        // The redacted board carries no black piece; `your_color`/`side_to_move`
+        // are the only lowercase text, and neither is a bare piece letter run.
+        assert!(
+            !white.visible_fen.contains(black_officer),
+            "leaked black '{black_officer}' in {serialized}"
+        );
+    }
+
+    // The non-moving player gets no move list (only the side to move does).
+    let black = fog_view(game.as_ref(), Color::Black);
+    assert!(black.legal_moves_uci.is_empty());
+    // ...and symmetrically sees no white piece.
+    assert!(
+        !black.visible_fen.chars().any(|c| c.is_ascii_uppercase()),
+        "Black's fog view leaked a white piece: {}",
+        black.visible_fen
+    );
+}
+
+#[test]
+fn fogofwar_spectator_is_redacted_until_the_game_ends() {
+    let mut game = new_game("fogofwar");
+
+    // While ongoing the spectator sees only public metadata — no board at all.
+    let spectator = game
+        .spectator_view()
+        .to_typed::<FogSpectatorView>()
+        .expect("ongoing spectator view is redacted");
+    assert_eq!(spectator.side_to_move, Color::White);
+    assert_eq!(spectator.status, GameStatus::Ongoing);
+
+    // Resigning ends the game; the spectator now sees the full final board.
+    let resign = Action::from_typed(&McrAction::Resign).expect("serializable");
+    game.apply(Color::White, &resign).expect("resign is legal");
+    let final_view = game
+        .spectator_view()
+        .to_typed::<FogFinalView>()
+        .expect("finished spectator view reveals the board");
+    assert!(
+        final_view.fen.starts_with("rnbqkbnr/pppppppp"),
+        "the final board should be fully revealed: {}",
+        final_view.fen
+    );
+    assert!(matches!(final_view.status, GameStatus::Finished(_)));
 }
