@@ -89,7 +89,7 @@ mcs-variant-mcr = { path = "../mcs-variant-mcr" }
 # The RBC variant, used in the variants-endpoint integration tests.
 mcs-variant-rbc = { path = "../mcs-variant-rbc" }
 # A real WebSocket client to exercise the live-game socket end to end.
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"
 # `SinkExt`/`StreamExt` for driving the tungstenite client stream in tests.
 futures = { workspace = true }
 # Property/fuzz testing of the untrusted WebSocket protocol parsers and a
