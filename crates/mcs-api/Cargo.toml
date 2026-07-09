@@ -78,7 +78,7 @@ mcs-storage = { workspace = true, features = ["sqlite"] }
 # Local test signer: derive an address from a fixed private key and produce
 # EIP-191 personal-sign signatures over the SIWE challenge, mirroring a wallet.
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
-sha3 = "0.10"
+sha3 = "0.12"
 # EIP-4361 message parser used in test helpers to compute the EIP-191 prehash
 # for signing. Kept as a dev-only dep since the production code now goes through
 # mcs-auth exclusively.
