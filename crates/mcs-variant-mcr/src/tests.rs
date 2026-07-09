@@ -12,13 +12,13 @@ use mcs_core::{
 };
 
 use crate::factory::register;
-use crate::wire::{FogFinalView, FogSpectatorView, FogView, McrAction, McrView};
+use crate::wire::{McrAction, McrView};
 
-/// The number of variants this adapter registers (mcr's full catalog minus the
-/// single excluded id `jieqi`). Since #155 this includes `standard` and
-/// `chess960`; since #156 it includes Fog of War (redacted), Duck, Placement, and
-/// Sittuyin.
-const EXPECTED_REGISTERED: usize = 116;
+/// The number of variants this adapter registers: mcr's **whole** catalog, with
+/// nothing deferred. Since #155 this includes `standard` and `chess960`; since
+/// #156 the phased Duck / Placement / Sittuyin and redacted Fog of War; and since
+/// #163 jieqi (its per-player redaction now delegated to mcr).
+const EXPECTED_REGISTERED: usize = 119;
 
 /// Helper: a move action payload from a UCI string.
 fn move_action(uci: &str) -> Action {
@@ -49,6 +49,22 @@ fn new_game(variant: &str) -> Box<dyn GameSession> {
         .expect("variant is registered")
 }
 
+/// Helper: a new game created the way the server does — options resolved through
+/// [`prepare_new_game_options`](mcs_core::VariantFactory::prepare_new_game_options)
+/// first (so jieqi gets its per-game reveal seed), then a session built from them.
+/// Returns the resolved options alongside the session so a test can replay them
+/// through the recovery path.
+fn new_prepared_game(variant: &str) -> (Box<dyn GameSession>, VariantOptions) {
+    let registry = registry();
+    let options = registry
+        .prepare_new_game_options(variant, &VariantOptions::default())
+        .expect("options resolve");
+    let game = registry
+        .new_game(variant, &options)
+        .expect("variant is registered");
+    (game, options)
+}
+
 #[test]
 fn registers_the_expected_catalog() {
     let registry = registry();
@@ -57,8 +73,9 @@ fn registers_the_expected_catalog() {
 
     // A representative sample of the catalog is present: ordinary chess and
     // Chess960 (now mcr-owned, #155), an 8x8 fairy, a hand variant, a
-    // large-board variant, a small board, and the once-deferred variants now
-    // handled since #156 (Fog of War redacted; Duck / Placement / Sittuyin).
+    // large-board variant, a small board, the phased variants (#156), and both
+    // hidden-information variants — Fog of War and jieqi — whose per-player views
+    // mcr redacts (#163).
     for present in [
         "standard",
         "chess960",
@@ -69,6 +86,7 @@ fn registers_the_expected_catalog() {
         "xiangqi",
         "atomic",
         "fogofwar",
+        "jieqi",
         "duck",
         "placement",
         "sittuyin",
@@ -78,10 +96,6 @@ fn registers_the_expected_catalog() {
             "{present} should be registered"
         );
     }
-
-    // Only Jieqi remains excluded (its stochastic hidden identity is not exposed
-    // at mcr's `Game` seam; see `factory::is_excluded`).
-    assert!(registry.get("jieqi").is_none(), "jieqi should be excluded");
 }
 
 #[test]
@@ -461,25 +475,27 @@ fn placement_and_sittuyin_deploy_through_open_drops() {
 }
 
 // ---------------------------------------------------------------------------
-// Fog of War redaction (#156): the hidden-information guarantee — a player's
-// view never leaks the opponent's hidden pieces, and spectators see nothing but
-// public metadata until the game ends.
+// Hidden-information redaction, delegated to mcr (#163): a player's view never
+// leaks the opponent's hidden information, and a spectator's view is redacted
+// while the game is in progress. The adapter computes none of this — it passes
+// mcr's `view_for` / `spectator_view` output through — so these tests exercise
+// mcr's redaction across both hidden-information variants: Fog of War (fog) and
+// jieqi (concealed `Dark` identities + a stripped reveal seed).
 // ---------------------------------------------------------------------------
 
-/// Helper: decode a Fog of War player view.
-fn fog_view(game: &dyn GameSession, player: Color) -> FogView {
-    game.view_for(player)
-        .to_typed::<FogView>()
-        .expect("fog view decodes")
+/// Helper: the piece-placement field (first FEN field) of a view — the part that
+/// would carry a leaked opponent piece.
+fn placement_of(view: &McrView) -> &str {
+    view.fen.split(' ').next().unwrap_or("")
 }
 
 #[test]
 fn fogofwar_is_registered_and_playable() {
     let mut game = new_game("fogofwar");
     assert_eq!(game.variant_id(), "fogofwar");
-    let before = fog_view(game.as_ref(), Color::White);
+    let before = view(game.as_ref(), Color::White);
     assert_eq!(before.side_to_move, Color::White);
-    assert_eq!(before.your_color, Color::White);
+    // The side to move sees its own legal moves through mcr's redacted view.
     assert_eq!(before.legal_moves_uci.len(), 20);
     game.apply(Color::White, &move_action("e2e4"))
         .expect("e2e4 is legal in fog of war");
@@ -491,58 +507,190 @@ fn fogofwar_player_view_never_leaks_the_opponent() {
     let game = new_game("fogofwar");
 
     // At the start neither side attacks past the fourth rank, so a player sees
-    // only their own army: no opponent-cased piece may appear in the view.
-    let white = fog_view(game.as_ref(), Color::White);
+    // only their own army: no opponent piece may appear in the redacted board.
+    let white = view(game.as_ref(), Color::White);
+    let white_placement = placement_of(&white);
     assert!(
-        !white.visible_fen.chars().any(|c| c.is_ascii_lowercase()),
-        "White's fog view leaked a black piece: {}",
-        white.visible_fen
+        !white_placement.chars().any(|c| c.is_ascii_lowercase()),
+        "White's fog view leaked a black piece: {white_placement}"
     );
-    // The whole opponent army must be absent — serialize and check the full view.
-    let serialized = serde_json::to_string(&white).expect("serializes");
-    for black_officer in ['r', 'n', 'b', 'q', 'k'] {
-        // The redacted board carries no black piece; `your_color`/`side_to_move`
-        // are the only lowercase text, and neither is a bare piece letter run.
-        assert!(
-            !white.visible_fen.contains(black_officer),
-            "leaked black '{black_officer}' in {serialized}"
-        );
-    }
 
-    // The non-moving player gets no move list (only the side to move does).
-    let black = fog_view(game.as_ref(), Color::Black);
+    // The non-moving player gets no move list (only the side to move does),
+    // and symmetrically sees no white piece.
+    let black = view(game.as_ref(), Color::Black);
     assert!(black.legal_moves_uci.is_empty());
-    // ...and symmetrically sees no white piece.
+    let black_placement = placement_of(&black);
     assert!(
-        !black.visible_fen.chars().any(|c| c.is_ascii_uppercase()),
-        "Black's fog view leaked a white piece: {}",
-        black.visible_fen
+        !black_placement.chars().any(|c| c.is_ascii_uppercase()),
+        "Black's fog view leaked a white piece: {black_placement}"
     );
 }
 
 #[test]
-fn fogofwar_spectator_is_redacted_until_the_game_ends() {
-    let mut game = new_game("fogofwar");
+fn fogofwar_spectator_is_redacted_while_in_progress() {
+    let game = new_game("fogofwar");
 
-    // While ongoing the spectator sees only public metadata — no board at all.
+    // A spectator of an in-progress fog game sees mcr's doubly redacted board —
+    // every secret piece hidden from both sides — and no move list, so nothing
+    // leaks. Neither king is visible from the mutually-hidden start.
     let spectator = game
         .spectator_view()
-        .to_typed::<FogSpectatorView>()
-        .expect("ongoing spectator view is redacted");
-    assert_eq!(spectator.side_to_move, Color::White);
+        .to_typed::<McrView>()
+        .expect("spectator view decodes");
     assert_eq!(spectator.status, GameStatus::Ongoing);
-
-    // Resigning ends the game; the spectator now sees the full final board.
-    let resign = Action::from_typed(&McrAction::Resign).expect("serializable");
-    game.apply(Color::White, &resign).expect("resign is legal");
-    let final_view = game
-        .spectator_view()
-        .to_typed::<FogFinalView>()
-        .expect("finished spectator view reveals the board");
     assert!(
-        final_view.fen.starts_with("rnbqkbnr/pppppppp"),
-        "the final board should be fully revealed: {}",
-        final_view.fen
+        spectator.legal_moves_uci.is_empty(),
+        "a spectator sees no move list while the game is in progress"
     );
-    assert!(matches!(final_view.status, GameStatus::Finished(_)));
+    let placement = placement_of(&spectator);
+    assert!(
+        !placement.contains('k') && !placement.contains('K'),
+        "neither king should be visible to a spectator: {placement}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// jieqi (hidden Xiangqi), re-enabled in #163: created with a per-game reveal seed
+// so it is genuine hidden information, its per-player redaction delegated to mcr.
+// ---------------------------------------------------------------------------
+
+/// The canonical jieqi generals and dark tokens (mcr dialect): `k`/`K` are the
+/// face-up generals, `=d`/`=D` a face-down (concealed) piece.
+#[test]
+fn jieqi_is_registered_and_playable_with_a_seed() {
+    let (mut game, options) = new_prepared_game("jieqi");
+    assert_eq!(game.variant_id(), "jieqi");
+
+    // The resolved options carry a seeded starting FEN (mcr's optional seventh
+    // field): a seven-field jieqi FEN opts the game into the stochastic reveal.
+    let fen = options.as_value()["fen"]
+        .as_str()
+        .expect("jieqi options carry a seeded start FEN");
+    assert_eq!(
+        fen.split_whitespace().count(),
+        7,
+        "the start FEN must carry a trailing seed field: {fen}"
+    );
+    fen.split_whitespace()
+        .nth(6)
+        .unwrap()
+        .parse::<u64>()
+        .expect("the seventh field is a u64 seed");
+
+    // The game is playable: the side to move has legal moves and one applies.
+    let before = view(game.as_ref(), Color::White);
+    assert_eq!(before.side_to_move, Color::White);
+    let first = before.legal_moves_uci[0].clone();
+    game.apply(Color::White, &move_action(&first))
+        .expect("a listed jieqi move is legal");
+    assert_eq!(game.to_move(), Color::Black);
+}
+
+#[test]
+fn jieqi_view_conceals_identities_and_never_leaks_the_seed() {
+    let (game, _options) = new_prepared_game("jieqi");
+
+    for color in [Color::White, Color::Black] {
+        let v = view(game.as_ref(), color);
+        // mcr strips the seed from every redacted view: the FEN is back to six
+        // fields, so the reveal seed can never cross the boundary to a client.
+        assert_eq!(
+            v.fen.split(' ').count(),
+            6,
+            "the reveal seed must be stripped from a player view: {}",
+            v.fen
+        );
+        // Concealed pieces stay generic `Dark` tokens — no unflipped identity is
+        // revealed to either player.
+        let placement = placement_of(&v);
+        assert!(
+            placement.contains("=d") && placement.contains("=D"),
+            "concealed pieces must render as Dark: {placement}"
+        );
+    }
+
+    // The spectator view likewise carries no seed.
+    let spectator = game
+        .spectator_view()
+        .to_typed::<McrView>()
+        .expect("spectator view decodes");
+    assert_eq!(
+        spectator.fen.split(' ').count(),
+        6,
+        "the spectator view must not carry the seed: {}",
+        spectator.fen
+    );
+}
+
+#[test]
+fn jieqi_recovery_replays_to_the_same_seeded_assignment() {
+    // Recovery rebuilds a game by replaying its action log through a fresh session
+    // created from the *persisted* options. The seed is resolved once (at
+    // creation) and carried in those options, so a fresh session built from the
+    // same options and driven through the same moves must reveal identical
+    // concealed identities — otherwise a recorded move could become illegal on
+    // replay. This pins that determinism.
+    let registry = registry();
+    let options = registry
+        .prepare_new_game_options("jieqi", &VariantOptions::default())
+        .expect("options resolve");
+
+    // The original game: play several plies, each a first-listed legal move for
+    // the side to move, revealing dark pieces as they go. Record the UCIs.
+    let mut original = registry
+        .new_game("jieqi", &options)
+        .expect("jieqi is registered");
+    let mut played = Vec::new();
+    for _ in 0..8 {
+        let mover = original.to_move();
+        let moves = view(original.as_ref(), mover).legal_moves_uci;
+        let uci = moves[0].clone();
+        original
+            .apply(mover, &move_action(&uci))
+            .expect("a listed move is legal in the original");
+        played.push((mover, uci));
+    }
+    let original_spectator = original.spectator_view();
+
+    // The recovered game: a fresh session from the identical persisted options,
+    // replaying the recorded log. Every move must still be legal (no divergence),
+    // and the final board must match byte-for-byte — the same seed reproduced the
+    // same reveals.
+    let mut recovered = registry
+        .new_game("jieqi", &options)
+        .expect("jieqi is registered");
+    for (player, uci) in &played {
+        recovered
+            .apply(*player, &move_action(uci))
+            .expect("the recorded move replays legally on recovery");
+    }
+    assert_eq!(
+        recovered.spectator_view(),
+        original_spectator,
+        "recovery must reproduce the same seeded jieqi assignment"
+    );
+}
+
+#[test]
+fn prepare_options_seeds_only_jieqi_and_honors_explicit_positions() {
+    let registry = registry();
+
+    // A perfect-information variant's options are returned unchanged.
+    let untouched = registry
+        .prepare_new_game_options("standard", &VariantOptions::default())
+        .expect("resolve");
+    assert_eq!(untouched, VariantOptions::default());
+
+    // jieqi with an explicit FEN is honored as-is — the seed (present or absent)
+    // is never re-randomized, which is what makes the recovery path deterministic.
+    let explicit = VariantOptions::new(serde_json::json!({
+        "fen": "=d=d=d=dk=d=d=d=d/9/1=d5=d1/=d1=d1=d1=d1=d/9/9/=D1=D1=D1=D1=D/1=D5=D1/9/=D=D=D=DK=D=D=D=D w - - 0 1 42"
+    }));
+    let resolved = registry
+        .prepare_new_game_options("jieqi", &explicit)
+        .expect("resolve");
+    assert_eq!(
+        resolved, explicit,
+        "an explicit jieqi position is untouched"
+    );
 }

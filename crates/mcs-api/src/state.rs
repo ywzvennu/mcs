@@ -920,7 +920,19 @@ impl AppState {
             ));
         }
 
-        // 1. Instantiate a fresh session for the agreed variant.
+        // 1. Resolve the durable options once, then instantiate a fresh session
+        //    from them. Resolving first lets a variant bake any per-game choice it
+        //    makes at creation (e.g. jieqi's hidden-reveal seed) into the options
+        //    we persist below, so recovery — which replays through `new_game` on
+        //    exactly these persisted options — rebuilds the identical session.
+        let options = match self.variants.prepare_new_game_options(variant_id, &options) {
+            Ok(options) => options,
+            Err(error) => {
+                self.live_games.release(white);
+                self.live_games.release(black);
+                return Err(error.into());
+            }
+        };
         let session = match self.variants.new_game(variant_id, &options) {
             Ok(session) => session,
             Err(error) => {

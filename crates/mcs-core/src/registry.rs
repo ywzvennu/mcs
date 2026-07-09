@@ -120,7 +120,46 @@ pub trait VariantFactory: Send + Sync {
         VariantMetadata::default()
     }
 
+    /// Resolves the options a **fresh** game will be both created *and persisted*
+    /// with, called once at creation before [`new_game`](Self::new_game).
+    ///
+    /// This is the seam through which a variant bakes any per-game choice it makes
+    /// **at creation** into the durable [`VariantOptions`] the server stores — so
+    /// that recovery, which replays the action log through a fresh
+    /// [`new_game`](Self::new_game) on exactly these persisted options, rebuilds
+    /// the *identical* session. A variant with a per-game random ingredient (for
+    /// example a hidden-information reveal seed) MUST generate it here and fold it
+    /// into the returned options, never inside [`new_game`](Self::new_game) —
+    /// which recovery re-runs, and which must therefore stay a pure function of
+    /// its options.
+    ///
+    /// The resolved options are server-internal (they are not surfaced to clients
+    /// through the game DTO), so a secret an implementor folds in here does not
+    /// leak; the per-player views remain the redaction seam that protects it.
+    ///
+    /// The default returns `options` unchanged, which is correct for every variant
+    /// whose session is a pure function of its options already (every
+    /// perfect-information variant, and any variant that takes an explicit start
+    /// position).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GameError::InvalidActionPayload`] (or another suitable case) if
+    /// `options` cannot be interpreted by the variant.
+    fn prepare_new_game_options(
+        &self,
+        options: &VariantOptions,
+    ) -> Result<VariantOptions, GameError> {
+        Ok(options.clone())
+    }
+
     /// Creates a new game of this variant configured by `options`.
+    ///
+    /// This MUST be a pure function of `options`: the recovery path replays a
+    /// game's action log through a fresh `new_game` on its persisted options, so
+    /// any per-game randomness must instead be resolved once in
+    /// [`prepare_new_game_options`](Self::prepare_new_game_options) and carried in
+    /// the options.
     ///
     /// # Errors
     ///
@@ -173,6 +212,29 @@ impl VariantRegistry {
     #[must_use]
     pub fn ids(&self) -> Vec<&'static str> {
         self.factories.keys().copied().collect()
+    }
+
+    /// Resolves the durable options a fresh game of the variant registered under
+    /// `id` should be created and persisted with (see
+    /// [`VariantFactory::prepare_new_game_options`]).
+    ///
+    /// Call this once at creation, persist the result, and pass that same value
+    /// to [`new_game`](Self::new_game) — so recovery, replaying through
+    /// `new_game` on the persisted options, rebuilds the identical session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GameError::UnknownVariant`] if no variant is registered under
+    /// `id`, or whatever error the variant's factory returns.
+    pub fn prepare_new_game_options(
+        &self,
+        id: &str,
+        options: &VariantOptions,
+    ) -> Result<VariantOptions, GameError> {
+        let factory = self
+            .get(id)
+            .ok_or_else(|| GameError::UnknownVariant(id.to_owned()))?;
+        factory.prepare_new_game_options(options)
     }
 
     /// Creates a new game of the variant registered under `id`.

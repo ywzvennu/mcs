@@ -12,20 +12,25 @@
 //! variant-agnostic boundary types and adds the non-board mechanics the server
 //! needs (resignation and draw offers).
 //!
-//! ## Scope: almost the whole catalog
+//! ## Scope: the whole catalog
 //!
-//! [`register`] walks mcr's whole catalog ([`mcr::VariantRef::all`]) and
-//! registers a factory for every variant **except Jieqi** (dark chess), whose
-//! stochastic per-piece hidden identity mcr's [`Game`](mcr::Game) seam does not
-//! surface — see [`register`] for the rationale. Everything else is served:
+//! [`register`] walks mcr's whole catalog ([`mcr::VariantRef::all`]) and registers
+//! a factory for **every** variant — mcr redacts each one's per-player views, so
+//! there is no longer any variant this adapter must defer. Highlights:
 //!
 //! - the **phased** variants Duck (whose two-part move is a single combined UCI,
 //!   `e2e4,e5`), Placement, and Sittuyin (whose setup phases are alternating
 //!   *open* drops driven through the ordinary move seam) — all single-action,
 //!   with no hidden information (#156);
-//! - **Fog of War** (Dark Chess), the flagship hidden-information variant, whose
-//!   per-player views are **redacted** so a side sees only its own pieces and the
-//!   squares they attack (see [`McrGame`] and the [`fog`](mod@fog) module).
+//! - the **hidden-information** variants **Fog of War** (Dark Chess) and **jieqi**
+//!   (hidden Xiangqi), whose per-player views mcr **redacts** — Fog of War shows a
+//!   side only its own pieces and the squares they attack, and seeded jieqi keeps
+//!   every unflipped piece a generic `Dark` token and never leaks its reveal seed.
+//!   This adapter computes none of that redaction: it delegates to mcr's
+//!   [`view_for`](mcr::Game::view_for) (#163). jieqi games are created with a
+//!   per-game random reveal seed (folded into the persisted options for recovery),
+//!   so their concealed identities are genuinely hidden rather than the
+//!   deterministic home-role baseline.
 //!
 //! Since #155 this includes `standard` (ordinary FIDE chess) and `chess960`
 //! (Fischer Random): the cozy-chess-backed `mcs-variant-standard` crate has been
@@ -33,10 +38,8 @@
 //! draws that adapter hand-rolled — threefold / fivefold repetition and the
 //! fifty-move claim — are preserved here (see [`McrGame`]).
 //!
-//! Every registered variant but Fog of War is **perfect-information**: both
-//! players and any spectator observe the same complete board. See [`wire`] for
-//! the exact JSON shapes of actions, views, and events, and [`McrGame`] for the
-//! session implementation.
+//! See [`wire`] for the exact JSON shapes of actions, views, and events, and
+//! [`McrGame`] for the session implementation.
 //!
 //! ## Usage
 //!
@@ -56,7 +59,6 @@
 #![doc(html_root_url = "https://docs.rs/mcs-variant-mcr")]
 
 mod factory;
-mod fog;
 mod game;
 pub mod wire;
 

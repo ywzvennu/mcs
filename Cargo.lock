@@ -1228,7 +1228,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 [[package]]
 name = "mcr"
 version = "0.0.0"
-source = "git+https://github.com/ywzvennu/mcr?branch=main#23d1544e52c83bd7ef508759f4e528e7c3a04686"
+source = "git+https://github.com/ywzvennu/mcr?branch=main#057049271bcced9a10bda1ca06f9be1369eba69a"
 
 [[package]]
 name = "mcs-api"
@@ -1433,6 +1433,7 @@ version = "0.1.0"
 dependencies = [
  "mcr",
  "mcs-core",
+ "rand 0.8.6",
  "serde",
  "serde_json",
 ]

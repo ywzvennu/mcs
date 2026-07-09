@@ -29,6 +29,11 @@ impl McrVariant {
     }
 }
 
+/// The canonical mcr catalog name of jieqi (hidden Xiangqi), the one variant this
+/// adapter resolves a per-game reveal seed for (see
+/// [`prepare_new_game_options`](McrVariant::prepare_new_game_options)).
+const JIEQI_ID: &str = "jieqi";
+
 /// Options accepted by the [`McrVariant`] factory.
 ///
 /// The only field is an optional starting FEN, in mcr's dialect. With no (or
@@ -76,10 +81,74 @@ impl VariantFactory for McrVariant {
         }
     }
 
+    /// Resolves the durable options a fresh game will be created and persisted
+    /// with, giving jieqi its per-game hidden-reveal seed.
+    ///
+    /// jieqi is a genuine hidden-information game only when it carries a reveal
+    /// seed: without one, every concealed piece reveals to the Xiangqi piece
+    /// native to its home square (the deterministic home-role baseline), which any
+    /// observer can predict — so there is no hidden information. This method gives
+    /// each fresh jieqi game a per-game random `u64` seed, folded into the starting
+    /// FEN as mcr's optional trailing seventh field, so its concealed identities
+    /// are genuinely secret (a seed-derived shuffle of each army).
+    ///
+    /// Baking the seed into the returned options — which the server persists and
+    /// later replays through [`new_game`](Self::new_game) on recovery — is what
+    /// makes recovery **reproduce the same assignment**: the seed is generated once
+    /// here, never in [`new_game`](Self::new_game), which recovery re-runs. An
+    /// explicit `fen` (a caller-chosen position, or a recovered one that already
+    /// carries its seed) is honored untouched, so a seed is never re-randomized.
+    ///
+    /// Every other variant, and jieqi given an explicit `fen`, returns its options
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GameError::InvalidActionPayload`] (via
+    /// [`GameError::Serialization`]) if the options are malformed.
+    fn prepare_new_game_options(
+        &self,
+        options: &VariantOptions,
+    ) -> Result<VariantOptions, GameError> {
+        // Only jieqi resolves a seed; every other variant is a pure function of
+        // its (possibly default) options already.
+        if self.variant.name() != JIEQI_ID {
+            return Ok(options.clone());
+        }
+
+        let opts: McrOptions = if options.as_value().is_null() {
+            McrOptions::default()
+        } else {
+            options.to_typed()?
+        };
+        // An explicit starting position is authoritative: honor it as-is (this is
+        // also the recovery path, whose persisted FEN already carries the seed) and
+        // never re-randomize.
+        if opts.fen.is_some() {
+            return Ok(options.clone());
+        }
+
+        // Fold a fresh per-game seed into the variant's start FEN as mcr's optional
+        // trailing seventh field (a plain `u64`). mcr's start FEN is the six-field
+        // all-dark baseline; appending the seed opts this game into the stochastic
+        // reveal.
+        let seed = rand::random::<u64>();
+        let start_fen = self.variant.rules().board.start_fen;
+        let seeded_fen = format!("{start_fen} {seed}");
+        Ok(VariantOptions::new(
+            serde_json::json!({ "fen": seeded_fen }),
+        ))
+    }
+
     /// Creates a fresh game of this variant.
     ///
     /// Accepts `{ "fen": "..." }` to start from an explicit position; with no
-    /// (or `null`) options the variant's standard start position is used.
+    /// (or `null`) options the variant's standard start position is used. This is
+    /// a pure function of `options`: any per-game randomness (jieqi's reveal seed)
+    /// is resolved once in
+    /// [`prepare_new_game_options`](Self::prepare_new_game_options) and arrives
+    /// here already baked into the `fen`, so recovery — which replays through this
+    /// method on the persisted options — rebuilds the identical game.
     ///
     /// # Errors
     ///
@@ -101,50 +170,18 @@ impl VariantFactory for McrVariant {
     }
 }
 
-/// Whether `variant` is deliberately **not** registered by this adapter.
-///
-/// Since #156 this adapter serves the whole of mcr's catalog — including the
-/// once-deferred phased variants (Duck, Placement, Sittuyin) and the flagship
-/// hidden-information variant Fog of War (whose per-player views are redacted;
-/// see [`McrGame`](crate::McrGame)) — with a **single** remaining exclusion:
-///
-/// - **Jieqi** (dark chess). mcr's [`Game`](mcr::Game) seam models Jieqi's reveal
-///   *deterministically* (a face-down piece reveals as the Xiangqi piece native
-///   to its home square) and its FEN exposes only a **generic** face-down marker
-///   (`=D`/`=d`) for every concealed piece — never the stochastic per-piece
-///   identity that makes real Jieqi a hidden-information game (the seeded reveal
-///   pool is a separate layer, not wired into `Game`). The adapter therefore
-///   cannot show a player its own concealed identities, nor drive a true reveal,
-///   without fabricating hidden state mcr does not expose. Rather than ship a
-///   misleading "deterministic Jieqi", it stays excluded until the seam surfaces
-///   the reveal pool (tracked under #156's follow-up).
-///
-/// Duck, Placement, and Sittuyin need no exclusion: Duck's two-part move is a
-/// single combined UCI (`e2e4,e5`) mcr emits directly, and the setup phases of
-/// Placement and Sittuyin are alternating **open** drops (`N@a1`) driven through
-/// the ordinary [`legal_ucis`](mcr::Game::legal_ucis) / [`play_uci`](mcr::Game::play_uci)
-/// seam — all fully expressible as single actions with no hidden information.
-fn is_excluded(variant: VariantRef) -> bool {
-    // Jieqi remains deferred: the seam exposes only a generic face-down marker,
-    // not the stochastic per-piece hidden identity (see the doc comment). Every
-    // other variant — Fog of War (redacted views), Duck, Placement, Sittuyin — is
-    // now registered.
-    variant.name() == "jieqi"
-}
-
 /// Registers mcr's variant catalog with `registry`, one factory per variant,
 /// keyed by the variant's canonical mcr name.
 ///
-/// Every variant in [`VariantRef::all`] is registered **except** those filtered
-/// by [`is_excluded`] (since #156, only Jieqi — see that function for the
-/// rationale). This includes `standard` and `chess960` (#155), so mcr is the
-/// single gameplay engine for ordinary chess as well, and Fog of War, whose
-/// per-player views are redacted by [`McrGame`](crate::McrGame).
+/// **Every** variant in [`VariantRef::all`] is registered — this adapter no longer
+/// defers any of them. This includes `standard` and `chess960` (#155), so mcr is
+/// the single gameplay engine for ordinary chess as well, and the
+/// hidden-information variants **Fog of War** and **jieqi**, whose per-player views
+/// mcr redacts (delegated by [`McrGame`](crate::McrGame), #163). jieqi is registered
+/// as a genuine hidden-information game: each fresh game is given a per-game reveal
+/// seed by [`prepare_new_game_options`](McrVariant::prepare_new_game_options).
 pub fn register(registry: &mut VariantRegistry) {
     for variant in VariantRef::all() {
-        if is_excluded(variant) {
-            continue;
-        }
         registry.register(Arc::new(McrVariant::new(variant)));
     }
 }
